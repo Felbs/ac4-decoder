@@ -1,0 +1,257 @@
+# SPDX-License-Identifier: Apache-2.0
+"""M33 -- the 64-band complex QMF analysis/synthesis bank (clause 5.7.3/5.7.4).
+
+A-SPX lives entirely in the QMF domain: it patches low subbands up to high
+ones, adjusts their envelopes and adds noise, all on the complex subband
+matrix.  So none of the A-SPX side information M32 now parses can become audio
+until this filterbank exists.  This is that filterbank, and nothing else.
+
+THE WINDOW CAME FROM THE C FILE, NOT THE PDF
+----------------------------------------------
+Table D.3's 640 window coefficients are also shipped as `QWIN` in
+`ts_103190_tables.c` -- machine readable, no OCR risk.  M23's parser could not
+read it because that parser is INTEGER-only: it split `9.90318758627504e-04`
+into three tokens and reported 1918 "values" for a 640-entry array.  A
+float-aware read gives exactly 640, matching the declared size, symmetric about
+index 320 for n >= 1 -- the standard MPEG QMF prototype shape.
+
+THE AMBIGUITY, AND HOW IT IS SETTLED
+--------------------------------------
+The synthesis modulation matrix is given twice and the two disagree:
+
+    clause 5.7.4.2 step 2:  N[n][k] ~ exp(j*pi*(k+0.5)*(2n - 4*64 - 1)/128)
+                            i.e. the constant is 257
+    the pseudocode below:   exponent = j*(pi/128)*(sb+0.5)*(2*n - 255)
+                            i.e. the constant is 255
+
+Rather than pick one, both are built and the one that RECONSTRUCTS is taken --
+the same approach that settled step 6 of the MDCT overlap-add in M30.
+
+THE GATE: ANALYSIS THEN SYNTHESIS RETURNS THE SIGNAL
+------------------------------------------------------
+A complex QMF bank is oversampled by two, so the analysis/synthesis pair is
+near-perfectly reconstructing: feed a known signal in, get it back out, delayed
+by the bank's group delay.  That is checkable with no broadcast data and no
+encoder.  The delay is MEASURED by cross-correlation rather than assumed, and
+then the reconstruction SNR is computed at that lag.  A wrong window, a wrong
+modulation constant, a wrong fold in the `g` extraction: each destroys the SNR.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+from . import hcb as H                                               # noqa: E402
+
+NSB = 64                     # num_qmf_subbands
+NWIN = 640                   # num_qmf_win_coef
+
+
+BANK = os.path.join(HERE, "tables", "ac4_qwin.json")
+
+
+def qwin(path=None):
+    """The 640-tap QMF prototype, as FLOATS.
+
+    Prefers the spec's C file; falls back to the banked coefficients.
+
+    E108, and it was a REAL user-facing hole: the AC-4 Huffman codebooks were
+    banked on 8/12 so a fresh clone could decode, but this prototype filter
+    was not -- and it is what A-SPX high-frequency regeneration needs. Without
+    it `apply_hf_pair` raised FileNotFoundError, the audio worker counted a
+    silent `self_hf_fail` and carried on, so every clone WITHOUT the ETSI
+    source produced core-band-only audio: it decoded, it played, and it was
+    quietly missing its top octave. Measured on a Raspberry Pi running a
+    public clone. The coefficients are numeric facts and round-trip
+    bit-identically; the document itself is still not ours to redistribute.
+    """
+    if path is None and not os.path.exists(H.DEFAULT_C) and             os.path.exists(BANK):
+        import json
+        w = np.asarray(json.load(open(BANK, encoding="utf-8"))["coef"], float)
+        if w.size != NWIN:
+            raise ValueError(f"banked QWIN has {w.size} taps, expected {NWIN}")
+        return w
+    src = open(path or H.DEFAULT_C, encoding="utf-8", errors="replace").read()
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    m = re.search(r"const\s+\w+\s+QWIN\s*\[\s*(\d*)\s*\]\s*=\s*\{(.*?)\}\s*;",
+                  src, re.S)
+    if not m:
+        raise LookupError("QWIN not found")
+    vals = [float(x) for x in
+            re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", m.group(2))]
+    declared = int(m.group(1)) if m.group(1) else len(vals)
+    if len(vals) != declared:
+        raise ValueError(f"QWIN: {len(vals)} values, declared {declared}")
+    return np.asarray(vals, float)
+
+
+def analysis_matrix():
+    """M[sb][n] = exp(j*pi/128*(sb+0.5)*(2n-1)), 64 x 128.  Pseudocode 65."""
+    sb = np.arange(NSB)[:, None]
+    n = np.arange(2 * NSB)[None, :]
+    return np.exp(1j * np.pi / (2 * NSB) * (sb + 0.5) * (2 * n - 1))
+
+
+def synthesis_matrix(const):
+    """N[n][sb] = 1/64 * exp(j*pi/128*(sb+0.5)*(2n-const)), 128 x 64."""
+    n = np.arange(2 * NSB)[:, None]
+    sb = np.arange(NSB)[None, :]
+    return np.exp(1j * np.pi / (2 * NSB) * (sb + 0.5)
+                  * (2 * n - const)) / NSB
+
+
+_QMF_STATE = {"lib": None}
+
+
+def _qmf_lib():
+    """The E109 compiled QMF bank.  OPTIONAL: absent -> the NumPy loops
+    below, which stay the reference.  AC4_QMF_KERNEL=0 disables it."""
+    lib = _QMF_STATE["lib"]
+    if lib is None:
+        lib = False
+        name = "qmf_kernel.dll" if os.name == "nt" else "qmf_kernel.so"
+        path = os.path.join(HERE, name)
+        if os.environ.get("AC4_QMF_KERNEL", "1") != "0":
+            try:
+                import ctypes
+                cand = ctypes.CDLL(path)
+                cand.qmf_kernel_abi.restype = ctypes.c_int32
+                if int(cand.qmf_kernel_abi()) != 1:
+                    raise OSError("ABI mismatch")
+                f64 = np.ctypeslib.ndpointer(np.float64, flags="C")
+                for fn in ("qmf_analyse_f64", "qmf_synthesise_f64"):
+                    g = getattr(cand, fn)
+                    g.restype = ctypes.c_int32
+                    g.argtypes = [f64, ctypes.c_int32, f64, f64, f64]
+                lib = cand
+            except OSError:
+                lib = False
+        _QMF_STATE["lib"] = lib
+    return lib or None
+
+
+def analyse(pcm, w, M):
+    """Clause 5.7.3.2 / Pseudocode 65.  -> (64, num_timeslots) complex."""
+    nts = len(pcm) // NSB
+    _k = _qmf_lib()
+    if _k is not None and nts > 0:
+        # E109: the loop below is ~2880 iterations of tiny NumPy calls for a
+        # few seconds of audio -- dispatch-bound, like E53's LDPC.
+        out = np.empty((NSB, nts), np.complex128)
+        rc = _k.qmf_analyse_f64(
+            np.ascontiguousarray(pcm[:nts * NSB], np.float64), nts,
+            np.ascontiguousarray(w, np.float64),
+            np.ascontiguousarray(M, np.complex128).view(np.float64),
+            out.view(np.float64))
+        if rc == 0:
+            return out
+    filt = np.zeros(NWIN)
+    out = np.empty((NSB, nts), complex)
+    for ts in range(nts):
+        filt[NSB:] = filt[:-NSB]                       # shift by 64
+        filt[:NSB] = pcm[ts * NSB:(ts + 1) * NSB][::-1]
+        z = filt * w
+        u = z[:2 * NSB].copy()
+        for k in range(1, 5):
+            u += z[k * 2 * NSB:(k + 1) * 2 * NSB]
+        out[:, ts] = M @ u
+    return out
+
+
+def synthesise(Q, w, N):
+    """Clause 5.7.4.2.  -> real PCM."""
+    nts = Q.shape[1]
+    _k = _qmf_lib()
+    if _k is not None and nts > 0:
+        out = np.empty(nts * NSB, np.float64)
+        rc = _k.qmf_synthesise_f64(
+            np.ascontiguousarray(Q, np.complex128).view(np.float64), nts,
+            np.ascontiguousarray(w, np.float64),
+            np.ascontiguousarray(N, np.complex128).view(np.float64), out)
+        if rc == 0:
+            return out
+    filt = np.zeros(10 * 2 * NSB)                      # 1280
+    out = np.empty(nts * NSB)
+    g = np.empty(NWIN)
+    for ts in range(nts):
+        filt[2 * NSB:] = filt[:-2 * NSB]               # shift by 128
+        filt[:2 * NSB] = np.real(N @ Q[:, ts])
+        for n in range(5):                             # the g fold
+            g[128 * n:128 * n + NSB] = filt[256 * n:256 * n + NSB]
+            g[128 * n + NSB:128 * (n + 1)] = \
+                filt[256 * n + 192:256 * n + 192 + NSB]
+        ww = g * w
+        out[ts * NSB:(ts + 1) * NSB] = ww.reshape(10, NSB).sum(axis=0)
+    return out
+
+
+def gate(w, const, n=64 * 200, verbose=True):
+    """Analyse then synthesise a known signal; -> (delay, SNR dB)."""
+    rng = np.random.default_rng(7)
+    x = rng.standard_normal(n)
+    Q = analyse(x, w, analysis_matrix())
+    y = synthesise(Q, w, synthesis_matrix(const))
+    # measure the group delay rather than assuming it
+    best, lag = -1.0, 0
+    for d in range(0, 1024):
+        if d + 4096 > len(y):
+            break
+        a, b = x[:4096], y[d:d + 4096]
+        c = float(np.corrcoef(a, b)[0, 1])
+        if c > best:
+            best, lag = c, d
+    # ALIGNMENT: x[i] corresponds to y[i + lag].  Comparing x[2048:] against
+    # y[lag:] instead of y[lag+2048:] is off by 2048 samples and reports a
+    # near-zero gain on a bank that is actually reconstructing -- which is
+    # exactly what the first run of this gate did, while its own correlation
+    # search (correctly anchored at each signal's origin) read +1.000000.
+    # Two measurements disagreeing that sharply means one of them is wrong,
+    # not that the thing under test is strange.
+    off = 2048
+    a = x[off:len(x) - 2048]
+    b = y[lag + off:lag + off + len(a)]
+    if len(b) < len(a):
+        a = a[:len(b)]
+    if len(a) < 1024:
+        return lag, -99.0
+    err = a - b
+    snr = 10 * np.log10((a ** 2).mean() / max((err ** 2).mean(), 1e-30))
+    if verbose:
+        print(f"    constant {const}: delay {lag} samples, "
+              f"correlation {best:+.6f}, reconstruction SNR {snr:6.2f} dB")
+    return lag, snr
+
+
+def integration_gate(wav, w, verbose=True):
+    """Analyse OUR OWN decoded audio and find where its band limit lands.
+
+    The renderer stops at max_sfb, which M27/M28 put at 12000 Hz, and A-SPX
+    starts at QMF subband 32 by the header's own arithmetic.  So the QMF
+    analysis of the decoded audio must show energy up to subband 31 and the
+    noise floor from 32 up.  Nothing forces those three to agree -- the band
+    table, the A-SPX header and this filterbank share no code -- so agreement
+    is evidence about all three, and it also proves the bank is correctly
+    ALIGNED in frequency rather than merely reconstructing.
+    """
+    import wave
+    wv = wave.open(wav)
+    n = min(wv.getnframes(), 64 * 600)
+    nch = wv.getnchannels()
+    d = np.frombuffer(wv.readframes(n), "<i2").reshape(n, nch).astype(float)
+    x = d[:, 0] / 32768.0
+    x = x[:(len(x) // NSB) * NSB]
+    E = (np.abs(analyse(x, w, analysis_matrix())) ** 2).mean(axis=1)
+    tot = E.sum()
+    above = E[32:].sum() / tot
+    if verbose:
+        print(f"    subband 31 {E[31]/E.max():.2e}   subband 32 "
+              f"{E[32]/E.max():.2e}   subband 40 {E[40]/E.max():.2e}")
+        print(f"    energy at or above subband 32 (12000 Hz): "
+              f"{100 * above:.4f} %")
+    return above

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.so
+*.dll
+*.dylib
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+# broadcast captures and decoded audio never go in this repository
+*.m4s
+*.mp4
+*.ac4
+*.ts
+*.wav

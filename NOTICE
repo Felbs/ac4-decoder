@@ -1,0 +1,60 @@
+ac4-decoder -- an AC-4 audio decoder written from ETSI TS 103 190
+Copyright 2026 Felbs
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+--------------------------------------------------------------------------------
+PATENTS
+--------------------------------------------------------------------------------
+This software implements a published audio coding standard, AC-4 (ETSI TS 103
+190-1 and -2). Implementing, distributing or using an implementation of a
+published standard may require patent licences held by third parties
+(standards-essential patents); AC-4 in particular is a patented technology
+licensed by its owner. This project holds none of those patents.
+
+The patent grant in Section 3 of the Apache-2.0 licence covers the patent
+claims of THIS PROJECT'S CONTRIBUTORS ONLY. It does not grant, and cannot
+grant, any third-party patent rights. You are responsible for determining
+what patent licences your particular use requires. If you intend to use this
+software commercially, or to ship it in a product, get your own advice.
+Nothing here is a representation that you are free to do so.
+
+--------------------------------------------------------------------------------
+TRADEMARKS
+--------------------------------------------------------------------------------
+Section 6 of the licence grants no trademark rights.
+
+"Dolby" and "AC-4" are trademarks of Dolby Laboratories. "ATSC 3.0" and
+"NextGen TV" are trademarks of the Advanced Television Systems Committee, Inc.
+and/or its licensors. "ETSI" is a trademark of ETSI. All other product and
+company names are the trademarks of their respective owners.
+
+They are used here only descriptively -- to say which published format this
+software decodes. This project is not affiliated with, endorsed by, sponsored
+by, or certified by Dolby Laboratories, ETSI, ATSC, or any broadcaster or
+equipment manufacturer, and no such relationship should be inferred. No
+conformance or certification claim of any kind is made.
+
+--------------------------------------------------------------------------------
+STANDARDS DOCUMENTS
+--------------------------------------------------------------------------------
+The decoder was written from ETSI TS 103 190-1 and -2, which ETSI publishes
+free of charge. The standards DOCUMENTS are copyrighted by their publisher and
+are NOT included in or redistributed by this project. The files in
+ac4/tables/ are numeric data only (Huffman code lengths and codewords, the QMF
+prototype filter, the A-SPX noise table and scale-factor band offsets) --
+never the document or its text.
+
+--------------------------------------------------------------------------------
+BROADCAST CONTENT
+--------------------------------------------------------------------------------
+No broadcast audio is included in this repository. The integration tests run
+on captures the user supplies (see tests/capture_util.py).

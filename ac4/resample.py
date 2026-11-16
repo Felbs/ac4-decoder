@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: Apache-2.0
+"""M38 -- AC-4 output resampling to the true 48 kHz presentation rate.
+
+THE BUG THIS FIXES
+------------------
+M29/M37 render 1536 samples per AC-4 frame and label the result 48 kHz.
+1536 is the MDCT length -- the INTERNAL frame length.  ETSI TS 103 190-1
+Table 83 specifies, for `frame_rate_index = 3` (29.97 fps) at 48 kHz, a
+decoder output resampling ratio of
+
+    1001/1000 x 25/24  =  1001/960  =  1.04270833...
+
+so that one frame of 1536 internal samples becomes 1601.6 output samples
+occupying 1/29.97 s = 33.367 ms.  Without it the audio plays 4.27 % fast:
+0.72 of a semitone sharp, and ~4.8 s of drift across a two-minute programme.
+Inaudible on its own; fatal the moment you put it next to picture.
+
+INDEPENDENT CONFIRMATION (does not rely on reading Table 83 correctly)
+---------------------------------------------------------------------
+Every MMTP MPU on this service carries 120 video frames and 60 AC-4 frames.
+Video runs at exactly 60000/1001 fps, so one MPU spans 120 x 1001/60000 =
+2.002 s, and therefore one AC-4 frame spans 2.002/60 = 33.367 ms = 1601.6
+samples at 48 kHz.  Two derivations, one from the audio spec and one from
+the transport layer, agreeing to the digit.
+
+WHAT THIS MEANS FOR THE A-SPX BANDWIDTH CLAIM  (a correction)
+--------------------------------------------------------------
+Resampling does NOT move physical frequencies -- it only fixes the rate
+label -- so every frequency we quoted for this decoder was in the INTERNAL
+domain, computed as if the render were 48 kHz.  It was not.  True internal
+fs = 1536 / 0.033367 = 46033.97 Hz, i.e. 0.9590 of what we assumed, so
+every figure scales by that:
+
+    quoted (internal-normalised)      actual (physical)
+    core/A-SPX crossover  12000 Hz    11508 Hz    (line 768 of 1536)
+    A-SPX stop            21000 Hz    20140 Hz    (QMF subband 56 of 64)
+    QMF band spacing        375 Hz      359.6 Hz
+
+The three-way agreement between the Annex B band table, the A-SPX header
+and the QMF measurement still holds -- those subsystems agreed with each
+other, and they still do.  What was wrong was the absolute Hz label we
+hung on all three, because it came from the sample rate we assumed rather
+than the one Table 83 defines.  A shared wrong constant is invisible to
+any amount of cross-checking between users of that constant.
+"""
+import numpy as np
+from scipy.signal import resample_poly
+
+UP, DOWN = 1001, 960            # Table 83: 1001/1000 x 25/24
+INTERNAL_FRAME = 1536           # MDCT length
+OUTPUT_FRAME = 1601.6           # 1536 * 1001/960
+FRAME_SECONDS = 1001.0 / 30000.0    # 1/29.97 = 33.367 ms
+OUT_FS = 48000
+
+
+def internal_fs():
+    """The rate the renderer's samples are actually at."""
+    return INTERNAL_FRAME / FRAME_SECONDS
+
+
+def resample(x, up=UP, down=DOWN):
+    """Rational resample to the presentation rate.
+
+    `x` is (n,) or (n, ch).  resample_poly's polyphase FIR is applied per
+    column; the anti-imaging filter is designed for the 1/1001 band so no
+    aliasing is introduced (output Nyquist 24000 Hz vs 21000 Hz of content).
+    """
+    if x.ndim == 1:
+        return resample_poly(x, up, down)
+    return np.column_stack([resample_poly(x[:, c], up, down)
+                            for c in range(x.shape[1])])
+
+
+class StreamResampler:
+    """The same 1001/960 resampling, fed in pieces of any size.
+
+    `resample()` treats each call as a complete signal: the filter sees
+    zeros beyond both ends, so the first and last 10 input samples of every
+    call are computed against silence instead of their real neighbours.  A
+    live worker calls it once per pass, which left a small error at every
+    pass boundary (2.5 % of the signal on white noise, measured by the gate
+    below) -- every 8 s, and every 2 s once the passes are shortened for a
+    quick start.
+
+    This class keeps the input it still needs and gives the SAME samples no
+    matter how the input is split (`--stream-gate` below proves it against
+    one call over the whole signal).  It is causal: the output is the
+    one-shot output delayed by DELAY input samples (0.35 ms at 46034 Hz),
+    which is what lets it emit every sample a pass is owed without waiting
+    for the next pass -- the muxer's audio hold asks "does the wav cover
+    this slot", and a resampler that held 10 samples back would answer "no"
+    for a whole extra pass.
+
+    After n input samples in total, exactly ceil(n * up / down) output
+    samples have been returned -- the same count resample() gives -- so the
+    wav timeline is unchanged.
+    """
+    DELAY = 16      # input samples; resample_poly's filter reaches 10 each way
+    KEEP = 32       # input samples of history kept ahead of the next output
+
+    def __init__(self, up=UP, down=DOWN):
+        self.up, self.down = up, down
+        self.buf = None         # delayed input from index `base` onwards
+        self.base = 0           # always a multiple of `down` (phase 0)
+        self.n_in = 0           # input samples taken so far
+        self.n_out = 0          # output samples returned so far
+
+    def push(self, x):
+        x = np.asarray(x, dtype=np.float64)
+        if self.buf is None:
+            self.buf = np.zeros((self.DELAY,) + x.shape[1:])
+        self.buf = np.concatenate([self.buf, x])
+        self.n_in += len(x)
+        m_hi = -(-self.n_in * self.up // self.down)         # ceil
+        if m_hi <= self.n_out:
+            return np.zeros((0,) + x.shape[1:])
+        r = resample_poly(self.buf, self.up, self.down, axis=0)
+        m_base = self.base // self.down * self.up
+        out = r[self.n_out - m_base:m_hi - m_base]
+        if len(out) != m_hi - self.n_out:
+            raise RuntimeError("stream resampler came up short: %d of %d"
+                               % (len(out), m_hi - self.n_out))
+        self.n_out = m_hi
+        nb = ((m_hi * self.down // self.up - self.KEEP)
+              // self.down) * self.down
+        if nb > self.base:
+            self.buf = self.buf[nb - self.base:]
+            self.base = nb
+        return out
+
+
+def stream_gate():
+    """Pieces of any size == one call, and == resample() delayed by DELAY."""
+    rng = np.random.default_rng(38)
+    x = rng.standard_normal((300000, 2))
+    whole = StreamResampler().push(x)
+    ok = True
+    for name, cuts in (("2 s passes (92160)", [92160] * 3),
+                       ("one AC-4 frame (1536)", [1536] * 190),
+                       ("ragged", [1, 7, 959, 961, 5000, 13, 1536, 77777])):
+        rs, parts, pos = StreamResampler(), [], 0
+        for n in cuts:
+            parts.append(rs.push(x[pos:pos + n]))
+            pos += n
+        parts.append(rs.push(x[pos:]))
+        y = np.vstack(parts)
+        e = (float(np.abs(y - whole).max()) if y.shape == whole.shape
+             else float("inf"))
+        g = e < 1e-9
+        ok &= bool(g)
+        print(f"  {name:24s} {len(y)} samples, max |diff| vs one call "
+              f"{e:.3g}   {'PASS' if g else 'FAIL'}")
+    d = StreamResampler.DELAY
+    ref = resample(np.vstack([np.zeros((d, 2)), x]))[:len(whole)]
+    e = float(np.abs(ref - whole).max())
+    g = len(whole) == -(-len(x) * UP // DOWN) and e < 1e-9
+    ok &= bool(g)
+    print(f"  equals resample() delayed {d} samples: max |diff| {e:.3g}, "
+          f"length {len(whole)}   {'PASS' if g else 'FAIL'}")
+    one, two = resample(x[:92160]), resample(x[92160:184320])
+    k = len(one)
+    both = resample(x[:184320])
+    e2 = float(np.abs(np.vstack([one, two])[k - 12:k + 12]
+                      - both[k - 12:k + 12]).max())
+    print(f"  (the old per-pass call, for scale: error at a pass boundary "
+          f"{e2:.3g} on unit noise)")
+    print("STREAM GATE PASS" if ok else "STREAM GATE FAILED")
+    return ok
+
+
+def expected_length(n_frames):
+    """Exact output sample count for a whole number of AC-4 frames."""
+    # 1536 * 1001/960 = 1601.6 -- integral only over groups of 5 frames,
+    # so compute on the total rather than per frame.
+    total = n_frames * INTERNAL_FRAME
+    return total * UP // DOWN
