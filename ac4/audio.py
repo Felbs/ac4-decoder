@@ -226,9 +226,81 @@ def unmix(m, s, st, fr):
                     l[lo:hi] = m[lo:hi] + s[lo:hi]
                     r[lo:hi] = m[lo:hi] - s[lo:hi]
         return l, r
-    # sap_mode 0 = no processing; sap_mode 3 = full SAP (alpha prediction,
-    # not implemented -- passed through rather than faked, and counted)
+    if mode == 3 and st.get("sap"):                 # full SAP, clause 5.3.2
+        l, r = m.copy(), s.copy()
+        coeffs = sap_coeffs(st["sap"])
+        for g in range(min(fr.num_groups, len(coeffs))):
+            off = fr.sect_sfb_offset(g)
+            for sfb, abcd in enumerate(coeffs[g]):
+                if abcd is None or sfb + 1 >= len(off):
+                    continue                        # a=d=1, b=c=0: identity
+                lo, hi = off[sfb], min(off[sfb + 1], len(m))
+                if hi > lo:
+                    a, b, c, d = abcd
+                    l[lo:hi] = a * m[lo:hi] + b * s[lo:hi]
+                    r[lo:hi] = c * m[lo:hi] + d * s[lo:hi]
+        return l, r
+    # sap_mode 0 = no processing
     return m, s
+
+
+def sap_alpha_q(sap):
+    """Pseudocode 59, the sap_mode 3 branch: the quantised prediction
+    coefficients alpha_q[g][sfb] (None where sap_used is 0).
+
+    Even bands carry a delta (sap_hcw symbol - 60) against band sfb - 2 of
+    the same group, or against the same band of group g - 1 when
+    delta_code_time is set, g > 0 and max_sfb did not change from the
+    previous group; band 0 without time coding takes the delta itself.
+    Odd bands copy the even band below them.
+
+    The pseudocode does not say what an unused band's alpha_q is when a
+    later band (or the next group) refers to it. Here it is 0. That is an
+    inference, not spec text. It does occur on air: about 4,000 such
+    references in 18 minutes of one broadcaster's 5.1 (none on the other's).
+    Of three candidate rules it gives the most continuous alpha from frame
+    to frame: the median change against the same band in the neighbouring
+    frames is 2 steps with 0, against 4 for "carry the last coded band" and
+    4 for "keep last frame's value" (1 step on bands with no such reference).
+    """
+    used, dpcm = sap["coeff_used"], sap["dpcm"]
+    max_sfb = sap["max_sfb"]
+    dct = sap["delta_code_time"]
+    out = []
+    prev_q = None
+    max_sfb_prev = max_sfb[0] if max_sfb else 0
+    for g, m in enumerate(max_sfb):
+        q = [0] * m
+        o = [None] * m
+        for sfb in range(m):
+            if not used[g][sfb]:
+                continue
+            if sfb % 2:
+                q[sfb] = q[sfb - 1]
+            else:
+                delta = dpcm[g][sfb] - 60
+                code_delta = 0 if (g == 0 or m != max_sfb_prev) else dct
+                if code_delta:
+                    q[sfb] = prev_q[sfb] + delta
+                elif sfb == 0:
+                    q[sfb] = delta
+                else:
+                    q[sfb] = q[sfb - 2] + delta
+            o[sfb] = q[sfb]
+        out.append(o)
+        prev_q = q
+        max_sfb_prev = m
+    return out
+
+
+def sap_coeffs(sap):
+    """Clause 5.3.2 -> per group, per band: (a, b, c, d) or None (identity).
+
+    sap_gain = alpha_q * 0.1;  a = 1 + sap_gain, b = 1, c = 1 - sap_gain,
+    d = -1, and clause 5.3.3.2 applies [O0; O1] = [a b; c d] x [I0; I1].
+    """
+    return [[None if q is None else (1.0 + 0.1 * q, 1.0, 1.0 - 0.1 * q, -1.0)
+             for q in grp] for grp in sap_alpha_q(sap)]
 
 
 def write_wav(path, chans, rate=FS):

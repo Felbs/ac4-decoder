@@ -31,7 +31,7 @@ repository.
 | Input | fragmented MP4 (init segment + `moof`/`mdat` fragments, or bare fragments) |
 | 5.1 (`5_X` channel element, coding_config 0) | codec mode 1 (A-SPX): all six channels. Codec mode 4 (ASPX_ACPL_3): the two-channel core only (see below) |
 | Stereo (`channel_pair_element`) | stereo_codec_mode 0 (SIMPLE) and 1 (A-SPX) |
-| Core (ASF/MDCT) | Huffman spectral data, scale factors, long and short frames with block switching, KBD windows, M/S (sap_mode 1 and 2), noise fill, LFE |
+| Core (ASF/MDCT) | Huffman spectral data, scale factors, long and short frames with block switching, KBD windows, stereo processing (sap_mode 1 and 2: M/S; sap_mode 3: full SAP with prediction coefficients), noise fill, LFE |
 | A-SPX | parsed and rendered on the L/R and Ls/Rs pairs: 64-band complex QMF, envelope decoding, HF generation, envelope adjustment, joint-balance rendering |
 | Output | 48 kHz via the 1001/960 resampler (TS 103 190-1 Table 83); without it audio runs 4.27 % fast |
 | I-frames | decoding can start mid-stream; A-SPX starts at the first I-frame |
@@ -44,6 +44,47 @@ broadcasters' streams: about 12.3 kHz on one 5.1 stream's front pair, 16.6 to
 18 kHz on the other broadcaster's stereo streams; without A-SPX the core
 stops near 12 kHz.
 
+### Full SAP (sap_mode 3)
+
+Stereo audio processing mode 3 sends, per pair of scale factor bands, a
+prediction coefficient alpha (DPCM-coded in frequency, or in time across
+short-block groups) and decodes the two tracks as
+`L = (1 + alpha) M + S`, `R = (1 - alpha) M - S` (TS 103 190-1 Table 48,
+Pseudocode 59, clause 5.3.3.2). It is common on air: 26 % of one
+broadcaster's 5.1 frames and 34 % of the other's (18 minutes measured)
+use it on at least one channel pair. How it was checked, on captures:
+
+* **Bit accounting.** Every SAP3 frame walked to the end of `audio_data()`
+  (A-SPX and A-CPL side data included) stops 0 to 7 bits short of
+  `audio_size`, i.e. exactly at the byte alignment: 300 of 300 on one
+  broadcaster, 10 984 of 10 986 in the 18 minutes of the other (the two
+  others, and 10 non-SAP3 frames, look like reception damage). A parse that
+  reads one coefficient per band instead of per band pair fails this.
+* **Against an independent reference.** The A-SPX envelopes carry each
+  channel's high-band energy as the encoder measured it on the original.
+  On SAP3 frames, the decoded L/R level difference just below the A-SPX
+  crossover follows the envelopes' L/R difference just above it
+  (correlation 0.61 and 0.80 on the two broadcasters' front pairs). With
+  alpha negated the correlation turns negative (-0.62, -0.79); with alpha
+  ignored it vanishes (-0.04, 0.13); with the matrix transposed the sign is
+  right but the image is about half as wide (scale 0.35 and 0.31 against
+  0.74 and 0.61); passing the tracks through (the old behaviour) puts L/R
+  steps at every switch, 9 to 22 times the ordinary frame-to-frame change.
+* **Nothing else changes.** Streams without SAP3 frames decode
+  byte-identically to before; on streams with them, only SAP3 channel
+  pairs change.
+
+Two things this does not settle. The decoded image is not continuous with
+the neighbouring M/S frames in a simple before/after comparison, and is not
+meant to be: those frames often send an all-zero side signal in the upper
+core bands (in 96 % of one broadcaster's M/S frames at 9 to 12 kHz), so
+they are exactly mono there, and a variant that weakens alpha looks
+"smoother" against them. And when a coded band's DPCM reference is a band
+whose coefficient is not sent, the standard does not say what value to
+use; this decoder uses 0, the best of three candidate rules on the frame-to-
+frame continuity of alpha (inferred; about 4 000 such references in the
+18 minutes, none on the other broadcaster).
+
 ## What it does not do yet
 
 * **A-CPL.** An ASPX_ACPL_3 5.1 stream decodes to its stereo core (the coded
@@ -51,9 +92,6 @@ stops near 12 kHz.
   ASPX_ACPL_1/2 and stereo_codec_mode 2/3 raise and count as bad frames.
 * **A-SPX on the centre channel.** Its block is parsed (to keep state) but
   not rendered, so the centre stops near 12 kHz.
-* **Full SAP (sap_mode 3)** is passed through undecoded. On one broadcaster's
-  5.1 stream 22 % of frames use it, so those frames are decoded incorrectly
-  (inferred effect; measured frequency).
 * Companding (read, not applied); A-SPX additional harmonics (under 1.5 % of
   channel-frames); the SSF speech frontend; coding_config other than 0.
 * Mono, 3.0, 5.0 and 7.x elements; immersive and object audio (A-JOC, IFM,
@@ -116,7 +154,9 @@ package's CLI write **byte-identical** PCM with one decode pass and with
 | `hcb.py`, `spectral.py` | Huffman codebooks and decoding |
 | `sfb.py` | scale-factor band offsets |
 | `channels.py`, `pair.py` | `5_X` channel element; `channel_pair_element` |
-| `audio.py` | dequantisation, M/S, noise fill |
+| `audio.py` | dequantisation, stereo processing (M/S and full SAP), noise fill |
+| `acpl_parse.py` | A-CPL side data, parsed only (no upmix) |
+| `frameinfo.py` | walks each frame's audio_data() to its end and checks it against audio_size |
 | `mdct.py`, `filterbank.py` | MDCT, KBD windows, block switching, overlap-add |
 | `qmf.py` | 64-band complex QMF bank |
 | `aspx_*.py` | A-SPX bands, parse, envelopes, HF generation, adjustment, render |

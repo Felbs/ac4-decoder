@@ -50,5 +50,5 @@ def decode_pair(sub, T, b_iframe=False):
     if mode == 1:
         companding_control(b, 2)
     l, r, st = two_channel_data(b, T)
-    return dict(L=l, R=r, st_lr=st, aspx=aspx,
+    return dict(L=l, R=r, st_lr=st, aspx=aspx, codec_mode=mode,
                 bits=b.p, nbits=len(sub) * 8)
