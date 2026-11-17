@@ -21,6 +21,12 @@ SAP (sap_mode 3), companding, DRC / dialogue / loudness metadata,
 presentation or substream choice (substream 1 is always decoded), frame
 rates other than 29.97 and sample rates other than 48 kHz.
 
+DAMAGED INPUT (robust.py): decode_pass never raises and always returns
+1536 samples per frame. Frames that break a rule of the bitstream are
+concealed by the stream (zeroed spectrum, A-SPX high band muted, state
+held); after synthesis an output guard mutes any frame far above a running
+reference. n_concealed / concealed.reasons / last_concealed report them.
+
 THE BURST GUARD is a heuristic carried over from the receiver, not part of
 the standard: on air, a few A-SPX frames have been seen to decode tens of
 times louder than any programme (a decode error in the envelope chain whose
@@ -34,6 +40,7 @@ import numpy as np
 
 from . import aspx_render as R37
 from . import filterbank as FB
+from . import robust as RB
 from .stream import Ac4Stream
 
 FRAME = 1536                # internal samples per frame (29.97 fps, 48 kHz)
@@ -47,15 +54,34 @@ HF_TAIL = 2                 # frames after a burst frame that also play core
 REF_PEAK = {"5_X": 9.0e5, "pair": 2.0e5}
 
 
-def core_for_bursts(hf_a, hf_b, core_a, core_b, lead, limit, owed):
+def core_for_bursts(hf_a, hf_b, core_a, core_b, lead, limit, owed,
+                    hf_ratio=None, flagged=None, hf_floor=0.0):
     """One pair's A-SPX output with the core put back wherever A-SPX ran
-    away. -> (a, b, frames replaced, frames still owed to the next pass)."""
+    away. -> (a, b, frames replaced, frames still owed to the next pass).
+
+    hf_ratio (damaged-input check, robust.py): a frame whose A-SPX output
+    RMS is above hf_ratio x the RMS of the core it was made from is also
+    replaced, unless its A-SPX peak is below hf_floor; `flagged` (a bool
+    array of n frames) receives those frames."""
     n = min(len(hf_a), len(hf_b)) // FRAME
     if not n:
         return hf_a, hf_b, 0, owed
     pk = np.maximum(np.abs(hf_a[:n * FRAME]).reshape(n, FRAME).max(axis=1),
                     np.abs(hf_b[:n * FRAME]).reshape(n, FRAME).max(axis=1))
     hot = pk > limit
+    if hf_ratio is not None:
+        over = np.zeros(n, dtype=bool)
+        for hf, core in ((hf_a, core_a), (hf_b, core_b)):
+            d = np.concatenate([np.zeros(HF_DELAY), core])[lead:lead + len(hf)]
+            h = np.asarray(hf[:n * FRAME], dtype=float).reshape(n, FRAME)
+            rh = np.sqrt((h ** 2).mean(axis=1))
+            rc = np.sqrt((d[:n * FRAME].reshape(n, FRAME) ** 2).mean(axis=1))
+            with np.errstate(invalid="ignore"):
+                audible = ~(np.abs(h).max(axis=1) <= hf_floor)
+                over |= ~(rh <= hf_ratio * rc) & audible
+        if flagged is not None:
+            flagged[:n] |= over
+        hot = hot | over
     bad = np.zeros(n, dtype=bool)
     left = int(owed)
     for f in range(n):
@@ -94,7 +120,8 @@ class Decoder:
               A pair element always gives 2.
     """
 
-    def __init__(self, element="5_X", channels=None, burst_limit=None):
+    def __init__(self, element="5_X", channels=None, burst_limit=None,
+                 guard=True):
         if element not in ("5_X", "pair"):
             raise ValueError(f"element {element!r}: '5_X' or 'pair'")
         if channels is None:
@@ -117,6 +144,16 @@ class Decoder:
         self.n_hf_fail = 0
         self.acpl3 = False
         self.log = []               # human-readable notes, in order
+        # damaged input (robust.py): frames concealed, by reason
+        self.guard = RB.OutputGuard(REF_PEAK[element], FRAME) if guard \
+            else None
+        self.n_concealed = 0
+        self.concealed = RB.DamageLog()
+        # A-SPX level check (robust.py): None turns it off
+        self.hf_ratio = RB.MAX_HF_RATIO if guard else None
+        self.hf_floor = RB.HF_MIN_FRAC * REF_PEAK[element]
+        self._aspx_flag = np.zeros(0, dtype=bool)
+        self.n_frames = 0
 
     @property
     def n_ok(self):
@@ -126,10 +163,70 @@ class Decoder:
     def n_bad(self):
         return self.stream.n_bad
 
+    @property
+    def n_seq_jumps(self):
+        return self.stream.n_seq_jumps
+
     def decode_pass(self, frames):
         """-> float64 array (len(frames) * 1536, n_channels) at the internal
-        rate (48000 * 960 / 1001 Hz), decoder scale. A frame that fails to
-        decode gives silence of the right length (counted in n_bad)."""
+        rate (48000 * 960 / 1001 Hz), decoder scale.
+
+        Never raises on bad input and always returns exactly 1536 samples
+        per frame. A frame that breaks a rule of the bitstream is concealed
+        (counted in n_bad and n_concealed, reasons in concealed.reasons):
+        its spectrum is zeroed, so the previous frame's overlap fades out
+        and the next good frame fades in through its window, and its A-SPX
+        high band is muted with the envelope state held. A frame whose
+        output still rises far above the running level is muted by the
+        output guard (reason "guard.level")."""
+        frames = list(frames)
+        n_out = len(frames) * FRAME
+        n_bad0 = self.stream.n_bad
+        self._aspx_flag = np.zeros(len(frames), dtype=bool)
+        try:
+            y = self._decode_pass(frames)
+            status = list(self.stream.status)
+        except Exception as e:                                 # noqa: BLE001
+            # last resort: nothing escapes, and the timeline holds
+            self.log.append(f"decode pass failed ({type(e).__name__}: "
+                            f"{str(e)[:90]}) -- {len(frames)} frames muted")
+            y = np.zeros((n_out, len(self.chans)))
+            status = ["decoder.internal"] * len(frames)
+            self.stream.n_bad = n_bad0 + len(frames)
+            self.stream.damage.reasons["decoder.internal"] += len(frames)
+        if y.shape != (n_out, len(self.chans)):
+            self.log.append(f"pass gave {y.shape[0]} samples for "
+                            f"{len(frames)} frames -- fixed to {n_out}")
+            z = np.zeros((n_out, len(self.chans)))
+            m = min(n_out, y.shape[0])
+            z[:m, :y.shape[1]] = y[:m, :len(self.chans)]
+            y = z
+        if not np.isfinite(y).all():
+            y = np.where(np.isfinite(y), y, np.inf)  # the guard mutes them
+        if len(status) != len(frames):
+            status = (status + [None] * len(frames))[:len(frames)]
+        bad = np.array([s is not None for s in status], dtype=bool)
+        fired = np.zeros(len(frames), dtype=bool)
+        if self.guard is not None:
+            fired = self.guard.process(y, force=bad)
+        else:
+            y[~np.isfinite(y)] = 0.0
+        for s in status:
+            if s is not None:
+                self.concealed.add(s)
+        hf_flag = self._aspx_flag[:len(frames)] & ~bad & ~fired
+        for f in np.flatnonzero(fired & ~bad):
+            self.concealed.add("guard.level")
+        for f in np.flatnonzero(hf_flag):
+            self.concealed.add("aspx.level")
+        fired = fired | hf_flag
+        self.n_concealed += int((bad | fired).sum())
+        self.n_frames += len(frames)
+        self.last_status = status            # per frame of this pass
+        self.last_concealed = bad | fired
+        return y
+
+    def _decode_pass(self, frames):
         chans = self.chans
         dec = self.stream
         wins, lens, grp, cnts = dec.decode_frames(frames, chans)
@@ -172,7 +269,10 @@ class Decoder:
                         pcm[ka], pcm[kb], nb_, self.hf_hot[gkey] = \
                             core_for_bursts(hf["L"][lead:], hf["R"][lead:],
                                             pa, pb, lead, self.burst_limit,
-                                            self.hf_hot[gkey])
+                                            self.hf_hot[gkey],
+                                            hf_ratio=self.hf_ratio,
+                                            flagged=self._aspx_flag,
+                                            hf_floor=self.hf_floor)
                         if nb_:
                             self.n_burst += nb_
                             self.log.append(

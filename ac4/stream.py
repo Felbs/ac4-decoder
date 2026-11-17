@@ -31,6 +31,12 @@ from . import hcb as H                                              # noqa: E402
 from . import spectral as S                                         # noqa: E402
 from . import aspx_bands as A                                       # noqa: E402
 from . import aspx_render as R37                                      # noqa: E402
+from . import robust as RB                                          # noqa: E402
+
+# Marks a CONCEALED frame in the A-SPX group lists (where None means "no
+# A-SPX data for this frame"). The renderer mutes the high band for it and
+# leaves its envelope state untouched (hold).
+CONCEALED = RB.CONCEALED
 
 
 class Ac4Stream:
@@ -44,6 +50,11 @@ class Ac4Stream:
         self.tabs = {n[:-4]: S.Huff(arrays[n], arrays[n[:-4] + "_CW"])
                      for n in arrays
                      if n.endswith("_LEN") and n.startswith("ASPX_")}
+        # A-CPL books, for bit accounting of ASPX_ACPL_3 frames only
+        self.acpl_books = {
+            n[:-4]: S.Huff(arrays[n], arrays[n[:-4] + "_CW"])
+            for n in arrays if n.endswith("_LEN") and n.startswith("ACPL_")}
+        self.acpl_cfg = None        # acpl_config_2ch, from the last I-frame
         for nm in self.tabs:
             P.CENTRE[nm] = 0 if nm.endswith("_F0") else \
                 (len(arrays[nm + "_LEN"]) - 1) // 2
@@ -52,6 +63,16 @@ class Ac4Stream:
         self.fstate = {}
         self.n_ok = 0
         self.n_bad = 0
+        # robustness state (see robust.py)
+        self.damage = RB.DamageLog()
+        self.toc_shape = None       # the stream's TOC layout, from frame 1
+        self.mode = None            # the element's codec mode, from frame 1
+        self.seq_prev = None        # sequence_counter of the last frame
+        self.n_seq_jumps = 0
+        # per frame of the LAST decode_frames call: None = decoded, else the
+        # reason it was concealed; and whether its counter broke sequence
+        self.status = []
+        self.seq_break = []
 
     # 5.1 channel order everywhere downstream: matches m29's proven batch
     # render AND the standard WAV 6-channel layout (FL FR FC LFE BL BR), so a
@@ -96,9 +117,41 @@ class Ac4Stream:
         # the grouped filterbank needs frame boundaries because channels'
         # window lists do not align positionally when framings diverge
         groups = {"lr": [], "sr": []}
-        for f in frames:
+        self.status = []
+        self.seq_break = []
+        pending = []            # frames decoded before any aspx_config
+        for fi, f in enumerate(frames):
+            wpos = {k: len(v) for k, v in wins.items()}
+            fstate0 = dict(self.fstate)
+            seq = None
+            brk = False
+            resume = None       # the counter to expect after an outlier
+            on = RB.CHECKS
             try:
-                st = M.parse(f)
+                if on:
+                    RB.check_frame_size(f)
+                try:
+                    st = M.parse(f)
+                except Exception as e:                         # noqa: BLE001
+                    raise RB.Damaged("toc.parse", str(e)[:60])
+                if on:
+                    RB.check_toc(st, f, self.toc_shape)
+                seq = st["sequence_counter"]
+                brk = not RB.seq_continues(seq, self.seq_prev)
+                if on and brk and seq != 0 and fi + 1 < len(frames):
+                    # one frame of lookahead: when the NEXT frame carries on
+                    # from the frame before this one (and not from this
+                    # one), this frame is an outlier -- swapped, repeated
+                    # or from another stream -- and is concealed
+                    nxt = RB.peek_counter(frames[fi + 1])
+                    prev = self.seq_prev
+                    if (nxt is not None
+                            and not RB.seq_continues(nxt, seq)
+                            and (RB.seq_continues(nxt, prev)
+                                 or nxt == RB.seq_next(RB.seq_next(prev)))):
+                        resume = RB.seq_prev_of(nxt)
+                        raise RB.Damaged("seq.outlier",
+                                         f"{prev} -> {seq} -> {nxt}")
                 # PAYLOAD BASE (TS 103 190-1 4.3.3.2.10/.11 + Pseudocode 1):
                 # substream offsets are measured from the end of the
                 # byte-aligned ac4_toc and START at payload_base --
@@ -121,9 +174,78 @@ class Ac4Stream:
                 else:
                     r = C.decode_element(sub, self.T, b_iframe=ifr)
                 if r["bits"] > r["nbits"]:
-                    raise ValueError("element overran its substream")
-                if r.get("aspx"):
-                    self.cfg = r["aspx"]
+                    raise RB.Damaged("element.parse",
+                                     "element overran its substream")
+                # a different codec mode is a foreign frame, unless it is an
+                # I-frame where the stream may legitimately switch: one that
+                # continues the sequence counter or marks a splice (0)
+                if (on and self.mode is not None and r["mode"] != self.mode
+                        and not (ifr and (not brk or seq == 0))):
+                    raise RB.Damaged("element.mode",
+                                     f"{r['mode']} in a {self.mode} stream")
+                cfg = r.get("aspx") or self.cfg
+                if on and r.get("aspx"):
+                    try:
+                        t_new = R37.t_for(r["aspx"])
+                        ok_cfg = (t_new["n_hi"] >= 1 and t_new["n_lo"] >= 1
+                                  and t_new["num_sb_aspx"] >= 1)
+                    except Exception:                          # noqa: BLE001
+                        ok_cfg = False
+                    if not ok_cfg:
+                        raise RB.Damaged("aspx.config", str(r["aspx"]))
+                # A-SPX: Table 25 / Table 22 put the A-SPX blocks right after
+                # the channel data; parse them all (the 5_X element: L/R,
+                # Ls/Rs and the centre) so the frame closes on audio_size
+                aspx_lr = aspx_sr = None
+                end = r["bits"]
+                acpl3 = bool(r.get("acpl3"))
+                five = self.element != "pair" and not acpl3
+                has_aspx = not (self.element == "pair" and r["mode"][1] == 0)
+                if cfg and has_aspx:
+                    from .toc import Bits
+                    b = Bits(sub)
+                    b.p = r["bits"]
+                    t = R37.t_for(cfg)
+                    try:
+                        aspx_lr = P.aspx_data(b, self.tabs, t, cfg,
+                                              self.nats, ifr, True,
+                                              self.fstate, 0)
+                        if five:
+                            aspx_sr = P.aspx_data(b, self.tabs, t, cfg,
+                                                  self.nats, ifr, True,
+                                                  self.fstate, 1)
+                            P.aspx_data(b, self.tabs, t, cfg,
+                                        self.nats, ifr, False,
+                                        self.fstate, 2)
+                    except Exception as e:                     # noqa: BLE001
+                        if on:
+                            raise RB.Damaged("aspx.parse", str(e)[:60]) \
+                                if not isinstance(e, RB.Damaged) else e
+                        # (checks off: a later block mis-parsing does not
+                        # cost an earlier one, as before)
+                    end = b.p
+                    # ASPX_ACPL_3: acpl_data_2ch() closes the frame
+                    acfg = r.get("acpl") or self.acpl_cfg
+                    if on and acpl3 and acfg:
+                        try:
+                            C.acpl_data_2ch(b, self.acpl_books, acfg)
+                        except Exception as e:                 # noqa: BLE001
+                            raise RB.Damaged("acpl.parse", str(e)[:60])
+                        end = b.p
+                r["end"] = end
+                # every block of audio_data() parsed?  Not before the first
+                # aspx_config (the A-SPX blocks cannot be sized) nor, for
+                # ASPX_ACPL_3, before the first acpl_config_2ch
+                complete = ((bool(cfg) or not has_aspx)
+                            and (not acpl3 or bool(r.get("acpl")
+                                                   or self.acpl_cfg)))
+                if on:
+                    RB.check_closure(r, len(sub), complete)
+                    if not cfg and has_aspx:
+                        pending.append(dict(
+                            fi=fi, sub=sub, bits=r["bits"], ifr=ifr,
+                            start=r["audio_start"], size=r["audio_size"],
+                            acpl3=acpl3, five=five, wpos=wpos))
                 # noise fill seeded by the stream's own sequence counter,
                 # exactly as the batch render does
                 rng = np.random.default_rng(st["sequence_counter"])
@@ -151,49 +273,122 @@ class Ac4Stream:
                                "lfe": r["lfe"]["framing"]})
                 pk = {k: R.packed_spectrum(r[k], fm[k], rng)
                       for k in chans}
+                if on:
+                    for k, v in pk.items():
+                        if len(v) and not (np.abs(v).max()
+                                           <= RB.MAX_SPECTRAL_LINE):
+                            raise RB.Damaged("asf.level", k)
+                # ---- the frame is accepted: commit its state
+                if r.get("aspx"):
+                    self.cfg = r["aspx"]
+                if r.get("acpl"):
+                    self.acpl_cfg = r["acpl"]
+                if self.toc_shape is None:
+                    self.toc_shape = RB.toc_shape(st)
+                self.mode = r["mode"]
                 if "L" in pk:
                     pk["L"], pk["R"] = R.unmix(pk["L"], pk["R"],
                                                r["st_lr"], fm["L"])
                 if "Ls" in pk:
                     pk["Ls"], pk["Rs"] = R.unmix(pk["Ls"], pk["Rs"],
                                                  r["st_sr"], fm["Ls"])
-                u, seq = {}, {}
+                u, seq_l = {}, {}
                 for k in chans:
-                    u[k], seq[k] = R.ungroup(pk[k], fm[k])
-                got_lr = got_sr = None
-                if self.cfg:
-                    from .toc import Bits
-                    b = Bits(sub)
-                    b.p = r["bits"]
-                    t = R37.t_for(self.cfg)
-                    try:
-                        got_lr = P.aspx_data(b, self.tabs, t, self.cfg,
-                                             self.nats, ifr, True,
-                                             self.fstate, 0)
-                        if "Ls" in pk:
-                            got_sr = P.aspx_data(b, self.tabs, t, self.cfg,
-                                                 self.nats, ifr, True,
-                                                 self.fstate, 1)
-                            P.aspx_data(b, self.tabs, t, self.cfg,
-                                        self.nats, ifr, False,
-                                        self.fstate, 2)
-                    except Exception:                          # noqa: BLE001
-                        # a later block mis-parsing must not cost an earlier
-                        # one: whatever was assigned before the throw stands
-                        pass
+                    u[k], seq_l[k] = R.ungroup(pk[k], fm[k])
+                got_lr = aspx_lr
+                got_sr = aspx_sr if "Ls" in pk else None
                 self.n_ok += 1
-            except Exception:                                  # noqa: BLE001
+                self.status.append(None)
+                self.seq_break.append(brk)
+                if brk:
+                    self.n_seq_jumps += 1
+                self.seq_prev = seq
+            except Exception as e:                             # noqa: BLE001
                 # A bad frame must not desynchronise the timeline: emit
                 # silence of the right length so every downstream index
-                # stays frame-accurate.
+                # stays frame-accurate.  Nothing it parsed is kept: the
+                # A-SPX framing state goes back to before it (hold).
+                self.fstate = fstate0
+                reason = RB.reason_of(e)
                 u = {k: [np.zeros(1536)] for k in chans}
-                seq = {k: [1536] for k in chans}
-                got_lr = got_sr = None
+                seq_l = {k: [1536] for k in chans}
+                got_lr = got_sr = CONCEALED
                 self.n_bad += 1
+                self.damage.add(reason)
+                self.status.append(reason)
+                self.seq_break.append(False)
+                # the next frame is expected to carry the counter this one
+                # should have had
+                if resume is not None:
+                    self.seq_prev = resume
+                elif self.seq_prev is not None:
+                    self.seq_prev = RB.seq_next(self.seq_prev)
             for k in chans:
                 wins[k].extend(u[k])
-                lengths[k].extend(seq[k])
-                counts[k].append(len(seq[k]))
+                lengths[k].extend(seq_l[k])
+                counts[k].append(len(seq_l[k]))
             groups["lr"].append(got_lr)
             groups["sr"].append(got_sr)
+        if pending and self.cfg and RB.CHECKS:
+            self._late_closure(pending, wins, lengths, counts, groups)
         return wins, lengths, groups, counts
+
+    def _late_closure(self, pending, wins, lengths, counts, groups):
+        """Frames decoded before the stream's first aspx_config could only
+        be checked against an upper bound. When an I-frame later in the
+        same pass brings the configuration, parse their A-SPX (and A-CPL)
+        blocks with it -- for accounting only -- and conceal the ones that
+        do not close. Only when at least LATE_MAJORITY of the judged frames
+        close: otherwise the configuration evidently changed at the I-frame
+        and nothing is concluded. Frames whose framing needs a
+        previous_stop_pos from before the pass are not judged."""
+        from .toc import Bits
+        cfg, acfg = self.cfg, self.acpl_cfg
+        t = R37.t_for(cfg)
+        state = RB.TrackingState()
+        verdicts = []
+        for pd in pending:
+            state.missing = False
+            b = Bits(pd["sub"])
+            b.p = pd["bits"]
+            try:
+                P.aspx_data(b, self.tabs, t, cfg, self.nats, pd["ifr"],
+                            True, state, 0)
+                if pd["five"]:
+                    P.aspx_data(b, self.tabs, t, cfg, self.nats, pd["ifr"],
+                                True, state, 1)
+                    P.aspx_data(b, self.tabs, t, cfg, self.nats, pd["ifr"],
+                                False, state, 2)
+                if pd["acpl3"]:
+                    if not acfg:
+                        continue
+                    C.acpl_data_2ch(b, self.acpl_books, acfg)
+                stop = pd["start"] + 8 * pd["size"]
+                ok = stop - 7 <= b.p <= stop
+            except Exception:                                  # noqa: BLE001
+                ok = False
+            if not state.missing:
+                verdicts.append((pd, ok))
+            if not ok:
+                # a frame that did not parse leaves no state to trust
+                state = RB.TrackingState()
+        if not verdicts:
+            return
+        if sum(ok for _, ok in verdicts) < RB.LATE_MAJORITY * len(verdicts):
+            return
+        for pd, ok in sorted(verdicts, key=lambda v: -v[0]["fi"]):
+            if ok:
+                continue
+            fi = pd["fi"]
+            for k in wins:
+                p0, c = pd["wpos"].get(k), counts[k][fi]
+                if p0 is None:
+                    continue
+                wins[k][p0:p0 + c] = [np.zeros(1536)]
+                lengths[k][p0:p0 + c] = [1536]
+                counts[k][fi] = 1
+            groups["lr"][fi] = groups["sr"][fi] = CONCEALED
+            self.status[fi] = "audio_size.late"
+            self.n_bad += 1
+            self.n_ok -= 1
+            self.damage.add("audio_size.late")

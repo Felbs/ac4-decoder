@@ -24,11 +24,19 @@ a hint track that only declares a default size.
 A fragment whose mdat is not complete in the input is skipped as a whole,
 the same way a reader of a growing file leaves it for later.
 
+DAMAGE. A trun whose sample_count cannot fit in its box makes the fragment
+unusable (skipped). A sample whose size or offset points outside the mdat
+is returned as an EMPTY frame, so the sample count -- and so the timeline
+-- is kept; the decoder conceals it.
+
 Not handled (stage 1): the 'dac4' decoder-specific box is not parsed (the
 decoder reads everything from the in-band table of contents), raw AC-4
 sync frames, MPEG-TS, and non-fragmented MP4 (stsz/stco sample tables).
 """
 from __future__ import annotations
+
+# More samples than any real fragment holds (a damaged sample_count).
+MAX_SAMPLES = 1 << 16
 
 
 def boxes(d, start=0, end=None):
@@ -110,6 +118,7 @@ def _tfhd(d, o):
 
 
 def _trun(d, o):
+    box_end = o + int.from_bytes(d[o:o + 4], "big")
     fl = int.from_bytes(d[o + 9:o + 12], "big")
     n = int.from_bytes(d[o + 12:o + 16], "big")
     p = o + 16
@@ -122,10 +131,13 @@ def _trun(d, o):
     per = sum(4 for b in (0x100, 0x200, 0x400, 0x800) if fl & b)
     soff = 4 if fl & 0x100 else 0
     sizes = None
+    if p + n * per > min(box_end, len(d)) or n > MAX_SAMPLES:
+        # a damaged sample_count: the per-sample table cannot be that long
+        return dict(flags=fl, n=0, data_offset=doff, sizes=None, bad=True)
     if fl & 0x200:
         sizes = [int.from_bytes(d[p + i * per + soff:p + i * per + soff + 4], "big")
                  for i in range(n)]
-    return dict(flags=fl, n=n, data_offset=doff, sizes=sizes)
+    return dict(flags=fl, n=n, data_offset=doff, sizes=sizes, bad=False)
 
 
 def fragment_samples(d, moof_o, moof_sz, track_id=None):
@@ -143,7 +155,7 @@ def fragment_samples(d, moof_o, moof_sz, track_id=None):
                 tf = _tfhd(d, co)
             elif ct == b"trun":
                 truns.append(_trun(d, co))
-        if tf is None or not truns:
+        if tf is None or not truns or any(t["bad"] for t in truns):
             continue
         if tf["base"] is not None:
             base = tf["base"]
@@ -162,7 +174,7 @@ def fragment_samples(d, moof_o, moof_sz, track_id=None):
                 pos = base
             sizes = tr0["sizes"]
             if sizes is None:
-                if tf["default_size"] is None:
+                if tf["default_size"] is None or tr0["n"] > MAX_SAMPLES:
                     sizes = None
                 else:
                     sizes = [tf["default_size"]] * tr0["n"]
@@ -190,7 +202,10 @@ def frames(data, track_id=None):
     media segments alone). Incomplete trailing fragments are skipped."""
     d = bytes(data)
     if track_id is None:
-        ids = ac4_track_ids(d)
+        try:
+            ids = ac4_track_ids(d)
+        except (IndexError, ValueError):          # a damaged moov
+            ids = []
         track_id = ids[0] if ids else None
     out = []
     tops = list(boxes(d))
@@ -201,13 +216,18 @@ def frames(data, track_id=None):
         nxt = tops[i + 1] if i + 1 < len(tops) else None
         if nxt is None or nxt[2] != b"mdat" or nxt[0] + nxt[1] > len(d):
             continue
-        smp = fragment_samples(d, o, sz, track_id)
+        try:
+            smp = fragment_samples(d, o, sz, track_id)
+        except (IndexError, ValueError):          # a damaged moof
+            smp = None
         if smp is None:
             continue
         md_end = nxt[0] + nxt[1]
-        if any(p < nxt[0] + 8 or p + s > md_end for p, s in smp):
-            continue
-        out.extend(d[p:p + s] for p, s in smp)
+        # a sample whose (damaged) size or offset points outside the mdat
+        # still holds its place in time: it is passed on EMPTY, and the
+        # decoder conceals it, instead of the whole fragment being dropped
+        out.extend(d[p:p + s] if nxt[0] + 8 <= p and p + s <= md_end
+                   else b"" for p, s in smp)
     return out
 
 

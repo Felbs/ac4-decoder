@@ -3,6 +3,11 @@
 
     ac4dec IN.m4s OUT.wav [--element auto|5_X|pair] [--channels 2|6]
                           [--seconds S] [--max-pass N] [--ref-peak X]
+                          [--no-guard]
+
+DAMAGED INPUT. Frames that break a rule of the bitstream are concealed
+(faded to silence, exact length kept); the summary line counts them as
+"concealed", with the reasons above it.
 
 IN is an init segment followed by media fragments (moof + mdat), or bare
 fragments. OUT is 16-bit PCM at 48 kHz: 6 channels in WAV 5.1 order
@@ -62,7 +67,7 @@ def to_int16(pcm):
 
 
 def decode_file(src, dst, element="auto", channels=None, seconds=None,
-                max_pass=1800, ref_peak=0.0, quiet=False):
+                max_pass=1800, ref_peak=0.0, quiet=False, guard=True):
     from . import mp4
     from .decoder import Decoder, probe_element
     from .resample import StreamResampler
@@ -84,7 +89,7 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
                 "pass --element")
             return 1
     t0 = time.time()
-    dec = Decoder(element, channels)
+    dec = Decoder(element, channels, guard=guard)
     lvl = LevelPolicy(element, ref_peak)
     rs = StreamResampler()
     n_ch = len(dec.chans)
@@ -107,7 +112,12 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
     for line in dec.log + lvl.notes:
         say("  " + line)
     secs = n_out / OUT_FS
-    say(f"{len(frames)} frames ({dec.n_bad} bad), element {element}, "
+    if dec.n_concealed:
+        why = ", ".join(f"{k} {v}" for k, v in
+                        sorted(dec.concealed.reasons.items()))
+        say(f"  concealed frames by reason: {why}")
+    say(f"{len(frames)} frames ({dec.n_bad} bad, {dec.n_concealed} "
+        f"concealed, {dec.n_seq_jumps} sequence jumps), element {element}, "
         f"{n_ch} ch, {secs:.3f} s -> {dst}  "
         f"[{dt:.1f} s, {secs / dt if dt > 0 else 0:.2f}x real time; "
         f"A-SPX bursts {dec.n_burst}, A-SPX failures {dec.n_hf_fail}]")
@@ -132,10 +142,14 @@ def main(argv=None):
     ap.add_argument("--ref-peak", type=float, default=0.0,
                     help="decoder-scale level written at 0.9 of full scale "
                          "(0 = the per-element default)")
+    ap.add_argument("--no-guard", action="store_true",
+                    help="turn off the output level guard (damaged-frame "
+                         "safety net; see README)")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
     return decode_file(a.src, a.dst, a.element, a.channels, a.seconds,
-                       a.max_pass, a.ref_peak, a.quiet)
+                       a.max_pass, a.ref_peak, a.quiet,
+                       guard=not a.no_guard)
 
 
 if __name__ == "__main__":

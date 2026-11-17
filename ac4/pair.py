@@ -29,8 +29,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 from .toc import Bits                                     # noqa: E402
-from .channels import (aspx_config, companding_control,        # noqa: E402
-                          two_channel_data)
+from .channels import (aspx_config, audio_size,                # noqa: E402
+                       companding_control, two_channel_data)
 
 
 def decode_pair(sub, T, b_iframe=False):
@@ -38,9 +38,7 @@ def decode_pair(sub, T, b_iframe=False):
     with L/R only. Raises on ACPL modes (not seen on this air; counted by
     the caller as bad frames rather than mis-decoded)."""
     b = Bits(sub)
-    b.u(15)                                          # audio_size_value
-    if b.u(1):
-        b.u(7)                                       # audio_size extension
+    asz, a0 = audio_size(b)                          # Table 16
     mode = b.u(2)                                    # stereo_codec_mode
     if mode >= 2:
         raise ValueError(f"stereo_codec_mode {mode} (ACPL) not implemented")
@@ -51,4 +49,5 @@ def decode_pair(sub, T, b_iframe=False):
         companding_control(b, 2)
     l, r, st = two_channel_data(b, T)
     return dict(L=l, R=r, st_lr=st, aspx=aspx,
-                bits=b.p, nbits=len(sub) * 8)
+                bits=b.p, nbits=len(sub) * 8,
+                audio_size=asz, audio_start=a0, mode=("pair", mode))

@@ -70,6 +70,7 @@ from . import qmf as Q                                               # noqa: E40
 from . import aspx_env as V                                          # noqa: E402
 from . import aspx_hfgen as G                                             # noqa: E402
 from . import aspx_envadj as E                                            # noqa: E402
+from .robust import CONCEALED                                        # noqa: E402
 
 FS = 48000
 
@@ -138,6 +139,20 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None):
         if state_log is not None:
             state_log.append((idx_noise, (prev[0], prev[1]),
                               (nprev[0], nprev[1])))
+        if got is CONCEALED:
+            # a concealed frame: no high band for its slots (its core is
+            # the faded overlap tail); the envelope state is held as it was
+            for k in ("L", "R"):
+                ta = max(slot + TS_OFFSET, 0)
+                tz = min(slot + 24 + TS_OFFSET, Qh[k].shape[1])
+                if tz > ta:
+                    Qh[k][sbx:sbx + n_sb, ta:tz] = 0.0
+            # the noise table runs on as if the frame had been decoded
+            # (one frame = 24 QMF slots), so the frames after it pick up
+            # the noise sequence where a clean decode would be
+            idx_noise = (idx_noise + n_sb * 24) % 512
+            slot += 24
+            continue
         if got is None or len(got) < 2:
             slot += 24
             continue

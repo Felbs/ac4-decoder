@@ -73,6 +73,8 @@ from . import hcb as H                                               # noqa: E40
 from . import spectral as S                                          # noqa: E402
 from . import sfb as B                                               # noqa: E402
 from .toc_v1 import Bits                                      # noqa: E402
+from . import robust as RB                                     # noqa: E402
+from .robust import Damaged, MAX_EXT_N, MAX_QUANT, SF_MAX, SF_MIN  # noqa: E402
 
 # Annex B scale factor band offsets, per transform length, each extracted and
 # gated against Table B.1's independent band count (M27).  Short frames split
@@ -117,6 +119,8 @@ def asf_section_data(b, max_sfb, n_sect_bits=5):
     k = 0
     while k < max_sfb:
         cb = b.u(4)
+        if cb > 11 and RB.CHECKS:         # 4.3.6.3.1: 12..15 shall not be used
+            raise Damaged("asf.sect_cb", str(cb))
         sect_len = 1
         while True:
             incr = b.u(n_sect_bits)
@@ -125,9 +129,11 @@ def asf_section_data(b, max_sfb, n_sect_bits=5):
             sect_len += esc
         sect_len += incr
         end = k + sect_len
-        # a section may not run past max_sfb; with max_sfb 43 < 49 the LSF
-        # split in the spec never triggers for this stream, but guard anyway
+        # the sections tile 0..max_sfb exactly; one that runs past it is a
+        # damaged frame, not something to clamp
         if end > max_sfb:
+            if RB.CHECKS:
+                raise Damaged("asf.sect_len", f"{end} > {max_sfb}")
             end = max_sfb
         for sfb in range(k, end):
             sfb_cb[sfb] = cb
@@ -278,6 +284,8 @@ def asf_spectral_data(b, sects, offsets, tables):
                         n = 0
                         while b.u(1):
                             n += 1
+                            if n > MAX_EXT_N and RB.CHECKS:  # <= 8191
+                                raise Damaged("asf.quant", "ext_code")
                         mag = (1 << (n + 4)) + b.u(n + 4)
                         vals[j] = -mag if v < 0 else mag
             lines[k:k + dim] = vals[:max(0, min(dim, len(lines) - k))]
@@ -353,6 +361,9 @@ def sf_data(b, fr, T):
                          default=0), dtype=np.int32)
     for g in range(G):
         part = asf_spectral_data(b, sects[g], offs[g], T["cb"])
+        if (RB.CHECKS and len(part)
+                and int(np.abs(part).max()) > MAX_QUANT):
+            raise Damaged("asf.quant", "line above 8191")
         n = min(len(part), len(lines))
         lines[:n] = np.where(part[:n] != 0, part[:n], lines[:n])
     sfs, first = [], [False]
@@ -377,6 +388,8 @@ def _scalefac_group(b, sfb_cb, lines, offsets, sf_table, max_sfb, cur, first):
         if sfb_cb[sfb] != 0 and band_max(lines, offsets, sfb) > 0:
             if first[0]:
                 cur[0] += sf_table.decode(b) - SF_CENTRE
+                if not SF_MIN <= cur[0] <= SF_MAX and RB.CHECKS:
+                    raise Damaged("asf.sf_range", str(cur[0]))
             else:
                 first[0] = True
             out[sfb] = cur[0]
@@ -458,6 +471,9 @@ class Framing:
         self.max_sfb = [b.u(n_msfb_bits(self.length_idx(0)))]
         if self.different:
             self.max_sfb.append(b.u(n_msfb_bits(self.length_idx(1))))
+        for i, m in enumerate(self.max_sfb):
+            if m > len(SFB_TABLE[self.length_idx(i)]) - 1 and RB.CHECKS:
+                raise Damaged("asf.max_sfb", f"{m}")
         n_grp = 0 if self.long else N_GRP_BITS[tuple(self.tl)]
         sfg = [b.u(1) for _ in range(n_grp)]
 
@@ -686,26 +702,63 @@ def _acpl3_core(b, T, b_iframe, sub):
     5.1 upmix for an A-CPL build.  acpl_data_2ch sits LAST in the frame, so
     not parsing it costs nothing upstream.
     """
-    aspx = None
+    aspx = acpl = None
     if b_iframe:
         aspx = aspx_config(b)
-        b.u(4)                                       # acpl_config_2ch, Table 60
+        acpl = acpl_config_2ch(b)                    # Table 60
     lfe = mono_data(b, T, b_lfe=True)                # b_has_lfe (5.1)
     companding_control(b, 2)
     l, r, st_lr = two_channel_data(b, T)             # stereo_data(), Table 23
     return dict(lfe=lfe, L=l, R=r, st_lr=st_lr, aspx=aspx, acpl3=True,
-                bits=b.p, nbits=len(sub) * 8, coding_config=None)
+                acpl=acpl, bits=b.p, nbits=len(sub) * 8, coding_config=None)
+
+
+# Table 142: acpl_num_param_bands_id -> acpl_num_param_bands
+ACPL_NUM_PARAM_BANDS = {0: 15, 1: 12, 2: 9, 3: 7}
+
+
+def acpl_config_2ch(b):
+    """Table 60: four bits, no conditionals."""
+    return dict(bands_id=b.u(2), quant_mode_0=b.u(1), quant_mode_1=b.u(1))
+
+
+def acpl_data_2ch(b, books, acfg):
+    """Tables 62-65, READ FOR BIT ACCOUNTING ONLY: the A-CPL upmix is not
+    built, but walking these bits lets an ASPX_ACPL_3 frame close exactly
+    on audio_size (robust.py). `books` maps an Annex A name such as
+    "ACPL_HCB_ALPHA_FINE_F0" to a Huffman book.  acpl_param_band is 0 for
+    the 2-channel configuration (Table 60)."""
+    interp = b.u(1)                                  # acpl_interpolation_type
+    n_ps = b.u(1) + 1                                # Table 145
+    if interp == 1:
+        for _ in range(n_ps):
+            b.u(5)                                   # acpl_param_timeslot
+    nb = ACPL_NUM_PARAM_BANDS[acfg["bands_id"]]
+    q0 = "COARSE" if acfg["quant_mode_0"] else "FINE"     # Table 143
+    q1 = "COARSE" if acfg["quant_mode_1"] else "FINE"
+    for dtype, q in ((("ALPHA", q0),) * 2 + (("BETA", q0),) * 2
+                     + (("BETA3", q0),) + (("GAMMA", q1),) * 6):
+        for _ in range(n_ps):                        # acpl_ec_data
+            if b.u(1) == 0:                          # diff_type: DIFF_FREQ
+                books[f"ACPL_HCB_{dtype}_{q}_F0"].decode(b)
+                df = books[f"ACPL_HCB_{dtype}_{q}_DF"]
+                for _ in range(1, nb):
+                    df.decode(b)
+            else:                                    # DIFF_TIME
+                dt = books[f"ACPL_HCB_{dtype}_{q}_DT"]
+                for _ in range(nb):
+                    dt.decode(b)
 
 
 def decode_element(sub, T, b_iframe=False):
     """The whole 5.1 element.  -> dict of six channels + the bit position."""
     b = Bits(sub)
-    b.u(15)                                          # audio_size_value
-    if b.u(1):
-        b.vb(7)
+    asz, a0 = audio_size(b)
     codec_mode = b.u(3)
     if codec_mode == 4:
-        return _acpl3_core(b, T, b_iframe, sub)
+        r = _acpl3_core(b, T, b_iframe, sub)
+        r.update(audio_size=asz, audio_start=a0, mode=("5_X", 4))
+        return r
     if codec_mode != 1:
         raise ValueError(f"5_X_codec_mode {codec_mode} is not ASPX")
     aspx = aspx_config(b) if b_iframe else None
@@ -720,7 +773,18 @@ def decode_element(sub, T, b_iframe=False):
     centre = mono_data(b, T, b_lfe=False)
     return dict(lfe=lfe, L=l, R=r, Ls=ls, Rs=rs, C=centre,
                 st_lr=st_lr, st_sr=st_sr, aspx=aspx,
-                bits=b.p, nbits=len(sub) * 8, coding_config=coding_config)
+                bits=b.p, nbits=len(sub) * 8, coding_config=coding_config,
+                audio_size=asz, audio_start=a0, mode=("5_X", 1))
+
+
+def audio_size(b):
+    """Table 16: audio_size_value, b_more_bits [variable_bits(7) << 15],
+    byte_align.  -> (audio_size in bytes, bit where audio_data starts)."""
+    asz = b.u(15)
+    if b.u(1):
+        asz += b.vb(7) << 15
+        b.align()
+    return asz, b.p
 
 
 def load_tables():

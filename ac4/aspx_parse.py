@@ -71,10 +71,16 @@ from . import spectral as S                                          # noqa: E40
 from . import channels as C                                          # noqa: E402
 from . import aspx_bands as A                                        # noqa: E402
 from .toc_v1 import Bits                                      # noqa: E402
+from . import robust as RB                                    # noqa: E402
+from .robust import Damaged, MAX_NUM_ENV                      # noqa: E402
 
 FIXFIX, FIXVAR, VARFIX, VARVAR = 0, 1, 2, 3
 NAMES = {FIXFIX: "FIXFIX", FIXVAR: "FIXVAR", VARFIX: "VARFIX",
          VARVAR: "VARVAR"}
+
+
+# See aspx_data(). Off reproduces the receiver this code came from.
+BALANCE_SHARES_STOP = True
 
 
 class Unsupported(Exception):
@@ -133,10 +139,18 @@ def aspx_framing(b, cfg, nats, b_iframe, state, key):
             for _ in range(b.u(n_rel_bits)):
                 rel_r.append(2 * b.u(n_rel_bits) + 2)
         num_env = len(rel_l) + len(rel_r) + 1
+        if num_env > MAX_NUM_ENV[ic] and RB.CHECKS:  # Table 127
+            raise Damaged("aspx.num_env", f"{num_env}")
         ptr_bits = math.ceil(math.log(num_env + 2) / math.log(2))
         tsg_ptr = b.u(ptr_bits) - 1
         borders = var_borders(ic, num_env, nats, b_iframe, var_l, var_r,
                               rel_l, rel_r, state, key)
+        # the interval's borders must run strictly forward, from inside the
+        # previous frame's overhang (var_l, 0..3) to at most nats + 3
+        if RB.CHECKS and (
+                borders[0] < 0 or borders[num_env] > nats + 3
+                or any(a >= z for a, z in zip(borders, borders[1:]))):
+            raise Damaged("aspx.borders", f"{borders}")
 
     if cfg["freq_res_mode"] == 0:
         fr = [b.u(1) for _ in range(num_env)]
@@ -310,6 +324,10 @@ def aspx_data(b, tabs, t, cfg, nats, b_iframe, two_ch, state, grp):
                      dir_noise=d_noise, balance=0, ch=0, ah=ah[0])]
     balance = b.u(1)
     f1, q1 = f0, q0
+    if balance == 1 and BALANCE_SHARES_STOP:
+        # channel 1 uses channel 0's framing, so its previous_stop_pos
+        # (Pseudocode 76, per channel) is channel 0's stop border too
+        state[(grp, 1)] = state[(grp, 0)]
     if balance == 0:
         f1 = aspx_framing(b, cfg, nats, b_iframe, state, (grp, 1))
         q1 = cfg["quant_mode_env"]
