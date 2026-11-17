@@ -19,13 +19,18 @@ KINDS
   repeat     the frame replaced by a copy of the one before it
   extend     random bytes appended to the frame
   empty      a zero-length sample
+  run        3..20 CONSECUTIVE frames, each with 1..3 flipped bits or a
+             2..32-byte burst (reception damage comes in runs; the hits
+             above are kept at least 6 frames apart)
+  first      1..3 bits flipped in the first 8 bytes (the TOC) of frame 0,
+             the frame a decoder learns the stream's layout from
 """
 from __future__ import annotations
 
 import numpy as np
 
 KINDS = ("bitflip", "burst", "truncate", "zero", "swap", "garbage",
-         "foreign", "repeat", "extend", "empty")
+         "foreign", "repeat", "extend", "empty", "run", "first")
 FRAME = 1536
 
 
@@ -47,6 +52,15 @@ def damage(frames, kind, seed, n_hits=6, foreign=None):
     """-> (damaged frame list, sorted list of damaged indices)."""
     rng = np.random.default_rng(seed)
     out = [bytes(f) for f in frames]
+    if kind == "run":
+        return _run(out, rng)
+    if kind == "first":
+        f = bytearray(out[0])
+        for _ in range(int(rng.integers(1, 4))):
+            j = int(rng.integers(0, 8 * min(8, len(f))))
+            f[j >> 3] ^= 0x80 >> (j & 7)
+        out[0] = bytes(f)
+        return out, [0]
     pos = pick_positions(len(out), n_hits, rng)
     hit = set()
     for i in pos:
@@ -95,6 +109,27 @@ def damage(frames, kind, seed, n_hits=6, foreign=None):
             raise ValueError(kind)
         hit.add(i)
     return out, sorted(hit)
+
+
+def _run(out, rng):
+    n_run = int(rng.integers(3, 21))
+    a = int(rng.integers(8, max(9, len(out) - n_run - 2)))
+    hit = []
+    for i in range(a, min(len(out) - 2, a + n_run)):
+        f = bytearray(out[i])
+        n = len(f)
+        if n and rng.random() < 0.5:
+            for _ in range(int(rng.integers(1, 4))):
+                j = int(rng.integers(0, 8 * n))
+                f[j >> 3] ^= 0x80 >> (j & 7)
+        elif n:
+            m = int(rng.integers(2, 33))
+            b = int(rng.integers(0, max(1, n - m)))
+            for j in range(b, min(n, b + m)):
+                f[j] ^= int(rng.integers(1, 256))
+        out[i] = bytes(f)
+        hit.append(i)
+    return out, hit
 
 
 def frame_peaks(y, frame=FRAME):

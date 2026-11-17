@@ -77,6 +77,11 @@ class Bits:
             val += self.u(n)
             if not self.u(1):
                 return val
+            if val >> 32:
+                # no field of a real stream comes near this; without the
+                # stop, a run of 1-bits (a damaged frame) grows an integer
+                # bit by bit to the end of the frame (quadratic time)
+                raise ValueError("variable_bits: value over 32 bits")
             val <<= n
             val += (1 << n)
 

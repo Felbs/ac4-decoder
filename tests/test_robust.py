@@ -7,13 +7,15 @@ MP4 reader on damaged boxes, the output guard and the sequence rules.
 With captures (AC4_TEST_DIR, see test_integration.py), each capture is cut
 to its first AC4_TEST_FRAGMENTS fragments and damaged deterministically
 (tests/inject.py: bit flips, byte bursts, truncation, zeroed bytes,
-swapped, repeated, extended, empty and garbage frames, and frames from
-another stream) with AC4_ROBUST_SEEDS seeds per kind (default 3). The
+swapped, repeated, extended, empty and garbage frames, frames from
+another stream, runs of 3..20 damaged frames in a row, and a damaged TOC in
+the first frame) with AC4_ROBUST_SEEDS seeds per kind (default 3). The
 gate, for every damaged decode:
 
   * no exception escapes Decoder.decode_pass;
   * the output has exactly 1536 samples per input frame;
   * no sample is above 2x the clean decode's own peak;
+  * at most MAX_COLLATERAL undamaged frames per hit are concealed;
   * every damaged frame is concealed, or provably harmless: frames
     i-1 .. i+8 equal the clean decode ("identical"), or no sample in them
     is above 2x the clean decode's own peak ("bounded"; inject.assess,
@@ -43,6 +45,7 @@ FRAME = 1536
 CAPTURES = CU.capture_files()
 N_FRAG = int(os.environ.get("AC4_TEST_FRAGMENTS", "2"))
 N_SEEDS = int(os.environ.get("AC4_ROBUST_SEEDS", "3"))
+MAX_COLLATERAL = RB.RELEARN + 1     # undamaged frames concealed per hit
 
 
 # ------------------------------------------------------- no captures needed
@@ -126,6 +129,41 @@ def test_output_guard_mutes_a_burst_and_ramps():
         np.abs(y0[11 * FRAME:11 * FRAME + g.RAMP]).max()
 
 
+def test_output_guard_does_not_lock_after_a_long_quiet_stretch():
+    """Loud, then 6 minutes far quieter, then loud again: the return is
+    programme, not damage (a guard that only releases slowly muted it for
+    good). Fed in 300-frame passes, as a caller might."""
+    g = RB.OutputGuard(1.0)
+
+    def feed(level, n):
+        out = []
+        for i in range(0, n, 300):
+            m = min(300, n - i)
+            y = (np.sin(0.07 * np.arange(m * FRAME)) * level)[:, None]
+            out.append(g.process(np.repeat(y, 2, axis=1)))
+        return np.concatenate(out)
+
+    assert not feed(0.9, 900).any()
+    assert not feed(0.3, int(6 * 60 * 29.97)).any()
+    assert not feed(0.9, 900).any()
+
+
+def test_output_guard_is_not_ratcheted_by_one_loud_frame():
+    """One accepted frame well above the stream level raises the
+    reference by at most UP x, so a louder frame after it is still
+    caught."""
+    g = RB.OutputGuard(1.0)
+    n = 400
+    y = np.repeat((np.sin(0.05 * np.arange(n * FRAME)) * 0.1)[:, None],
+                  2, axis=1)
+    g.init = 0.0                       # judge against the stream level
+    y[300 * FRAME + 7] = 0.24          # 2.4x: below RATIO, accepted
+    y[340 * FRAME + 7] = 0.6           # 6x: must still fire
+    fired = g.process(y)
+    assert not fired[300] and fired[340]
+    assert g.ref < 0.2
+
+
 def test_output_guard_ignores_a_steady_crescendo():
     g = RB.OutputGuard(1.0)
     t = np.arange(300 * FRAME)
@@ -179,7 +217,14 @@ def _foreign(caps, frames, el):
 
 def _run_gate(caps, kinds, seeds, guard):
     """-> (failures (str), worst peak ratio, worst local ratio of a frame
-    that was neither concealed nor identical, verdict counts)."""
+    that was neither concealed nor identical, verdict counts).
+
+    Also counted (tally["collateral"]): undamaged frames concealed. A hit
+    may cost its neighbours (a swapped pair, the frame after a damaged
+    sequence counter), but a decode that conceals more than
+    MAX_COLLATERAL undamaged frames per hit is a failure: that is the
+    shape of a decoder that locked onto a damaged frame's layout and muted
+    the rest."""
     import collections
     fails, worst, wloc = [], (0.0, None), (0.0, None)
     tally = collections.Counter()
@@ -201,6 +246,12 @@ def _run_gate(caps, kinds, seeds, guard):
                     fails.append(f"{tag}: shape {y.shape} != {clean.shape}")
                     continue
                 a = I.assess(clean, y, hits, d.last_concealed)
+                coll = int(d.last_concealed.sum()) - int(
+                    d.last_concealed[hits].sum())
+                tally["collateral"] += coll
+                if coll > MAX_COLLATERAL * max(1, len(hits)):
+                    fails.append(f"{tag}: {coll} undamaged frames "
+                                 f"concealed ({dict(d.concealed.reasons)})")
                 if a["peak_ratio"] > worst[0]:
                     worst = (a["peak_ratio"], tag)
                 if a["peak_ratio"] > 2.0:
@@ -248,6 +299,52 @@ def test_negative_control_old_behaviour_fails_the_gate(tmpdir_factory,
     print(f"negative control: {len(fails)} failures, worst peak "
           f"{worst[0]:.3g}x clean ({worst[1]})")
     assert fails, "the gate passed with the checks and guard off"
+
+
+def _first_iframe(frames, start=0):
+    from ac4 import toc as M
+    for i in range(start, len(frames)):
+        try:
+            if M.parse(frames[i])["b_iframe_global"]:
+                return i
+        except Exception:                                      # noqa: BLE001
+            pass
+    return None
+
+
+@pytestmark_caps
+def test_splice_to_another_stream_recovers(tmpdir_factory):
+    """Stream A, then stream B (same element, counter left as is: an
+    uncontrolled source change, TS 103 190-1 4.3.3.2.2). From just after
+    B's first I-frame on, nothing is concealed, and no sample is above 2x the louder clean stream."""
+    caps = _load(tmpdir_factory)
+    n_pairs = 0
+    for ia, (fa, ea) in enumerate(caps):
+        for ib, (fb, eb) in enumerate(caps):
+            if ia == ib or ea != eb or len(fa) < 60 or len(fb) < 120:
+                continue
+            k = 60
+            sp = fa[:k] + fb[k:]
+            d = Decoder(ea)
+            y = d.decode_pass(sp)
+            assert y.shape[0] == len(sp) * FRAME
+            i0 = _first_iframe(fb, k)
+            # (before B's first I-frame its frames need B's A-SPX
+            # configuration, which only an I-frame carries; the output
+            # guard judges the NEAR frames after concealed ones strictly,
+            # so a louder stream B may lose those too)
+            settle = (i0 + 1 + RB.OutputGuard.NEAR if i0 is not None
+                      else len(sp))
+            tail = d.last_concealed[settle:]
+            assert not tail.any(), (ia, ib, int(tail.sum()),
+                                    dict(d.concealed.reasons))
+            ca, _ = _clean(fa, ea)
+            cb, _ = _clean(fb, eb)
+            top = max(np.abs(ca).max(), np.abs(cb).max())
+            assert np.abs(y).max() <= 2.0 * top
+            n_pairs += 1
+    if not n_pairs:
+        pytest.skip("needs two captures of the same element")
 
 
 @pytestmark_caps

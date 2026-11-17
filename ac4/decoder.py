@@ -149,8 +149,10 @@ class Decoder:
             else None
         self.n_concealed = 0
         self.concealed = RB.DamageLog()
-        # A-SPX level check (robust.py): None turns it off
-        self.hf_ratio = RB.MAX_HF_RATIO if guard else None
+        # A-SPX level check (robust.py): one of the damaged-input checks,
+        # switched with them (robust.CHECKS), not with the output guard;
+        # None turns it off
+        self.hf_ratio = RB.MAX_HF_RATIO
         self.hf_floor = RB.HF_MIN_FRAC * REF_PEAK[element]
         self._aspx_flag = np.zeros(0, dtype=bool)
         self.n_frames = 0
@@ -186,6 +188,8 @@ class Decoder:
         try:
             y = self._decode_pass(frames)
             status = list(self.stream.status)
+            self.log.extend(self.stream.log)
+            self.stream.log.clear()
         except Exception as e:                                 # noqa: BLE001
             # last resort: nothing escapes, and the timeline holds
             self.log.append(f"decode pass failed ({type(e).__name__}: "
@@ -270,7 +274,9 @@ class Decoder:
                             core_for_bursts(hf["L"][lead:], hf["R"][lead:],
                                             pa, pb, lead, self.burst_limit,
                                             self.hf_hot[gkey],
-                                            hf_ratio=self.hf_ratio,
+                                            hf_ratio=(self.hf_ratio
+                                                      if RB.CHECKS
+                                                      else None),
                                             flagged=self._aspx_flag,
                                             hf_floor=self.hf_floor)
                         if nb_:

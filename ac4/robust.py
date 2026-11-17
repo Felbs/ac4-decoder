@@ -14,7 +14,8 @@ TABLE OF CONTENTS (TS 103 190-1 4.2.3, -2 6.2.1)
   toc.rate        fs_index / frame_rate_index differ from the stream's
   toc.shape       presentation/substream layout (channel modes, number of
                   substreams) differs from the stream's
-  toc.sizes       the substreams do not fit in the frame:
+  toc.sizes       the substream size list does not match n_substreams, or
+                  the substreams do not fit in the frame:
                   toc + payload_base + sum(substream_size) > frame length,
                   or a substream of size 0. (Equality does not hold on air:
                   frames carry trailing bytes, up to ~190 measured.)
@@ -30,9 +31,9 @@ AUDIO SUBSTREAM (4.2.4.2, 4.3.4.1)
                        first aspx_config, checked once an I-frame later in
                        the same decode pass brings it (Ac4Stream.
                        _late_closure; only when >= 90 % of such frames close)
-  element.mode         the element's codec mode differs from the stream's,
-                       other than on an I-frame that continues the sequence
-                       counter or marks a splice (a foreign frame)
+  element.mode         the element's codec mode differs from the stream's
+  (toc.version, toc.rate, toc.shape and element.mode are re-learnt: see
+  RELEARN below)
   element.parse        the element does not parse (ran out of bits, a
                        mode this decoder does not implement)
 
@@ -223,7 +224,7 @@ def check_toc(st, frame, ref_shape):
         raise Damaged("toc.seq_range", str(st["sequence_counter"]))
     sizes = st.get("substream_sizes") or []
     if len(sizes) < 2 or len(sizes) != st.get("n_substreams"):
-        raise Damaged("toc.shape", f"substream sizes {sizes}")
+        raise Damaged("toc.sizes", f"substream sizes {sizes}")
     total = st["toc_bytes"] + st.get("payload_base", 0) + sum(sizes)
     if total > len(frame) or min(sizes) < 1:
         raise Damaged("toc.sizes", f"{total} > {len(frame)}")
@@ -235,6 +236,50 @@ def check_toc(st, frame, ref_shape):
             raise Damaged("toc.rate")
         if shape[3:] != ref_shape[3:]:
             raise Damaged("toc.shape")
+
+
+# A TOC layout or codec mode that differs from the stream's is first taken
+# as damage (the frame is concealed). It is accepted as a real change of
+# source (TS 103 190-1 4.3.3.2.2: "uncontrolled" source changes happen, and
+# decoding resumes at the next I-frame) when the frame passes every other
+# check and either it is an I-frame (for a TOC change: and the next frame's
+# TOC agrees), or RELEARN frames in a row show the same new layout and mode.
+# Without this, one damaged TOC field in the first frame, or a splice to a
+# stream in another codec mode, muted everything after it.
+RELEARNABLE = ("toc.version", "toc.rate", "toc.shape", "element.mode")
+RELEARN = 3
+
+
+class Relearn:
+    """Counts consecutive frames that show the same change."""
+
+    def __init__(self):
+        self.key, self.n = None, 0
+
+    def reset(self):
+        self.key, self.n = None, 0
+
+    def accept(self, key, at_iframe):
+        """key: what the frame changes to. -> True to adopt it now."""
+        if key == self.key:
+            self.n += 1
+        else:
+            self.key, self.n = key, 1
+        if at_iframe or self.n >= RELEARN:
+            self.reset()
+            return True
+        return False
+
+
+def next_toc_agrees(frames, fi, shape):
+    """Does frame fi + 1 (if any) carry the TOC layout `shape`?"""
+    if fi + 1 >= len(frames):
+        return True
+    from . import toc as M
+    try:
+        return toc_shape(M.parse(frames[fi + 1])) == shape
+    except Exception:                                          # noqa: BLE001
+        return False
 
 
 def check_frame_size(frame):
@@ -268,54 +313,87 @@ def check_closure(r, sub_len, complete):
 class OutputGuard:
     """Last-resort level check on the decoded PCM, per frame.
 
-    ref     a running reference: the largest per-frame peak accepted so far,
-            released slowly (RELEASE per frame), never below FLOOR_FRAC of
-            the element's start level. It starts at the larger of
-            INIT_FRAC x the element's start level and the KTH largest of the
-            first WARM frame peaks of the first pass (so a burst of up to
-            KTH - 1 frames there cannot raise it), and releases from there.
-    fire    a frame whose peak exceeds RATIO x ref.
+    ref     the reference a frame is judged against: the larger of
+              * the stream level: the largest accepted frame peak, released
+                slowly (RELEASE per frame), seeded with the KTH largest of
+                the first WARM frame peaks (a burst of up to KTH - 1 frames
+                there cannot raise it), never below FLOOR_FRAC of the
+                element's start level; an accepted frame raises it to at
+                most UP x its present value, so one loud frame that gets through
+                cannot lift the guard out of the way for minutes;
+              * the start level: INIT_FRAC of the element's start level,
+                released fast (INIT_RELEASE per frame: halves in about
+                23 s), so a decoder that starts in a quiet passage does not
+                take a loud passage that follows for damage, and the
+                guard is relative to the stream itself within a minute or
+                two.
+    fire    a frame whose peak exceeds RATIO x ref, unless the rise is
+            SUSTAINED: at least S of the next L frames of the same pass,
+            not concealed upstream, are above both ref and 1/SPREAD of its
+            peak. Damage gives a frame or two; programme that gets louder
+            stays louder (without this a programme that returned to a
+            loud level after more than about 5 minutes below 40 % of it
+            was muted for good). A frame too near the end of its pass to
+            look ahead is judged without the exception.
+
+    NEAR DAMAGE. A frame within NEAR frames of one concealed upstream is
+    (or concealed itself: its output still carries the overlap tail of the
+    frame before it) is judged more strictly: against the stream level
+    alone (not the start level) and NEAR_RATIO, without the sustained
+    exception; and it does not raise the reference. Reception
+    damage comes in runs, and a damaged frame that slips through the
+    bitstream checks usually has concealed neighbours. Clean material has
+    no concealed frames, so this cannot touch it; on air it costs at most
+    a frame or two next to frames that are lost anyway.
 
     A frame that fires is muted: a short linear ramp from the last output
     sample down to zero at its start, zeros, and the next frame that does
     not fire ramps back in over RAMP samples. Frames that fire, and frames
     concealed upstream, do not raise the reference.
 
-    WHY AN ABSOLUTE START. A decoder that starts during a quiet passage has
-    no idea how loud the programme gets: simulated starts at every 250th
-    frame of the clean material reached 3.6 x a purely relative reference
-    when loud audio followed 10 s later. Starting the reference at
-    INIT_FRAC of the element's level, and letting it release, removes that.
-
-    MEASURED on clean material (136,000 frames, about 76 min, both
-    broadcasters, 5.1 and stereo; 549 simulated stream starts; see the
-    README): no frame peak above 1.76 x this reference. RATIO 2.5 leaves
-    1.42x (3.1 dB) margin over that: a trade between never touching clean
-    audio and catching damage the bitstream cannot show (for example a
-    flipped bit in an ext_code value, which changes a line's size but no
-    bit count). These are choices from those measurements, not figures
-    from the standard.
+    MEASURED on clean material (the per-frame peaks of 136,000 frames,
+    about 76 min, both broadcasters, 5.1 and stereo, with 549 simulated
+    stream starts; see the README): no frame fires; the largest peak of a
+    frame not excused as sustained is 2.18 x ref, so RATIO 2.5 leaves a
+    1.15x (1.2 dB) margin. These are choices from those measurements, not
+    figures from the standard. Like every level rule, it cannot tell a
+    damaged frame from programme within RATIO x the reference.
     """
 
     RATIO = 2.5
     RELEASE = 0.9999          # per frame: about -0.03 dB per second
+    INIT_RELEASE = 0.999      # per frame: halves in about 23 s
+    UP = 1.5
     FLOOR_FRAC = 0.05
     INIT_FRAC = 0.75
     WARM = 30
     KTH = 5
+    L, S, SPREAD = 6, 4, 4.0
+    NEAR, NEAR_RATIO = 3, 2.0
     RAMP = 256
 
     def __init__(self, start_level, frame=1536):
         self.frame = frame
         self.floor = self.FLOOR_FRAC * float(start_level)
         self.init = self.INIT_FRAC * float(start_level)
-        self.ref = None
+        self.ref = None           # the stream level
         self.last = None          # last output sample per channel
         self.muted = False        # was the previous frame muted?
         self.n_fired = 0
+        self.n_sustained = 0
+
+    def level(self):
+        return max(self.ref or 0.0, self.init, self.floor)
 
     def limit(self):
-        return self.RATIO * max(self.ref or 0.0, self.floor)
+        return self.RATIO * self.level()
+
+    def _sustained(self, pk, ok, f, ref):
+        ahead = slice(f + 1, f + 1 + self.L)
+        if len(pk[ahead]) < self.L:
+            return False
+        thr = max(ref, pk[f] / self.SPREAD)
+        return int(((pk[ahead] > thr) & ok[ahead]).sum()) >= self.S
 
     def process(self, y, force=None):
         """y: (n_frames * frame, ch), modified in place where frames fire.
@@ -330,18 +408,29 @@ class OutputGuard:
         with np.errstate(invalid="ignore"):
             pk = np.abs(y[:n * F]).reshape(n, F, -1).max(axis=(1, 2))
         pk = np.where(np.isfinite(pk), pk, np.inf)
+        forced = (np.zeros(n, dtype=bool) if force is None
+                  else np.asarray(force[:n], dtype=bool))
+        ok = ~forced & np.isfinite(pk)
         if self.ref is None:
-            ok = pk[:self.WARM]
-            if force is not None:
-                ok = ok[~np.asarray(force[:self.WARM], dtype=bool)]
-            ok = np.sort(ok[np.isfinite(ok)])[::-1]
-            seed = float(ok[min(self.KTH, len(ok)) - 1]) if len(ok) else 0.0
-            self.ref = max(seed, self.init, self.floor)
+            w = pk[:self.WARM][ok[:self.WARM]]
+            w = np.sort(w)[::-1]
+            seed = float(w[min(self.KTH, len(w)) - 1]) if len(w) else 0.0
+            self.ref = max(seed, self.floor)
         ramp_in = np.linspace(0.0, 1.0, self.RAMP, endpoint=False)[:, None]
         for f in range(n):
             seg = y[f * F:(f + 1) * F]
-            forced = bool(force[f]) if force is not None else False
-            if pk[f] > self.limit():
+            ref = self.level()
+            self.init *= self.INIT_RELEASE
+            near = bool(forced[max(0, f - self.NEAR):f + self.NEAR + 1].any())
+            if near:
+                loud = pk[f] > self.NEAR_RATIO * max(self.ref, self.floor)
+            else:
+                loud = pk[f] > self.RATIO * ref
+            if loud and ok[f] and not near and \
+                    self._sustained(pk, ok, f, ref):
+                loud = False
+                self.n_sustained += 1
+            if loud:
                 fired[f] = True
                 self.n_fired += 1
                 seg[:] = 0.0
@@ -355,11 +444,9 @@ class OutputGuard:
                     m = min(self.RAMP, F)
                     seg[:m] *= ramp_in[:m]
                     self.muted = False
-                if forced:
-                    self.ref = max(self.ref * self.RELEASE, self.floor)
-                else:
-                    self.ref = max(self.ref * self.RELEASE, float(pk[f]),
-                                   self.floor)
+                rise = (float(min(pk[f], self.UP * self.ref))
+                        if ok[f] and not near else 0.0)
+                self.ref = max(self.ref * self.RELEASE, rise, self.floor)
             self.last = np.array(seg[-1], dtype=float)
         return fired
 

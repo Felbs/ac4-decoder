@@ -68,6 +68,8 @@ class Ac4Stream:
         self.toc_shape = None       # the stream's TOC layout, from frame 1
         self.mode = None            # the element's codec mode, from frame 1
         self.seq_prev = None        # sequence_counter of the last frame
+        self.relearn = RB.Relearn()  # a change of TOC layout / codec mode
+        self.log = []
         self.n_seq_jumps = 0
         # per frame of the LAST decode_frames call: None = decoded, else the
         # reason it was concealed; and whether its counter broke sequence
@@ -134,8 +136,18 @@ class Ac4Stream:
                     st = M.parse(f)
                 except Exception as e:                         # noqa: BLE001
                     raise RB.Damaged("toc.parse", str(e)[:60])
+                # a TOC or codec mode that differs from the stream's is
+                # judged only after the frame has passed every other check
+                # (RB.Relearn): a real change is accepted at an I-frame, or
+                # after RB.RELEARN frames in a row that agree on it
+                changed = None
                 if on:
-                    RB.check_toc(st, f, self.toc_shape)
+                    try:
+                        RB.check_toc(st, f, self.toc_shape)
+                    except RB.Damaged as e:
+                        if e.reason not in RB.RELEARNABLE:
+                            raise
+                        changed = e
                 seq = st["sequence_counter"]
                 brk = not RB.seq_continues(seq, self.seq_prev)
                 if on and brk and seq != 0 and fi + 1 < len(frames):
@@ -176,13 +188,12 @@ class Ac4Stream:
                 if r["bits"] > r["nbits"]:
                     raise RB.Damaged("element.parse",
                                      "element overran its substream")
-                # a different codec mode is a foreign frame, unless it is an
-                # I-frame where the stream may legitimately switch: one that
-                # continues the sequence counter or marks a splice (0)
-                if (on and self.mode is not None and r["mode"] != self.mode
-                        and not (ifr and (not brk or seq == 0))):
-                    raise RB.Damaged("element.mode",
-                                     f"{r['mode']} in a {self.mode} stream")
+                # a different codec mode: a foreign or damaged frame, or a
+                # real change of source (4.3.3.2.2); judged like the TOC
+                if (on and changed is None and self.mode is not None
+                        and r["mode"] != self.mode):
+                    changed = RB.Damaged("element.mode", f"{r['mode']} in "
+                                         f"a {self.mode} stream")
                 cfg = r.get("aspx") or self.cfg
                 if on and r.get("aspx"):
                     try:
@@ -278,6 +289,22 @@ class Ac4Stream:
                         if len(v) and not (np.abs(v).max()
                                            <= RB.MAX_SPECTRAL_LINE):
                             raise RB.Damaged("asf.level", k)
+                if changed is not None:
+                    key = (changed.reason, RB.toc_shape(st), r["mode"])
+                    at_i = ifr
+                    if ifr and changed.reason != "element.mode":
+                        # a TOC change at an I-frame: the next frame's TOC
+                        # must agree (one damaged I-frame is not a change)
+                        at_i = RB.next_toc_agrees(frames, fi, key[1])
+                    if not self.relearn.accept(key, at_i):
+                        raise changed
+                    self.log.append(f"stream changed ({changed}) -- "
+                                    "accepted " + ("at an I-frame" if ifr
+                                                   else f"after {RB.RELEARN}"
+                                                   " frames"))
+                    self.toc_shape = RB.toc_shape(st)
+                else:
+                    self.relearn.reset()
                 # ---- the frame is accepted: commit its state
                 if r.get("aspx"):
                     self.cfg = r["aspx"]
@@ -319,8 +346,16 @@ class Ac4Stream:
                 self.seq_break.append(False)
                 # the next frame is expected to carry the counter this one
                 # should have had
+                # (a frame whose own counter the next frame continues is
+                # taken at its word: after a source change, every later
+                # frame would otherwise look like a break too)
+                nxt = (RB.peek_counter(frames[fi + 1])
+                       if fi + 1 < len(frames) else None)
                 if resume is not None:
                     self.seq_prev = resume
+                elif (seq is not None and nxt is not None
+                        and RB.seq_continues(nxt, seq)):
+                    self.seq_prev = seq
                 elif self.seq_prev is not None:
                     self.seq_prev = RB.seq_next(self.seq_prev)
             for k in chans:
