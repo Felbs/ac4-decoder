@@ -552,34 +552,50 @@ def chparam_info(b, fr, sf_table):
     """
     sap_mode = b.u(2)
     ms_used = None
+    sap = None
     G = fr.num_groups
     if sap_mode == 1:
         ms_used = []
         for g in range(G):
             ms_used.append([b.u(1) for _ in range(fr.max_sfb_g(g))])
     elif sap_mode == 3:
-        # sap_data(), clause 4.2.10.2
-        used = {}
-        all_on = b.u(1)                             # sap_coeff_all
-        for g in range(G):
-            m = fr.max_sfb_g(g)
-            if all_on:
-                used[g] = [1] * m
-                continue
-            u = []
-            for sfb in range(0, m, 2):
-                v = b.u(1)
-                u.append(v)
-                if sfb + 1 < m:
-                    u.append(v)                     # pairs share the flag
-            used[g] = u[:m]
-        if G != 1:
-            b.u(1)                                  # delta_code_time
-        for g in range(G):
-            for sfb in range(0, fr.max_sfb_g(g), 2):
-                if used[g][sfb]:
-                    sf_table.decode(b)              # dpcm_alpha_q
-    return sap_mode, ms_used
+        sap = sap_data(b, fr, sf_table)
+    return sap_mode, ms_used, sap
+
+
+def sap_data(b, fr, sf_table):
+    """Table 48, clause 4.2.10.2. -> dict with, per window group g,
+    `coeff_used[g]` (one flag per scale factor band below max_sfb_g; odd
+    bands copy the even band before them), `delta_code_time` (0 when there
+    is only one group, where the element is absent) and `dpcm[g]` (the
+    sap_hcw symbol index, 0..120, for each EVEN band whose flag is set;
+    None elsewhere). Clause 5.3.2 turns these into prediction gains."""
+    G = fr.num_groups
+    used = []
+    all_on = b.u(1)                                 # sap_coeff_all
+    for g in range(G):
+        m = fr.max_sfb_g(g)
+        if all_on:
+            used.append([1] * m)
+            continue
+        u = []
+        for sfb in range(0, m, 2):
+            v = b.u(1)                              # sap_coeff_used
+            u.append(v)
+            if sfb + 1 < m:
+                u.append(v)                         # pairs share the flag
+        used.append(u[:m])
+    dct = b.u(1) if G != 1 else 0                   # delta_code_time
+    dpcm = []
+    for g in range(G):
+        m = fr.max_sfb_g(g)
+        d = [None] * m
+        for sfb in range(0, m, 2):
+            if used[g][sfb]:
+                d[sfb] = sf_table.decode(b)         # dpcm_alpha_q, sap_hcw
+        dpcm.append(d)
+    return dict(coeff_all=all_on, coeff_used=used, delta_code_time=dct,
+                dpcm=dpcm, max_sfb=[fr.max_sfb_g(g) for g in range(G)])
 
 
 def companding_control(b, num_chan):
@@ -600,15 +616,16 @@ def two_channel_data(b, T):
     2 = M/S in ALL bands, 3 = full SAP (alpha prediction).  When M/S is on the
     two blocks are mid and side, not left and right.
     """
-    sap, ms_used = None, None
+    sap, ms_used, sap_d = None, None, None
     if b.u(1):                                      # b_enable_mdct_stereo_proc
         fr = Framing(b)
-        sap, ms_used = chparam_info(b, fr, T["sf"])
+        sap, ms_used, sap_d = chparam_info(b, fr, T["sf"])
         frs = [fr, fr]
     else:
         frs = [Framing(b), Framing(b)]
     chans = [sf_data(b, frs[i], T) for i in range(2)]
     return chans[0], chans[1], dict(sap_mode=sap, ms_used=ms_used,
+                                    sap=sap_d,
                                     max_sfb=frs[0].max_sfb_g(0),
                                     framing=frs[0])
 
@@ -705,49 +722,14 @@ def _acpl3_core(b, T, b_iframe, sub):
     aspx = acpl = None
     if b_iframe:
         aspx = aspx_config(b)
-        acpl = acpl_config_2ch(b)                    # Table 60
+        from .acpl_parse import acpl_config_2ch
+        acpl = acpl_config_2ch(b)                    # Table 60, four bits
     lfe = mono_data(b, T, b_lfe=True)                # b_has_lfe (5.1)
     companding_control(b, 2)
     l, r, st_lr = two_channel_data(b, T)             # stereo_data(), Table 23
     return dict(lfe=lfe, L=l, R=r, st_lr=st_lr, aspx=aspx, acpl3=True,
-                acpl=acpl, bits=b.p, nbits=len(sub) * 8, coding_config=None)
-
-
-# Table 142: acpl_num_param_bands_id -> acpl_num_param_bands
-ACPL_NUM_PARAM_BANDS = {0: 15, 1: 12, 2: 9, 3: 7}
-
-
-def acpl_config_2ch(b):
-    """Table 60: four bits, no conditionals."""
-    return dict(bands_id=b.u(2), quant_mode_0=b.u(1), quant_mode_1=b.u(1))
-
-
-def acpl_data_2ch(b, books, acfg):
-    """Tables 62-65, READ FOR BIT ACCOUNTING ONLY: the A-CPL upmix is not
-    built, but walking these bits lets an ASPX_ACPL_3 frame close exactly
-    on audio_size (robust.py). `books` maps an Annex A name such as
-    "ACPL_HCB_ALPHA_FINE_F0" to a Huffman book.  acpl_param_band is 0 for
-    the 2-channel configuration (Table 60)."""
-    interp = b.u(1)                                  # acpl_interpolation_type
-    n_ps = b.u(1) + 1                                # Table 145
-    if interp == 1:
-        for _ in range(n_ps):
-            b.u(5)                                   # acpl_param_timeslot
-    nb = ACPL_NUM_PARAM_BANDS[acfg["bands_id"]]
-    q0 = "COARSE" if acfg["quant_mode_0"] else "FINE"     # Table 143
-    q1 = "COARSE" if acfg["quant_mode_1"] else "FINE"
-    for dtype, q in ((("ALPHA", q0),) * 2 + (("BETA", q0),) * 2
-                     + (("BETA3", q0),) + (("GAMMA", q1),) * 6):
-        for _ in range(n_ps):                        # acpl_ec_data
-            if b.u(1) == 0:                          # diff_type: DIFF_FREQ
-                books[f"ACPL_HCB_{dtype}_{q}_F0"].decode(b)
-                df = books[f"ACPL_HCB_{dtype}_{q}_DF"]
-                for _ in range(1, nb):
-                    df.decode(b)
-            else:                                    # DIFF_TIME
-                dt = books[f"ACPL_HCB_{dtype}_{q}_DT"]
-                for _ in range(nb):
-                    dt.decode(b)
+                acpl=acpl, acpl_cfg=acpl, codec_mode=4,
+                bits=b.p, nbits=len(sub) * 8, coding_config=None)
 
 
 def decode_element(sub, T, b_iframe=False):
@@ -772,7 +754,7 @@ def decode_element(sub, T, b_iframe=False):
     ls, rs, st_sr = two_channel_data(b, T)          # Ls, Rs
     centre = mono_data(b, T, b_lfe=False)
     return dict(lfe=lfe, L=l, R=r, Ls=ls, Rs=rs, C=centre,
-                st_lr=st_lr, st_sr=st_sr, aspx=aspx,
+                st_lr=st_lr, st_sr=st_sr, aspx=aspx, codec_mode=codec_mode,
                 bits=b.p, nbits=len(sub) * 8, coding_config=coding_config,
                 audio_size=asz, audio_start=a0, mode=("5_X", 1))
 

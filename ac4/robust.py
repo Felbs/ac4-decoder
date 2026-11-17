@@ -323,7 +323,7 @@ class OutputGuard:
                 cannot lift the guard out of the way for minutes;
               * the start level: INIT_FRAC of the element's start level,
                 released fast (INIT_RELEASE per frame: halves in about
-                23 s), so a decoder that starts in a quiet passage does not
+                46 s), so a decoder that starts in a quiet passage does not
                 take a loud passage that follows for damage, and the
                 guard is relative to the stream itself within a minute or
                 two.
@@ -351,19 +351,19 @@ class OutputGuard:
     not fire ramps back in over RAMP samples. Frames that fire, and frames
     concealed upstream, do not raise the reference.
 
-    MEASURED on clean material (the per-frame peaks of 136,000 frames,
-    about 76 min, both broadcasters, 5.1 and stereo, with 549 simulated
-    stream starts; see the README): no frame fires; the largest peak of a
-    frame not excused as sustained is 2.18 x ref, so RATIO 2.5 leaves a
-    1.15x (1.2 dB) margin. These are choices from those measurements, not
+    MEASURED on clean material (the per-frame peaks of 136,461 frames,
+    about 76 min, both broadcasters, 5.1 with full SAP decoded and stereo,
+    with 549 simulated stream starts; see the README): no frame fires; the
+    largest frame peak is 2.51 x ref, so RATIO 3.0 leaves a 1.20x (1.6 dB)
+    margin. These are choices from those measurements, not
     figures from the standard. Like every level rule, it cannot tell a
     damaged frame from programme within RATIO x the reference.
     """
 
-    RATIO = 2.5
+    RATIO = 3.0
     RELEASE = 0.9999          # per frame: about -0.03 dB per second
-    INIT_RELEASE = 0.999      # per frame: halves in about 23 s
-    UP = 1.5
+    INIT_RELEASE = 0.9995     # per frame: halves in about 46 s
+    UP = 2.0
     FLOOR_FRAC = 0.05
     INIT_FRAC = 0.75
     WARM = 30

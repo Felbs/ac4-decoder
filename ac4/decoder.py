@@ -15,9 +15,9 @@ README's PROVENANCE section):
 
 `StreamResampler` (resample.py) then takes the internal rate to 48 kHz.
 
-What it does NOT do (stage 1): A-CPL upmix (an ASPX_ACPL_3 5.1 stream gives
-L/R; the other four channels are silent), A-SPX on the centre channel, full
-SAP (sap_mode 3), companding, DRC / dialogue / loudness metadata,
+What it does NOT do: A-CPL upmix (an ASPX_ACPL_3 5.1 stream gives
+L/R; the other four channels are silent), A-SPX on the centre channel,
+companding, DRC / dialogue / loudness metadata,
 presentation or substream choice (substream 1 is always decoded), frame
 rates other than 29.97 and sample rates other than 48 kHz.
 

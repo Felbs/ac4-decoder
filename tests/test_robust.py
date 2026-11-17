@@ -150,15 +150,15 @@ def test_output_guard_does_not_lock_after_a_long_quiet_stretch():
 
 def test_output_guard_is_not_ratcheted_by_one_loud_frame():
     """One accepted frame well above the stream level raises the
-    reference by at most UP x, so a louder frame after it is still
-    caught."""
+    reference by at most UP x (here 2x, not the 2.8x of the frame), so a
+    louder frame after it is still caught."""
     g = RB.OutputGuard(1.0)
     n = 400
     y = np.repeat((np.sin(0.05 * np.arange(n * FRAME)) * 0.1)[:, None],
                   2, axis=1)
     g.init = 0.0                       # judge against the stream level
-    y[300 * FRAME + 7] = 0.24          # 2.4x: below RATIO, accepted
-    y[340 * FRAME + 7] = 0.6           # 6x: must still fire
+    y[300 * FRAME + 7] = 0.28          # 2.8x: below RATIO, accepted
+    y[340 * FRAME + 7] = 0.8           # 8x: must still fire
     fired = g.process(y)
     assert not fired[300] and fired[340]
     assert g.ref < 0.2

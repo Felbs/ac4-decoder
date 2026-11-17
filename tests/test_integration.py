@@ -85,7 +85,13 @@ def test_identical_to_reference_worker(cut, tmp_path, max_pass):
     repo = CU.reference_repo()
     if not repo:
         pytest.skip("set AC4_REFERENCE_REPO to compare with the original")
-    element = probe_element(mp4.read_frames(cut))
+    frames = mp4.read_frames(cut)
+    element = probe_element(frames)
+    from ac4 import frameinfo
+    if any(3 in r["sap"] for r in frameinfo.walk(frames, element)):
+        # the original passes full SAP through undecoded; this package
+        # decodes it (tests/test_sap_captures.py), so these cuts differ
+        pytest.skip("cut has sap_mode 3 frames: output differs on purpose")
     channels = 6 if element == "5_X" else 2
     wdir = tmp_path / "lane"
     wdir.mkdir()

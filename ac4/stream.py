@@ -32,6 +32,7 @@ from . import spectral as S                                         # noqa: E402
 from . import aspx_bands as A                                       # noqa: E402
 from . import aspx_render as R37                                      # noqa: E402
 from . import robust as RB                                          # noqa: E402
+from . import acpl_parse as AP                                      # noqa: E402
 
 # Marks a CONCEALED frame in the A-SPX group lists (where None means "no
 # A-SPX data for this frame"). The renderer mutes the high band for it and
@@ -51,9 +52,7 @@ class Ac4Stream:
                      for n in arrays
                      if n.endswith("_LEN") and n.startswith("ASPX_")}
         # A-CPL books, for bit accounting of ASPX_ACPL_3 frames only
-        self.acpl_books = {
-            n[:-4]: S.Huff(arrays[n], arrays[n[:-4] + "_CW"])
-            for n in arrays if n.endswith("_LEN") and n.startswith("ACPL_")}
+        self.acpl_books = AP.load_books(arrays)
         self.acpl_cfg = None        # acpl_config_2ch, from the last I-frame
         for nm in self.tabs:
             P.CENTRE[nm] = 0 if nm.endswith("_F0") else \
@@ -239,7 +238,7 @@ class Ac4Stream:
                     acfg = r.get("acpl") or self.acpl_cfg
                     if on and acpl3 and acfg:
                         try:
-                            C.acpl_data_2ch(b, self.acpl_books, acfg)
+                            AP.acpl_data_2ch(b, self.acpl_books, acfg)
                         except Exception as e:                 # noqa: BLE001
                             raise RB.Damaged("acpl.parse", str(e)[:60])
                         end = b.p
@@ -397,7 +396,7 @@ class Ac4Stream:
                 if pd["acpl3"]:
                     if not acfg:
                         continue
-                    C.acpl_data_2ch(b, self.acpl_books, acfg)
+                    AP.acpl_data_2ch(b, self.acpl_books, acfg)
                 stop = pd["start"] + 8 * pd["size"]
                 ok = stop - 7 <= b.p <= stop
             except Exception:                                  # noqa: BLE001
