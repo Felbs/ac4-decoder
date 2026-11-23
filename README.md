@@ -175,6 +175,53 @@ first I-frame; levels in dB of full scale):
   0.15, Rs~R -0.28; their best lag against C is 500-900 samples, the
   decorrelators' delay).
 
+### Against independent references (phase B2)
+
+The public test kit carries the 5.1 programme also as E-AC-3 (256 kbit/s)
+and the stereo one as AAC; FFmpeg decodes those (E-AC-3 with
+`-drc_scale 0`), and the decode of the AC-4 version (`--drc off`) is
+compared after alignment (1163 samples for the 5.1, by cross-correlation
+of the centres).
+
+* **5.1 (ASPX_ACPL_2), levels and correlation.** Per channel within
+  +-0.9 dB (L +0.5, R +0.1, C +0.1, LFE +0.1, Ls -0.5, Rs -0.9);
+  correlation C 0.998, LFE 0.998, L 0.92, R 0.91, Ls 0.88, Rs 0.85.
+* **The surrounds lean towards the fronts, by design.** Our Rs correlates
+  a little better with the reference R (0.857) than with the reference Rs
+  (0.853). This is the coding, not a mapping error: in ASPX_ACPL_2 a
+  surround is rebuilt from its side's downmix L + Ls/sqrt2 (here R +
+  Rs/sqrt2) and decorrelated noise (Pseudocodes 116, 117), and the
+  programme's own R and Rs correlate 0.74. A best-case parametric
+  reconstruction computed from the reference itself (per 43 ms x 1/7
+  octave tile, the least-squares share of the downmix plus decorrelated
+  energy for the rest) prefers the front too above 1.6 kHz (Rs~R 0.37
+  against Rs~Rs 0.29 at 1.6 - 3.2 kHz). What the parameters control
+  matches: per tile, the share of the downmix in each surround (its
+  projection on the downmix) averages 0.18 - 0.51 against the
+  reference's 0.17 - 0.46 between 0.4 and 6.4 kHz (within 0.03 in every
+  octave of both sides but Rs at 0.4 - 0.8 kHz, 0.05), and the surround energy against the downmix 0.24 -
+  0.46 against 0.21 - 0.41; the per-tile L/Ls and R/Rs level ratios
+  correlate +0.4 to +0.5 with the reference's (a swapped pair or a
+  negated alpha makes them negative). Ls/Rs are not swapped (Ls~Ls 0.88
+  against Ls~Rs 0.70).
+* **12 - 16 kHz.** Phase B's "coupled channels about 5 dB low at 12 - 16
+  kHz" is the reference's own coding: above 11.4 kHz its L, R, Ls, Rs are
+  a flat spectral-extension plateau (to 13.6 kHz, then 20 dB down), its
+  centre is not. Our coupled channels sit 3 - 7 dB under that plateau, the
+  centre within 1 dB. On the AC-4 side the A-SPX crossover is 12.75 kHz;
+  the A-SPX output meets the encoder's transmitted envelope energies
+  within 0.25 dB up to 15 kHz on L/R (within 1 dB on C); above 15 kHz the
+  L/R output falls 5 - 11 dB under them, which is the standard's limiter
+  (Pseudocodes 96 - 100, two limiter groups by Pseudocode 72) capping the
+  gain where the patched source jumps by 24 dB at the patch border
+  (subband 44). Below the crossover the MDCT core falls 10 dB from 11.5
+  to 12.6 kHz on the L/R and C tracks alike.
+* **Stereo against AAC.** Level within -0.7 to -0.9 dB in every band to
+  10 kHz; the AAC version is low-passed at 11 kHz, so it says nothing
+  about the A-SPX range.
+
+No decoder error was found; nothing changed.
+
 ## Changes against the standard
 
 ### Phase A (2026-11-23, later)
