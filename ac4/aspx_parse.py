@@ -156,7 +156,12 @@ def aspx_framing(b, cfg, nats, b_iframe, state, key):
             raise Damaged("aspx.borders", f"{borders}")
 
     if cfg["freq_res_mode"] == 0:
-        fr = [b.u(1) for _ in range(num_env)]
+        # Table 53: a FIXFIX interval sends one aspx_freq_res, which
+        # Pseudocode 76 copies to every envelope; the others one each
+        if ic == FIXFIX:
+            fr = [b.u(1)] * num_env
+        else:
+            fr = [b.u(1) for _ in range(num_env)]
     else:
         fr = [freq_res(borders, e, max(tsg_ptr, 0), nats,
                        cfg["freq_res_mode"])
@@ -249,32 +254,32 @@ def _count(key, n=1):
 
 
 def hfgen_iwc(b, t, nats, two_ch, balance=0):
-    """Tables 55 and 56.  -> aspx_add_harmonic flags per channel.
-
-    The add-harmonic flags are the only thing here the synthesis needs; the
-    rest (tna_mode, and the fic/tic flags which are 0 throughout this stream)
-    are consumed for bit accounting only.
-    """
+    """Tables 55 and 56. -> per channel dict(tna, ah, fic, tic):
+    aspx_tna_mode per noise subband group, aspx_add_harmonic per
+    high-resolution subband group, aspx_fic_used_in_sfb per high-resolution
+    subband group (None: no FIC) and aspx_tic_used_in_slot per A-SPX
+    timeslot (None: no TIC). With aspx_balance 1 channel 1 takes channel
+    0's TNA modes (Table 56)."""
     n_noise, n_hi = t["n_noise"], t["n_hi"]
-    ah = [[0] * n_hi, [0] * n_hi]
-    _count("tna", sum(b.u(2) for _ in range(n_noise)))   # aspx_tna_mode ch0
+    out = [dict(tna=[0] * n_noise, ah=[0] * n_hi, fic=None, tic=None)
+           for _ in range(2)]
+    out[0]["tna"] = [b.u(2) for _ in range(n_noise)]     # aspx_tna_mode
+    _count("tna", sum(out[0]["tna"]))
     if two_ch:
         if balance == 0:
-            _count("tna", sum(b.u(2) for _ in range(n_noise)))   # ch1
-        if b.u(1):                                # aspx_ah_left
-            ah[0] = [b.u(1) for _ in range(n_hi)]
-            _count("ah", any(ah[0]))
-        if b.u(1):                                # aspx_ah_right
-            ah[1] = [b.u(1) for _ in range(n_hi)]
-            _count("ah", any(ah[1]))
+            out[1]["tna"] = [b.u(2) for _ in range(n_noise)]
+            _count("tna", sum(out[1]["tna"]))
+        else:
+            out[1]["tna"] = list(out[0]["tna"])
+        for c in range(2):
+            if b.u(1):                            # aspx_ah_left / _right
+                out[c]["ah"] = [b.u(1) for _ in range(n_hi)]
+                _count("ah", any(out[c]["ah"]))
         if b.u(1):                                # aspx_fic_present
             _count("fic")
-            if b.u(1):                            # aspx_fic_left
-                for _ in range(n_hi):
-                    b.u(1)
-            if b.u(1):                            # aspx_fic_right
-                for _ in range(n_hi):
-                    b.u(1)
+            for c in range(2):
+                if b.u(1):                        # aspx_fic_left / _right
+                    out[c]["fic"] = [b.u(1) for _ in range(n_hi)]
         if b.u(1):                                # aspx_tic_present
             _count("tic")
             copy = b.u(1)
@@ -282,24 +287,22 @@ def hfgen_iwc(b, t, nats, two_ch, balance=0):
             if copy == 0:
                 left, right = b.u(1), b.u(1)
             if copy or left:
-                for _ in range(nats):
-                    b.u(1)
+                out[0]["tic"] = [b.u(1) for _ in range(nats)]
             if right:
-                for _ in range(nats):
-                    b.u(1)
+                out[1]["tic"] = [b.u(1) for _ in range(nats)]
+            if copy:
+                out[1]["tic"] = list(out[0]["tic"])
     else:
         if b.u(1):                                # aspx_ah_present
-            ah[0] = [b.u(1) for _ in range(n_hi)]
-            _count("ah", any(ah[0]))
+            out[0]["ah"] = [b.u(1) for _ in range(n_hi)]
+            _count("ah", any(out[0]["ah"]))
         if b.u(1):                                # aspx_fic_present
             _count("fic")
-            for _ in range(n_hi):
-                b.u(1)
+            out[0]["fic"] = [b.u(1) for _ in range(n_hi)]
         if b.u(1):                                # aspx_tic_present
             _count("tic")
-            for _ in range(nats):
-                b.u(1)
-    return ah
+            out[0]["tic"] = [b.u(1) for _ in range(nats)]
+    return out
 
 
 def hcb_name(data_type, qmode, smode, htype):
@@ -382,14 +385,14 @@ def aspx_data(b, tabs, t, cfg, nats, b_iframe, two_ch, state, grp):
         q0 = 0
     if not two_ch:
         d_sig, d_noise = delta_dir(b, f0)
-        ah = hfgen_iwc(b, t, nats, two_ch=False)
+        iwc = hfgen_iwc(b, t, nats, two_ch=False)
         sig = ec_data(b, tabs, t, "SIGNAL", f0["num_env"], f0["freq_res"], q0,
                       0, d_sig)
         noi = ec_data(b, tabs, t, "NOISE", f0["num_noise"], None, 0, 0,
                       d_noise)
         return [dict(fr=f0, sig=sig, noise=noi, dir_sig=d_sig,
-                     dir_noise=d_noise, balance=0, ch=0, ah=ah[0],
-                     qmode=q0, t=t, xover=xover)]
+                     dir_noise=d_noise, balance=0, ch=0, ah=iwc[0]["ah"],
+                     iwc=iwc[0], qmode=q0, t=t, xover=xover)]
     balance = b.u(1)
     f1, q1 = f0, q0
     if balance == 1:
@@ -408,7 +411,7 @@ def aspx_data(b, tabs, t, cfg, nats, b_iframe, two_ch, state, grp):
             q1 = 0
     d0_sig, d0_noise = delta_dir(b, f0)
     d1_sig, d1_noise = delta_dir(b, f1)
-    ah = hfgen_iwc(b, t, nats, two_ch=True, balance=balance)
+    iwc = hfgen_iwc(b, t, nats, two_ch=True, balance=balance)
     sm1 = 1 if balance else 0
     s0 = ec_data(b, tabs, t, "SIGNAL", f0["num_env"], f0["freq_res"], q0, 0,
                  d0_sig)
@@ -417,8 +420,8 @@ def aspx_data(b, tabs, t, cfg, nats, b_iframe, two_ch, state, grp):
     n0 = ec_data(b, tabs, t, "NOISE", f0["num_noise"], None, 0, 0, d0_noise)
     n1 = ec_data(b, tabs, t, "NOISE", f1["num_noise"], None, 0, sm1, d1_noise)
     return [dict(fr=f0, sig=s0, noise=n0, dir_sig=d0_sig,
-                 dir_noise=d0_noise, balance=balance, ch=0, ah=ah[0],
-                 qmode=q0, t=t, xover=xover),
+                 dir_noise=d0_noise, balance=balance, ch=0, ah=iwc[0]["ah"],
+                 iwc=iwc[0], qmode=q0, t=t, xover=xover),
             dict(fr=f1, sig=s1, noise=n1, dir_sig=d1_sig,
-                 dir_noise=d1_noise, balance=balance, ch=1, ah=ah[1],
-                 qmode=q1, t=t, xover=xover)]
+                 dir_noise=d1_noise, balance=balance, ch=1, ah=iwc[1]["ah"],
+                 iwc=iwc[1], qmode=q1, t=t, xover=xover)]

@@ -70,6 +70,7 @@ from . import qmf as Q                                               # noqa: E40
 from . import aspx_env as V                                          # noqa: E402
 from . import aspx_hfgen as G                                             # noqa: E402
 from . import aspx_envadj as E                                            # noqa: E402
+from . import aspx_tools as TL                                            # noqa: E402
 from .robust import CONCEALED                                        # noqa: E402
 
 FS = 48000
@@ -272,39 +273,22 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
     if COMPANDING:
         compand([Qan["L"], Qan["R"]], groups, [tt["sbx"] for tt in tf],
                 geo=geo)
-    keys = []
-    for tt in tf:
-        if all(tt is not x for x in keys):
-            keys.append(tt)
+    # Qh starts as the analysed core everywhere; the high band of each
+    # frame with A-SPX data is generated over its A-SPX interval (TNA,
+    # pre-flattening; Pseudocode 89) in the loop below. Slots no interval
+    # covers -- frames from before the stream's first aspx_config, the
+    # TS_OFFSET slots before the first frame -- keep the core alone.
     for k in ("L", "R"):
-        Qa = Qan[k]
-        f = (np.arange(Qa.shape[1]) - TSO) // NT
-        fc = np.clip(f, 0, max(len(groups) - 1, 0))
-        Qh[k] = G.hf_generate(Qa, keys[0] if keys else t)
-        # a stream whose tables change (a new aspx_xover_subband_offset or
-        # configuration): each QMF slot is generated with the tables of the
-        # frame it carries
-        for tt in keys[1:]:
-            own = np.array([tf[i] is tt for i in fc], bool)
-            if own.any():
-                Qh[k][:, own] = G.hf_generate(Qa, tt)[:, own]
-        # HF generation only on the QMF slots of frames that have A-SPX
-        # data (or are concealed, whose high band is muted below): slot ts
-        # carries frame (ts - TS_OFFSET) // 24. The others -- frames from
-        # before the stream's first aspx_config, and the TS_OFFSET slots
-        # before the first frame -- keep the analysed core and nothing
-        # above it; patched there, they would play the copied low band
-        # unadjusted (up to 0.88 of full scale was measured).
-        has = np.array([g is not None for g in groups] + [False], bool)
-        keep = ~has[np.where((f >= 0) & (f < len(groups)), f, len(groups))]
-        if keep.any():
-            Qh[k][:, keep] = Qa[:, keep]
+        Qh[k] = Qan[k].copy()
 
     prev = {0: (None, 0), 1: (None, 0)}
     nprev = {0: None, 1: None}
     idx_noise = 0
+    tools = [TL.new_state(), TL.new_state()]
     if state0 is not None:
-        idx_noise, (prev[0], prev[1]), (nprev[0], nprev[1]) = state0
+        idx_noise, (prev[0], prev[1]), (nprev[0], nprev[1]) = state0[:3]
+        if len(state0) > 3:
+            tools = [TL.copy_state(x) for x in state0[3]]
     slot = 0
     applied = 0
     for fi, got in enumerate(groups):
@@ -313,7 +297,8 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
         n_sb, sbx = t["num_sb_aspx"], t["sbx"]
         if state_log is not None:
             state_log.append((idx_noise, (prev[0], prev[1]),
-                              (nprev[0], nprev[1])))
+                              (nprev[0], nprev[1]),
+                              [TL.copy_state(x) for x in tools]))
         if got is CONCEALED:
             # a concealed frame: no high band for its slots (its core is
             # the faded overlap tail); the envelope state is held as it was
@@ -365,17 +350,50 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
         b1 = (borders if got[0].get("balance") == 1
               else (got[1]["fr"].get("borders") or borders))
         ok = True
-        for k, sig, ns, bd, frk in (("L", sigA, nsA, b0, got[0]["fr"]),
-                                    ("R", sigB, nsB, b1, got[1]["fr"])):
-            est = E.estimate(Qh[k], t, bd, slot, TIA, ts_off=TSO)
+        A0 = slot + TSO                          # interval slot 0
+        for ci, (k, sig, ns, bd, frk) in enumerate(
+                (("L", sigA, nsA, b0, got[0]["fr"]),
+                 ("R", sigB, nsB, b1, got[1]["fr"]))):
+            iwc = got[ci].get("iwc") or {}
+            n_slots = Qh[k].shape[1]
+            ta_i = max(A0 + int(bd[0]) * TIA, 0)
+            tz_i = min(A0 + int(bd[-1]) * TIA, n_slots)
+            # HF generation over the interval (Pseudocodes 85-89)
+            ch = TL.chirps(iwc.get("tna") or [0] * t["n_noise"], tools[ci])
+            if np.any(ch != 0):
+                al0, al1 = TL.tna_alpha(Qan[k], t["sba"], A0, NT,
+                                        geo["hfgen"])
+            else:
+                al0 = al1 = np.zeros(t["sba"], complex)
+            gv = (TL.preflat_gain(Qan[k], sbx, ta_i, tz_i)
+                  if cfg.get("preflat") and tz_i > ta_i else None)
+            TL.generate(Qan[k], Qh[k], t, ta_i, tz_i, al0, al1, ch, gv)
+            if cfg.get("interpolation", 1) == 0:
+                est = E.estimate_groups(Qh[k], t, bd, frk["freq_res"],
+                                        slot, TIA, ts_off=TSO)
+            else:
+                est = E.estimate(Qh[k], t, bd, slot, TIA, ts_off=TSO)
             if est.shape != sig.shape:
                 ok = False
                 break
+            # additional sinusoids (Pseudocodes 92, 93)
+            sidx = TL.sine_idx_sb(frk, iwc.get("ah") or [], t,
+                                  tools[ci]["sine_sb"], n_sb)[:, :est.shape[1]]
+            area = TL.sine_area(sidx, t, frk)
             # Pseudocodes 95 and 99: the envelope at aspx_tsg_ptr (and at
             # p_sine_at_end) takes no noise factor in its gain or boost
-            g, nl = E.adjust(Qh[k], t, sig, est, lim, ns[:, :est.shape[1]],
-                             E.transient_envelopes(frk, est.shape[1]))
+            g, nl, sl = E.adjust(Qh[k], t, sig, est, lim,
+                                 ns[:, :est.shape[1]],
+                                 E.transient_envelopes(frk, est.shape[1]),
+                                 sine_idx=sidx, sine_area=area,
+                                 with_sine=True)
             t0 = slot + int(bd[0]) * TIA + TSO         # atsg_sig[0], slots
+            # the tone generator's index (Pseudocode 105): 1 at the first
+            # interval, else one on from the last of the previous one
+            si = tools[ci]["sine_idx"]
+            sbase = 1 if si is None else (si + 1) % 4
+            sgn = np.where((np.arange(n_sb) + sbx) % 2, -1.0, 1.0)
+            last_si = si
             for e in range(est.shape[1]):
                 ta = slot + int(bd[e]) * TIA + TSO
                 tz = slot + int(bd[e + 1]) * TIA + TSO
@@ -391,6 +409,31 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
                     kk = (idx_noise + n_sb * (ts - t0) + np.arange(n_sb)
                           + 1) % 512
                     Qh[k][sbx:sbx + n_sb, ts] += nl[:, e] * nt[kk]
+                    if sl[:, e].any():
+                        # Pseudocodes 104, 105 (index counted like the
+                        # noise index, from atsg_sig[0] in QMF slots)
+                        ix = (sbase + ts - t0) % 4
+                        Qh[k][sbx:sbx + n_sb, ts] += (
+                            sl[:, e] * TL.SINE_RE[ix]
+                            + 1j * sl[:, e] * sgn * TL.SINE_IM[ix])
+                    last_si = (sbase + ts - t0) % 4
+            tools[ci]["sine_idx"] = last_si
+            tools[ci]["sine_sb"] = (sidx[:, -1].copy() if sidx.shape[1]
+                                    else np.zeros(n_sb, bool))
+            # interleaved waveform coding (5.7.6.5.3): the core's own
+            # content above sbx is added in the FIC subband groups and
+            # replaces the generated band in the TIC slots
+            fm = TL.fic_mask(iwc.get("fic"), t, n_sb)
+            if fm.any() and tz_i > ta_i:
+                Qh[k][sbx:sbx + n_sb, ta_i:tz_i][fm] += \
+                    Qan[k][sbx:sbx + n_sb, ta_i:tz_i][fm]
+            for n_, used in enumerate(iwc.get("tic") or []):
+                if used:
+                    a_ = max(A0 + n_ * TIA, 0)
+                    z_ = min(A0 + (n_ + 1) * TIA, n_slots)
+                    if z_ > a_:
+                        Qh[k][sbx:sbx + n_sb, a_:z_] = \
+                            Qan[k][sbx:sbx + n_sb, a_:z_]
         if ok:
             applied += 1
             span = sum(max(0, min(slot + int(borders[e + 1]) * TIA + TSO,
@@ -402,7 +445,8 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
 
     if state_log is not None:
         state_log.append((idx_noise, (prev[0], prev[1]),
-                          (nprev[0], nprev[1])))
+                          (nprev[0], nprev[1]),
+                          [TL.copy_state(x) for x in tools]))
     for k in ("L", "R"):
         out[k] = Q.synthesise(Qh[k], w, Q.synthesis_matrix(255))
     if acpl_groups is not None:

@@ -259,16 +259,21 @@ def test_aspx_grid_at_other_frame_lengths(monkeypatch, fl):
     g = A.geometry(fl)
     cfg, t = _aspx_cfg()
     n_sb, sbx = t["num_sb_aspx"], t["sbx"]
-    got = [{"fr": {"borders": [0, g["nats"]]}, "balance": 1},
-           {"fr": {"borders": [0, g["nats"]]}, "balance": 1}]
+    got = [{"fr": {"borders": [0, g["nats"]], "freq_res": [1]},
+            "balance": 1},
+           {"fr": {"borders": [0, g["nats"]], "freq_res": [1]},
+            "balance": 1}]
     z = (lambda *a, **k: (np.zeros((n_sb, 1)), np.zeros((n_sb, 1))))
     monkeypatch.setattr(V, "reconstruct", lambda d, t, m, p: (None, p))
     monkeypatch.setattr(E, "noise_qscf", lambda d, t, p: (None, p))
     monkeypatch.setattr(E, "map_scf_joint", z)
     monkeypatch.setattr(E, "map_noise_joint", z)
     monkeypatch.setattr(E, "estimate", lambda *a, **k: np.zeros((n_sb, 1)))
-    monkeypatch.setattr(E, "adjust", lambda *a: (np.zeros((n_sb, 1)),
-                                                 np.ones((n_sb, 1))))
+    monkeypatch.setattr(E, "estimate_groups",
+                        lambda *a, **k: np.zeros((n_sb, 1)))
+    monkeypatch.setattr(E, "adjust", lambda *a, **k: (np.zeros((n_sb, 1)),
+                                                      np.ones((n_sb, 1)),
+                                                      np.zeros((n_sb, 1))))
     seen = []
     real = Q.synthesise
     monkeypatch.setattr(Q, "synthesise",
@@ -333,7 +338,8 @@ def test_aspx_data_reads_and_holds_the_xover_offset(monkeypatch):
     monkeypatch.setattr(P, "aspx_framing", framing)
     monkeypatch.setattr(P, "delta_dir", lambda b, f: ([0], [0]))
     monkeypatch.setattr(P, "hfgen_iwc",
-                        lambda b, t, *a, **k: seen.append(t) or [[0], [0]])
+                        lambda b, t, *a, **k: seen.append(t) or [
+                            dict(tna=[0], ah=[0], fic=None, tic=None)] * 2)
     monkeypatch.setattr(P, "ec_data", lambda *a: [[0]])
     state = {}
     w = BW().u(3, 1).u(1, 1)                 # offset 1, then aspx_balance
@@ -665,3 +671,195 @@ def test_pair_aspx_acpl_stream(tmp_path, mode):
         ref = dref.decode_pass(frames)
         assert got.shape == ref.shape
         assert np.abs(got - ref).max() <= 1e-9 * np.abs(ref).max()
+
+
+# ------------------------------------------------ A-SPX tools (item 3)
+def test_tna_alpha_against_pseudocodes_86_87():
+    """The covariance method of Pseudocodes 86, 87 written out with
+    loops (complex), against aspx_tools.tna_alpha."""
+    from ac4 import aspx_tools as TL
+    rng = np.random.default_rng(5)
+    nts, hf, sba = 24, 6, 20
+    Qa = rng.standard_normal((64, 96)) + 1j * rng.standard_normal((64, 96))
+    a0 = 30
+    a0g, a1g = TL.tna_alpha(Qa, sba, a0, nts, hf)
+    for sb in range(sba):
+        ext = [Qa[sb, a0 - 4 + i] for i in range(nts + hf + 4)]
+        cov = [[0j] * 3 for _ in range(3)]
+        for i in range(3):
+            for j in range(1, 3):
+                for ts in range(4, nts + hf + 4, 2):
+                    cov[i][j] += ext[ts - 2 * i] * np.conj(ext[ts - 2 * j])
+        den = cov[2][2] * cov[1][1] - abs(cov[1][2]) ** 2 / (1 + 2 ** -20)
+        a1 = (cov[0][1] * cov[1][2] - cov[0][2] * cov[1][1]) / den
+        a0_ = (-cov[0][1] + a1 * np.conj(cov[1][2])) / cov[1][1]
+        if abs(a0_) >= 4 or abs(a1) >= 4:
+            a0_ = a1 = 0
+        assert abs(a0g[sb] - a0_) < 1e-12 and abs(a1g[sb] - a1) < 1e-12
+
+
+def test_chirp_factors_table_195():
+    """Pseudocode 88: new_chirp from Table 195, smoothed against the
+    previous interval's chirp, zeroed below 0.015625."""
+    from ac4 import aspx_tools as TL
+    st = TL.new_state()
+    c = TL.chirps([2, 0, 3], st)                 # previous modes 0, chirp 0
+    assert np.allclose(c, [0.90625 * 0.9, 0.0, 0.90625 * 0.98])
+    c2 = TL.chirps([1, 1, 0], st)                # prev 2, 0, 3
+    want = [0.75 * 0.75 + 0.25 * c[0], 0.90625 * 0.6, 0.25 * c[2]]
+    assert np.allclose(c2, want)
+
+
+def test_preflat_gain_is_the_cubic_fit():
+    """Pseudocode 85: the gain vector from a least-squares cubic through
+    the low band's energies in dB (numpy's polyfit as the reference)."""
+    from ac4 import aspx_tools as TL
+    rng = np.random.default_rng(6)
+    sbx = 26
+    Qa = (rng.standard_normal((64, 40)) + 1j * rng.standard_normal((64, 40))) \
+        * np.linspace(30, 1, 64)[:, None]
+    gv = TL.preflat_gain(Qa, sbx, 5, 29)
+    pw = 10 * np.log10((np.abs(Qa[:sbx, 5:29]) ** 2).sum(axis=1) / 24 + 1)
+    poly = np.polyfit(np.arange(sbx), pw, 3)
+    want = 10 ** ((pw.mean() - np.polyval(poly, np.arange(sbx))) / 20)
+    assert np.allclose(gv, want, rtol=1e-9)
+
+
+def test_hf_generation_pseudocode_89():
+    """Pseudocode 89 written out: each patched subband is the source plus
+    chirp * alpha0 * the source two slots back plus chirp^2 * alpha1 *
+    four slots back, over 1 / gain_vec; the chirp of its noise group."""
+    from ac4 import aspx_bands as A
+    from ac4 import aspx_tools as TL
+    t = A.tables_for(_cfg(), 0)
+    rng = np.random.default_rng(7)
+    Qa = rng.standard_normal((64, 60)) + 1j * rng.standard_normal((64, 60))
+    al0 = rng.standard_normal(64) + 1j * rng.standard_normal(64)
+    al1 = rng.standard_normal(64) + 1j * rng.standard_normal(64)
+    ch = np.linspace(0.3, 0.9, t["n_noise"])
+    gv = rng.uniform(0.5, 2, 64)
+    Qh = np.zeros_like(Qa)
+    TL.generate(Qa, Qh, t, 10, 40, al0, al1, ch, gv)
+    sum_sb, g = 0, 0
+    for i in range(len(t["patch_num_sb"])):
+        for sb in range(t["patch_num_sb"][i]):
+            hi = t["sbx"] + sum_sb + sb
+            if g + 1 < len(t["noise"]) and t["noise"][g + 1] == hi:
+                g += 1
+            p = t["patch_start_sb"][i] + sb
+            for ts in range(10, 40):
+                want = (Qa[p, ts] + ch[g] * al0[p] * Qa[p, ts - 2]
+                        + ch[g] ** 2 * al1[p] * Qa[p, ts - 4]) / gv[p]
+                assert abs(Qh[hi, ts] - want) < 1e-12
+        sum_sb += t["patch_num_sb"][i]
+
+
+def test_sinusoid_placement_pseudocodes_92_93():
+    """A flagged high-resolution group gets its sinusoid in its middle
+    subband from aspx_tsg_ptr on (or from envelope 0 when the previous
+    interval had one there, or ended on its pointer); sine_area covers the
+    group of the envelope's own resolution."""
+    from ac4 import aspx_bands as A
+    from ac4 import aspx_tools as TL
+    t = A.tables_for(_cfg(), 0)
+    n_sb = t["num_sb_aspx"]
+    ah = [0] * t["n_hi"]
+    ah[2] = 1
+    fr = dict(borders=[0, 6, 16], tsg_ptr=1, sine_at_end=-1,
+              freq_res=[0, 1])
+    s = TL.sine_idx_sb(fr, ah, t, np.zeros(64, bool), n_sb)
+    a, z = t["hi"][2] - t["sbx"], t["hi"][3] - t["sbx"]
+    mid = int(0.5 * (a + z))
+    assert not s[:, 0].any() and s[mid, 1] and s[:, 1].sum() == 1
+    prev = np.zeros(64, bool)
+    prev[mid] = True
+    assert TL.sine_idx_sb(fr, ah, t, prev, n_sb)[mid, 0]
+    area = TL.sine_area(s, t, fr)
+    assert area[a:z, 1].all() and area[:, 1].sum() == z - a
+    lo = t["lo"]
+    g = max(i for i in range(len(lo) - 1) if lo[i] - t["sbx"] <= mid)
+    assert not area[:, 0].any()
+
+
+def test_adjust_with_sinusoids_pseudocodes_94_101():
+    """aspx_envadj.adjust with sinusoids against Pseudocodes 94-101
+    written out with loops."""
+    from ac4 import aspx_bands as A
+    from ac4 import aspx_envadj as E
+    t = A.tables_for(_cfg(), 0)
+    lim = E.sbg_lim(t)
+    n_sb, n_env, sbx = t["num_sb_aspx"], 2, t["sbx"]
+    rng = np.random.default_rng(8)
+    sig = rng.uniform(1, 100, (n_sb, n_env))
+    est = rng.uniform(1, 100, (n_sb, n_env))
+    noi = rng.uniform(0.01, 2, (n_sb, n_env))
+    sidx = np.zeros((n_sb, n_env), bool)
+    sidx[3, 1] = sidx[9, 0] = True
+    area = np.zeros_like(sidx)
+    area[2:5, 1] = area[8:11, 0] = True
+    tr = np.array([False, True])
+    g, nl, sl = E.adjust(None, t, sig, est, lim, noi, tr, sine_idx=sidx,
+                         sine_area=area, with_sine=True)
+    for e in range(n_env):
+        snf = sig[:, e] / (1 + noi[:, e])
+        sine = np.sqrt(snf * sidx[:, e])
+        nlev = np.sqrt(snf * noi[:, e])
+        gain = np.empty(n_sb)
+        for sb in range(n_sb):
+            if not area[sb, e]:
+                den = 1.0 + est[sb, e]
+                if not tr[e]:
+                    den *= 1 + noi[sb, e]
+                gain[sb] = np.sqrt(sig[sb, e] / den)
+            else:
+                den = (1.0 + est[sb, e]) * (1 + noi[sb, e])
+                gain[sb] = np.sqrt(sig[sb, e] * noi[sb, e] / den)
+        maxg = np.empty(n_sb)
+        for i in range(len(lim) - 1):
+            a, z = lim[i] - sbx, lim[i + 1] - sbx
+            maxg[a:z] = min(np.sqrt(sig[a:z, e].sum()
+                                    / (1e-12 + est[a:z, e].sum())) * 1.41254,
+                            1e5)
+        nlim = np.minimum(nlev, nlev * maxg / gain)
+        glim = np.minimum(gain, maxg)
+        for i in range(len(lim) - 1):
+            a, z = lim[i] - sbx, lim[i + 1] - sbx
+            nom = 1e-12 + sig[a:z, e].sum()
+            den = 1e-12 + (est[a:z, e] * glim[a:z] ** 2).sum()
+            den += (sine[a:z] ** 2).sum()
+            for sb in range(a, z):
+                if not (sine[sb] != 0 or tr[e]):
+                    den += nlim[sb] ** 2
+            bst = min(np.sqrt(nom / den), 1.584893192)
+            assert np.allclose(g[a:z, e], glim[a:z] * bst, rtol=1e-12)
+            assert np.allclose(nl[a:z, e], nlim[a:z] * bst, rtol=1e-12)
+            assert np.allclose(sl[a:z, e], sine[a:z] * bst, rtol=1e-12)
+
+
+def test_tna_off_and_no_preflat_is_the_plain_copy():
+    """With every aspx_tna_mode 0 (chirp 0) and aspx_preflat 0 the HF
+    generator is the patch copy of before."""
+    from ac4 import aspx_bands as A
+    from ac4 import aspx_tools as TL
+    from ac4 import aspx_hfgen as G
+    t = A.tables_for(_cfg(), 0)
+    rng = np.random.default_rng(9)
+    Qa = rng.standard_normal((64, 50)) + 1j * rng.standard_normal((64, 50))
+    Qh = Qa.copy()
+    st = TL.new_state()
+    ch = TL.chirps([0] * t["n_noise"], st)
+    TL.generate(Qa, Qh, t, 6, 40, np.zeros(64), np.zeros(64), ch, None)
+    ref = G.hf_generate(Qa, t)
+    assert np.array_equal(Qh[:, 6:40], ref[:, 6:40])
+
+
+def test_fixfix_freq_res_mode_0_reads_one_bit():
+    """Table 53: in aspx_freq_res_mode 0 a FIXFIX interval sends a single
+    aspx_freq_res (Pseudocode 76 copies it to every envelope); it used to
+    read one per envelope."""
+    from ac4 import aspx_parse as P
+    w = BW().u(1, 0).u(2, 2).u(1, 1).u(1, 0)    # FIXFIX, 4 env, freq_res 1
+    b = Bits(w.bytes())
+    fr = P.aspx_framing(b, dict(num_env_bits_fixfix=1, freq_res_mode=0), 12,
+                        False, {}, (0, 0))
+    assert fr["num_env"] == 4 and fr["freq_res"] == [1] * 4 and b.p == 4

@@ -358,7 +358,8 @@ def test_fixfix_single_envelope_reports_qmode_0(monkeypatch):
 
     monkeypatch.setattr(P, "aspx_framing", fake_framing)
     monkeypatch.setattr(P, "delta_dir", lambda b, f: ([0], [0]))
-    monkeypatch.setattr(P, "hfgen_iwc", lambda *a, **k: [[0], [0]])
+    monkeypatch.setattr(P, "hfgen_iwc", lambda *a, **k: [
+        dict(tna=[0], ah=[0], fic=None, tic=None)] * 2)
     monkeypatch.setattr(P, "ec_data",
                         lambda b, tabs, t, kind, n, fres, q, sm, d:
                         calls.setdefault(kind, []).append(q) or [[0]])
@@ -381,16 +382,19 @@ def test_aspx_grid_is_one_frame_after_pseudocode_75(monkeypatch):
     from test_units import _aspx_cfg
     cfg, t = _aspx_cfg()
     n_sb, sbx = t["num_sb_aspx"], t["sbx"]
-    got = [{"fr": {"borders": [0, 12]}, "balance": 1},
-           {"fr": {"borders": [0, 12]}, "balance": 1}]
+    got = [{"fr": {"borders": [0, 12], "freq_res": [1]}, "balance": 1},
+           {"fr": {"borders": [0, 12], "freq_res": [1]}, "balance": 1}]
     z = (lambda *a, **k: (np.zeros((n_sb, 1)), np.zeros((n_sb, 1))))
     monkeypatch.setattr(V, "reconstruct", lambda d, t, m, p: (None, p))
     monkeypatch.setattr(E, "noise_qscf", lambda d, t, p: (None, p))
     monkeypatch.setattr(E, "map_scf_joint", z)
     monkeypatch.setattr(E, "map_noise_joint", z)
     monkeypatch.setattr(E, "estimate", lambda *a, **k: np.zeros((n_sb, 1)))
-    monkeypatch.setattr(E, "adjust", lambda *a: (np.zeros((n_sb, 1)),
-                                                 np.ones((n_sb, 1))))
+    monkeypatch.setattr(E, "estimate_groups",
+                        lambda *a, **k: np.zeros((n_sb, 1)))
+    monkeypatch.setattr(E, "adjust", lambda *a, **k: (np.zeros((n_sb, 1)),
+                                                      np.ones((n_sb, 1)),
+                                                      np.zeros((n_sb, 1))))
     seen = []
     real = Q.synthesise
     monkeypatch.setattr(Q, "synthesise",

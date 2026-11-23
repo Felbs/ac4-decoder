@@ -111,6 +111,27 @@ def estimate(Qh, t, borders, sl0, nts_in_ats, ts_off=0):
     return est
 
 
+def estimate_groups(Qh, t, borders, freq_res, sl0, nts_in_ats, ts_off=0):
+    """Pseudocode 90, the aspx_interpolation == 0 branch: the mean energy
+    over each subband group (of the envelope's resolution) and the
+    envelope's slots, for every subband of the group. (Normalised per QMF
+    slot, as estimate() is; see the README, Interpretations.)"""
+    n_sb, n_env = t["num_sb_aspx"], len(borders) - 1
+    sbx = t["sbx"]
+    est = np.zeros((n_sb, n_env))
+    for e in range(n_env):
+        ta = int(borders[e]) * nts_in_ats + ts_off + sl0
+        tz = int(borders[e + 1]) * nts_in_ats + ts_off + sl0
+        ta, tz = max(ta, 0), min(tz, Qh.shape[1])
+        if tz <= ta:
+            continue
+        tab = t["hi"] if freq_res[e] else t["lo"]
+        for g in range(len(tab) - 1):
+            seg = np.abs(Qh[tab[g]:tab[g + 1], ta:tz]) ** 2
+            est[tab[g] - sbx:tab[g + 1] - sbx, e] = seg.mean()
+    return est
+
+
 # THE SCALE OF THE ENVELOPES. scf_sig_sbg is an absolute QMF-domain energy
 # on the standard's scale (Pseudocode 82: num_qmf_subbands * 2^(q / a)).
 # This decoder's samples are the standard's times filterbank.IMDCT_K
@@ -239,14 +260,17 @@ def transient_envelopes(fr, n_env):
     return np.array([e == ptr or e == end for e in range(n_env)], bool)
 
 
-def adjust(Qh, t, sig_sb, est, lim, noise_sb=None, transient=None):
-    """Pseudocodes 94..101.  -> (gain, adjusted noise level) per subband/env.
+def adjust(Qh, t, sig_sb, est, lim, noise_sb=None, transient=None,
+           sine_idx=None, sine_area=None, with_sine=False):
+    """Pseudocodes 94..101.  -> (gain, adjusted noise level) per subband/env,
+    and with with_sine the adjusted sine level too.
 
     transient (bool per envelope, transient_envelopes()): in those
     envelopes the gain leaves out the noise factor (Pseudocode 95: denom
     is not multiplied by 1 + scf_noise_sb) and the boost's denominator
-    leaves out the noise level (Pseudocode 99). No sinusoids are rendered
-    (sine_lev_sb = 0, sine_area_sb = 0)."""
+    leaves out the noise level (Pseudocode 99). sine_idx / sine_area
+    (aspx_tools.sine_idx_sb / sine_area, bool n_sb x n_env): the
+    additional sinusoids (Pseudocodes 94, 95, 99, 101); None: none."""
     n_sb, n_env = est.shape
     if noise_sb is None:
         noise_sb = np.zeros_like(est)
@@ -260,6 +284,15 @@ def adjust(Qh, t, sig_sb, est, lim, noise_sb=None, transient=None):
     # Pseudocode 94: the noise level shares the band energy with the signal
     sig_noise_fact = sig_sb / (1.0 + noise_sb)
     noise_lev = np.sqrt(sig_noise_fact * noise_sb)
+    sine_lev = np.zeros_like(est)
+    if sine_idx is not None and sine_idx.any() or (
+            sine_area is not None and sine_area.any()):
+        sidx = np.asarray(sine_idx[:, :n_env], float)
+        sine_lev = np.sqrt(sig_noise_fact * sidx)
+        area = np.asarray(sine_area[:, :n_env], bool)
+        # Pseudocode 95, the sine-area branch
+        den = (EPSILON + est) * (1.0 + noise_sb)
+        gain = np.where(area, np.sqrt(sig_sb * noise_sb / den), gain)
 
     # Pseudocode 96: per limiter subband group ceiling. Group i is the
     # subbands lim[i] .. lim[i+1] - 1 (the mapping loop's sb == sbg_lim
@@ -284,6 +317,9 @@ def adjust(Qh, t, sig_sb, est, lim, noise_sb=None, transient=None):
     noise_lim = np.minimum(noise_lev, noise_lev * ratio)
 
     boost = np.ones_like(gain)                   # Pseudocode 99 / 100
+    # the noise level counts where there is no sinusoid and the envelope
+    # is not a transient one
+    use_noise = (sine_lev == 0) & ~transient[None, :]
     for i in range(len(lim) - 1):
         lo = max(lim[i] - t["sbx"], 0)
         hi = min(lim[i + 1] - t["sbx"], n_sb)
@@ -291,10 +327,17 @@ def adjust(Qh, t, sig_sb, est, lim, noise_sb=None, transient=None):
             continue
         nom = EPSILON0 + sig_sb[lo:hi].sum(axis=0)
         den = EPSILON0 + (est[lo:hi] * lim_gain[lo:hi] ** 2).sum(axis=0)
-        den = den + np.where(transient, 0.0,
-                             (noise_lim[lo:hi] ** 2).sum(axis=0))
+        if with_sine:
+            den = den + (sine_lev[lo:hi] ** 2).sum(axis=0)
+            den = den + np.where(use_noise[lo:hi], noise_lim[lo:hi] ** 2,
+                                 0.0).sum(axis=0)
+        else:
+            den = den + np.where(transient, 0.0,
+                                 (noise_lim[lo:hi] ** 2).sum(axis=0))
         boost[lo:hi] = np.minimum(np.sqrt(nom / den), MAX_BOOST_FACT)
-    return lim_gain * boost, noise_lim * boost   # Pseudocode 101
+    if with_sine:                                # Pseudocode 101
+        return lim_gain * boost, noise_lim * boost, sine_lev * boost
+    return lim_gain * boost, noise_lim * boost
 
 
 def noise_table(path=None):

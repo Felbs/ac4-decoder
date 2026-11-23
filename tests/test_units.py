@@ -576,8 +576,8 @@ def test_aspx_noise_index_runs_on_across_envelopes(monkeypatch):
     from ac4 import qmf as Q
     cfg, t = _aspx_cfg()
     n_sb, sbx = t["num_sb_aspx"], t["sbx"]
-    got = [{"fr": {"borders": [0, 4, 8]}, "balance": 1},
-           {"fr": {"borders": [0, 4, 8]}, "balance": 1}]
+    got = [{"fr": {"borders": [0, 4, 8], "freq_res": [1, 1]}, "balance": 1},
+           {"fr": {"borders": [0, 4, 8], "freq_res": [1, 1]}, "balance": 1}]
     zeros = lambda *a, **k: np.zeros((n_sb, 2))             # noqa: E731
     monkeypatch.setattr(V, "reconstruct", lambda d, t, m, p: (None, p))
     monkeypatch.setattr(E, "noise_qscf", lambda d, t, p: (None, p))
@@ -587,8 +587,10 @@ def test_aspx_noise_index_runs_on_across_envelopes(monkeypatch):
     monkeypatch.setattr(E, "map_noise_joint",
                         lambda *a: (np.zeros((n_sb, 2)), np.zeros((n_sb, 2))))
     monkeypatch.setattr(E, "estimate", zeros)
-    monkeypatch.setattr(E, "adjust", lambda *a: (np.zeros((n_sb, 2)),
-                                                 np.ones((n_sb, 2))))
+    monkeypatch.setattr(E, "estimate_groups", zeros)
+    monkeypatch.setattr(E, "adjust", lambda *a, **k: (np.zeros((n_sb, 2)),
+                                                      np.ones((n_sb, 2)),
+                                                      np.zeros((n_sb, 2))))
     seen = []
     real = Q.synthesise
     monkeypatch.setattr(Q, "synthesise",
@@ -731,10 +733,10 @@ def test_aspx_transient_envelopes_from_the_framing(monkeypatch):
     # the renderer hands each channel's flags to adjust()
     cfg, t = _aspx_cfg()
     n_sb = t["num_sb_aspx"]
-    got = [{"fr": {"borders": [0, 4, 12], "tsg_ptr": 1, "sine_at_end": -1},
-            "balance": 1},
-           {"fr": {"borders": [0, 4, 12], "tsg_ptr": 1, "sine_at_end": 0},
-            "balance": 1}]
+    got = [{"fr": {"borders": [0, 4, 12], "tsg_ptr": 1, "sine_at_end": -1,
+                   "freq_res": [1, 1]}, "balance": 1},
+           {"fr": {"borders": [0, 4, 12], "tsg_ptr": 1, "sine_at_end": 0,
+                   "freq_res": [1, 1]}, "balance": 1}]
     monkeypatch.setattr(V, "reconstruct", lambda d, t, m, p: (None, p))
     monkeypatch.setattr(E, "noise_qscf", lambda d, t, p: (None, p))
     monkeypatch.setattr(E, "map_scf_joint",
@@ -743,8 +745,9 @@ def test_aspx_transient_envelopes_from_the_framing(monkeypatch):
     monkeypatch.setattr(E, "map_noise_joint",
                         lambda *a: (np.zeros((n_sb, 2)), np.zeros((n_sb, 2))))
     seen = []
-    monkeypatch.setattr(E, "adjust", lambda *a: (
-        seen.append(list(a[6])), (np.zeros((n_sb, 2)), np.zeros((n_sb, 2))))[1])
+    monkeypatch.setattr(E, "adjust", lambda *a, **k: (
+        seen.append(list(a[6])), (np.zeros((n_sb, 2)), np.zeros((n_sb, 2)),
+                                  np.zeros((n_sb, 2))))[1])
     x = np.zeros(3 * 1536)
     R37.apply_hf_pair(x, x, [None, got, None], cfg)
     assert seen == [[False, True], [True, True]]
