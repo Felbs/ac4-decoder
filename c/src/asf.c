@@ -616,10 +616,38 @@ static void acpl_config_2ch(ac4_bits *b, ac4_acpl_cfg *c)
     c->quant_mode_1 = (int)ac4_u(b, 1);
 }
 
+/* Table 59; partial = ASPX_ACPL_1 */
+static void acpl_config_1ch(ac4_bits *b, int partial, ac4_acpl1_cfg *c)
+{
+    static const int NPB[4] = { 15, 12, 9, 7 };
+    c->num_param_bands = NPB[ac4_u(b, 2)];
+    c->quant_mode = (int)ac4_u(b, 1);
+    c->qmf_band = c->param_band = 0;
+    if (partial) {
+        c->qmf_band = (int)ac4_u(b, 3) + 1;
+        c->param_band = ac4_acpl_sb_to_pb(c->num_param_bands, c->qmf_band);
+    }
+}
+
+static void set_blocks(ac4_element *e, int n, int g0, int t0, int g1,
+                       int t1, int g2, int t2)
+{
+    e->n_blocks = n;
+    e->blk_grp[0] = g0;
+    e->blk_two[0] = t0;
+    e->blk_grp[1] = g1;
+    e->blk_two[1] = t1;
+    e->blk_grp[2] = g2;
+    e->blk_two[2] = t2;
+}
+
 void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
                   ac4_element *e)
 {
     e->acpl3 = 0;
+    e->acpl1 = AC4_ACPL1_NONE;
+    e->n_acpl1 = 0;
+    e->r_silent = 0;
     e->has_aspx_cfg = e->has_acpl_cfg = 0;
     audio_size(b, e);
     e->mode = (int)ac4_u(b, 3);
@@ -633,6 +661,27 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
         mono_data(b, bk, 1, &e->lfe);
         companding_control(b, 2);
         stereo_data(b, bk, &e->lr);
+        set_blocks(e, 1, 0, 1, 0, 0, 0, 0);
+        e->bits_end = b->p;
+        return;
+    }
+    if (e->mode == 2 || e->mode == 3) {   /* ASPX_ACPL_1 / _2 */
+        e->acpl1 = AC4_ACPL1_5X;
+        if (b_iframe) {
+            aspx_config(b, &e->aspx_cfg);
+            acpl_config_1ch(b, e->mode == 2, &e->acpl1_cfg);
+            e->has_aspx_cfg = e->has_acpl_cfg = 1;
+        }
+        mono_data(b, bk, 1, &e->lfe);
+        companding_control(b, 3);
+        if (ac4_bit(b))                   /* coding_config 1: not built */
+            ac4_fail(b, AC4E_ELEMENT_PARSE);
+        two_channel_data(b, bk, &e->lr);  /* A, B (Table 181) */
+        if (e->mode == 2)                 /* the residuals: not built */
+            ac4_fail(b, AC4E_ELEMENT_PARSE);
+        mono_data(b, bk, 0, &e->c);
+        set_blocks(e, 2, 0, 1, 2, 0, 0, 0);
+        e->n_acpl1 = 2;
         e->bits_end = b->p;
         return;
     }
@@ -650,6 +699,7 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
     two_channel_data(b, bk, &e->lr);
     two_channel_data(b, bk, &e->sr);
     mono_data(b, bk, 0, &e->c);
+    set_blocks(e, 3, 0, 1, 1, 1, 2, 0);
     e->bits_end = b->p;
 }
 
@@ -657,17 +707,61 @@ void ac4_parse_pair(ac4_bits *b, const ac4_books *bk, int b_iframe,
                     ac4_element *e)
 {
     e->acpl3 = 0;
+    e->acpl1 = AC4_ACPL1_NONE;
+    e->n_acpl1 = 0;
+    e->r_silent = 0;
     e->has_aspx_cfg = e->has_acpl_cfg = 0;
     audio_size(b, e);
     e->mode = (int)ac4_u(b, 2);           /* stereo_codec_mode */
-    if (e->mode >= 2)
-        ac4_fail(b, AC4E_ELEMENT_PARSE);  /* ASPX_ACPL_1/2 */
-    if (b_iframe && e->mode == 1) {
+    if (b_iframe && e->mode >= 1) {
         aspx_config(b, &e->aspx_cfg);
         e->has_aspx_cfg = 1;
+        if (e->mode >= 2) {
+            acpl_config_1ch(b, e->mode == 2, &e->acpl1_cfg);
+            e->has_acpl_cfg = 1;
+        }
     }
     if (e->mode == 1)
         companding_control(b, 2);
-    stereo_data(b, bk, &e->lr);
+    else if (e->mode >= 2)
+        companding_control(b, 1);
+    if (e->mode <= 1) {
+        stereo_data(b, bk, &e->lr);
+        set_blocks(e, e->mode == 1 ? 1 : 0, 0, 1, 0, 0, 0, 0);
+    } else if (e->mode == 2) {
+        /* ASPX_ACPL_1 (Table 22): the "m" and "s" tracks */
+        ac4_pair *p = &e->lr;
+        p->st.sap_mode = -1;
+        if (ac4_bit(b)) {                 /* b_enable_mdct_stereo_proc */
+            ac4_framing_parse_ex(b, &p->fr[0], bk->fl, 1, 0);
+            chparam_info(b, bk, &p->fr[0], &p->st);
+            ac4_framing_side(&p->fr[0], &p->fr[1]);
+        } else {
+            ac4_framing f;
+            if (ac4_bit(b) != 0)          /* spec_frontend_m: SSF */
+                ac4_fail(b, AC4E_ELEMENT_PARSE);
+            ac4_framing_parse(b, &p->fr[0], bk->fl);
+            if (ac4_bit(b) != 0)          /* spec_frontend_s: SSF */
+                ac4_fail(b, AC4E_ELEMENT_PARSE);
+            ac4_framing_parse_ex(b, &f, bk->fl, 0, 1);
+            ac4_framing_side(&f, &p->fr[1]);
+        }
+        sf_data(b, bk, &p->fr[0], &p->ch[0]);
+        sf_data(b, bk, &p->fr[1], &p->ch[1]);
+        set_blocks(e, 1, 0, 0, 0, 0, 0, 0);
+        e->acpl1 = AC4_ACPL1_PAIR;
+        e->n_acpl1 = 1;
+    } else {                              /* ASPX_ACPL_2: one track */
+        ac4_mono m;
+        mono_data(b, bk, 0, &m);
+        e->lr.fr[0] = m.fr;
+        e->lr.ch[0] = m.ch;
+        e->lr.ch[0].fr = &e->lr.fr[0];
+        e->lr.st.sap_mode = -1;
+        e->r_silent = 1;
+        set_blocks(e, 1, 0, 0, 0, 0, 0, 0);
+        e->acpl1 = AC4_ACPL1_PAIR;
+        e->n_acpl1 = 1;
+    }
     e->bits_end = b->p;
 }

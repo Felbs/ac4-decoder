@@ -129,7 +129,8 @@ typedef struct {
     uint8_t *sub;
     size_t sub_len;
     size_t bits, start, size;
-    int ifr, acpl3, five;
+    int ifr, acpl3, n_acpl1;
+    int n_blocks, blk_grp[3], blk_two[3];
 } pending_t;
 
 /* an output frame waiting for the guard */
@@ -179,6 +180,7 @@ struct ac4dec {
 
     /* ---- stream state (Ac4Stream) */
     int acpl3;
+    int acpl1;                  /* AC4_ACPL1_* once seen */
     int have_shape;
     toc_shape shape;
     int mode;                   /* -1 = none yet */
@@ -191,6 +193,10 @@ struct ac4dec {
     ac4_acpl_cfg pcfg;
     ac4_aspx_state fstate;
     ac4_acpl_qstate aq;         /* A-CPL q_prev (Pseudocode 121) */
+    int aq1[2][2][AC4_ACPL_NB]; /* the 1ch modules' alpha1 / beta1 q_prev */
+    int aq1n[2][2];
+    int has_pcfg1;
+    ac4_acpl1_cfg pcfg1;
     pending_t *pend;
     int n_pend;
     int late_done;
@@ -555,6 +561,18 @@ static int chan_mask(const ac4dec *d, int acpl3)
     return 0x3f;
 }
 
+/* the channels of the mask the element does not code (ASPX_ACPL_2: R of
+   a pair; ASPX_ACPL_1 / _2 in 5_X: Ls, Rs): one silent long block */
+static int silent_mask(const ac4_element *e, int mask)
+{
+    int m = 0;
+    if (e->acpl1 == AC4_ACPL1_PAIR && e->r_silent)
+        m = 1 << CH_R;
+    else if (e->acpl1 == AC4_ACPL1_5X)
+        m = (1 << CH_LS) | (1 << CH_RS);
+    return m & mask;
+}
+
 static const ac4_chan *chan_src(const ac4_element *e, int k)
 {
     switch (k) {
@@ -589,6 +607,10 @@ static void stream_reset(ac4dec *d)
     d->nats = AC4_DEFAULT_FRAME / 128;
     memset(d->has_syn_tab, 0, sizeof(d->has_syn_tab));
     d->acpl3 = 0;
+    d->acpl1 = 0;
+    d->has_pcfg1 = 0;
+    memset(d->aq1, 0, sizeof(d->aq1));
+    memset(d->aq1n, 0, sizeof(d->aq1n));
     d->have_shape = 0;
     d->mode = -1;
     d->seq_prev = -1;
@@ -802,13 +824,14 @@ static void rec_conceal(ac4dec *d, rec_t *r, int code)
     r->af[0].has_tab = r->af[1].has_tab = r->af[2].has_tab = 0;
     r->af[0].acpl.kind = r->af[1].acpl.kind = r->af[2].acpl.kind =
         AC4_GRP_CONCEALED;
+    r->af[0].acpl1_kind = r->af[1].acpl1_kind = r->af[2].acpl1_kind =
+        AC4_GRP_CONCEALED;
     r->seq_jump = 0;
 }
 
 /* ------------------------------------------------------------ late */
 static void add_pending(ac4dec *d, long long index, const uint8_t *sub,
-                        size_t sub_len, const ac4_element *e, int ifr,
-                        int five)
+                        size_t sub_len, const ac4_element *e, int ifr)
 {
     pending_t *p;
     if (d->n_pend >= MAX_PENDING)
@@ -825,7 +848,10 @@ static void add_pending(ac4dec *d, long long index, const uint8_t *sub,
     p->size = e->audio_size;
     p->ifr = ifr;
     p->acpl3 = e->acpl3;
-    p->five = five;
+    p->n_acpl1 = e->n_acpl1;
+    p->n_blocks = e->n_blocks;
+    memcpy(p->blk_grp, e->blk_grp, sizeof(p->blk_grp));
+    memcpy(p->blk_two, e->blk_two, sizeof(p->blk_two));
     d->n_pend++;
 }
 
@@ -843,19 +869,21 @@ static int late_one(ac4dec *d, const pending_t *pd, ac4_aspx_state *st)
     b.eof_code = AC4E_ASPX_PARSE;
     if (setjmp(jb) != 0)
         return 0;
-    ac4_aspx_data(&b, &d->abk, &d->acfg, d->nats, pd->ifr, 1, st, 0, NULL,
-                  NULL);
-    if (pd->five) {
-        ac4_aspx_data(&b, &d->abk, &d->acfg, d->nats, pd->ifr, 1, st, 1,
-                      NULL, NULL);
-        ac4_aspx_data(&b, &d->abk, &d->acfg, d->nats, pd->ifr, 0, st, 2,
-                      NULL, NULL);
+    {
+        int i;
+        for (i = 0; i < pd->n_blocks; i++)
+            ac4_aspx_data(&b, &d->abk, &d->acfg, d->nats, pd->ifr,
+                          pd->blk_two[i], st, pd->blk_grp[i], NULL, NULL);
     }
-    if (pd->acpl3) {
-        if (!d->has_pcfg)
+    if (pd->acpl3 || pd->n_acpl1) {
+        int i;
+        if (pd->acpl3 ? !d->has_pcfg : !d->has_pcfg1)
             return -1;
         b.eof_code = AC4E_ACPL_PARSE;
-        ac4_acpl_data_2ch(&b, &d->abk, &d->pcfg, NULL, NULL);
+        if (pd->acpl3)
+            ac4_acpl_data_2ch(&b, &d->abk, &d->pcfg, NULL, NULL);
+        for (i = 0; i < pd->n_acpl1; i++)
+            ac4_acpl_data_1ch(&b, &d->abk, &d->pcfg1, NULL, NULL, NULL);
     }
     stop = pd->start + 8 * pd->size;
     return b.p <= stop && b.p + 7 >= stop;
@@ -928,7 +956,9 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     volatile int first_cfg = 0;
     ac4_aspx_state fstate0 = d->fstate;
     ac4_acpl_qstate aq0 = d->aq;
-    int code = AC4E_NONE, k, ifr = 0, five, has_aspx, acpl3, complete;
+    int aq10[2][2][AC4_ACPL_NB], aq1n0[2][2];
+    int code = AC4E_NONE, k, ifr = 0, has_aspx, acpl3, acpl1, complete;
+    int silent;
     size_t o, sub_len = 0;
     const uint8_t *sub = NULL;
     toc_shape sh;
@@ -938,6 +968,8 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     size_t end;
 
     memset(&sh, 0, sizeof(sh));
+    memcpy(aq10, d->aq1, sizeof(aq10));
+    memcpy(aq1n0, d->aq1n, sizeof(aq1n0));
     if (len < MIN_FRAME_BYTES || len > MAX_FRAME_BYTES || !data) {
         code = AC4E_MP4_SIZE;
         goto fail;
@@ -1054,30 +1086,32 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         cfg = &d->acfg;
     }
     acpl3 = e->acpl3;
-    five = d->element != AC4DEC_ELEMENT_PAIR && !acpl3;
-    has_aspx = !(d->element == AC4DEC_ELEMENT_PAIR && e->mode == 0);
+    acpl1 = e->acpl1;
+    has_aspx = e->n_blocks > 0;
     end = e->bits_end;
     r->af[0].kind = r->af[1].kind = r->af[2].kind = AC4_GRP_NONE;
     r->af[0].acpl.kind = r->af[1].acpl.kind = r->af[2].acpl.kind =
         AC4_GRP_NONE;
+    r->af[0].acpl1_kind = r->af[1].acpl1_kind = r->af[2].acpl1_kind =
+        AC4_GRP_NONE;
     if (cfg && has_aspx) {
         const ac4_acpl_cfg *pc = e->has_acpl_cfg ? &e->acpl_cfg
                                  : (d->has_pcfg ? &d->pcfg : NULL);
+        const ac4_acpl1_cfg *pc1 = e->has_acpl_cfg ? &e->acpl1_cfg
+                                   : (d->has_pcfg1 ? &d->pcfg1 : NULL);
+        int i;
         b.p = e->bits_end;
         b.eof_code = AC4E_ASPX_PARSE;
-        ac4_aspx_data(&b, &d->abk, cfg, d->nats, ifr, 1, &d->fstate, 0,
-                      &r->af[0].g, &gtab[0]);
-        r->af[0].kind = AC4_GRP_DATA;
-        if (five) {
-            ac4_aspx_data(&b, &d->abk, cfg, d->nats, ifr, 1, &d->fstate, 1,
-                          &r->af[1].g, &gtab[1]);
-            r->af[1].kind = AC4_GRP_DATA;
-            ac4_aspx_data(&b, &d->abk, cfg, d->nats, ifr, 0, &d->fstate, 2,
-                          &r->af[2].g, &gtab[2]);
-            /* the centre, rendered as the same channel twice (decoder.py):
-               with balance 0 each half decodes alone */
-            r->af[2].g.c[1] = r->af[2].g.c[0];
-            r->af[2].kind = AC4_GRP_DATA;
+        for (i = 0; i < e->n_blocks; i++) {
+            int g = e->blk_grp[i];
+            ac4_aspx_data(&b, &d->abk, cfg, d->nats, ifr, e->blk_two[i],
+                          &d->fstate, g, &r->af[g].g, &gtab[g]);
+            /* a one-channel block (the centre; the "m" track of a pair in
+               ASPX_ACPL_1 / _2) is rendered as the same channel twice
+               (decoder.py): with balance 0 each half decodes alone */
+            if (!e->blk_two[i])
+                r->af[g].g.c[1] = r->af[g].g.c[0];
+            r->af[g].kind = AC4_GRP_DATA;
         }
         end = b.p;
         if (acpl3 && pc) {
@@ -1086,9 +1120,18 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
             ac4_acpl_data_2ch(&b, &d->abk, pc, &d->aq, &r->af[0].acpl);
             end = b.p;
         }
+        if (acpl1 && pc1) {
+            b.eof_code = AC4E_ACPL_PARSE;
+            for (i = 0; i < e->n_acpl1; i++)
+                ac4_acpl_data_1ch(&b, &d->abk, pc1, d->aq1[i], d->aq1n[i],
+                                  &r->af[0].acpl1[i]);
+            r->af[0].acpl1_kind = AC4_GRP_DATA;
+            end = b.p;
+        }
     }
     complete = (cfg || !has_aspx)
-               && (!acpl3 || e->has_acpl_cfg || d->has_pcfg);
+               && (!(acpl3 || acpl1) || e->has_acpl_cfg
+                   || (acpl3 ? d->has_pcfg : d->has_pcfg1));
     /* audio_size closure */
     {
         size_t stop = e->audio_start + 8 * e->audio_size;
@@ -1100,11 +1143,12 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
             ac4_fail(&b, AC4E_AUDIO_CLOSURE);
     }
     if (!cfg && has_aspx)
-        add_pending(d, r->index, sub, sub_len, e, ifr, five);
+        add_pending(d, r->index, sub, sub_len, e, ifr);
     /* dequantise (with the level check) */
     r->mask = chan_mask(d, acpl3);
+    silent = silent_mask(e, r->mask);
     for (k = 0; k < 6; k++)
-        if (r->mask & (1 << k))
+        if ((r->mask & (1 << k)) && !(silent & (1 << k)))
             d->spec_n[k] = ac4_packed_spectrum(chan_src(e, k), d->spec[k],
                                                &jb);
     /* spectral noise fill: one generator per frame, reset from
@@ -1114,12 +1158,16 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         static const int ORDER_PAIR[] = { CH_L, CH_R };
         static const int ORDER_5X[] = { CH_LFE, CH_L, CH_R, CH_LS, CH_RS,
                                         CH_C };
+        static const int ORDER_A12[] = { CH_LFE, CH_L, CH_R, CH_C };
         const int *ord = ORDER_5X;
         int n_ord = acpl3 ? 3 : 6, i;
         ac4_snf_rng rng;
         if (d->element == AC4DEC_ELEMENT_PAIR) {
             ord = ORDER_PAIR;
-            n_ord = 2;
+            n_ord = e->r_silent ? 1 : 2;
+        } else if (acpl1) {
+            ord = ORDER_A12;
+            n_ord = 4;
         }
         ac4_snf_reset(&rng, t.sequence_counter);
         for (i = 0; i < n_ord; i++) {
@@ -1161,9 +1209,13 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         d->tab = tab_new;
         d->has_cfg = 1;
     }
-    if (e->has_acpl_cfg) {
+    if (e->has_acpl_cfg && acpl3) {
         d->pcfg = e->acpl_cfg;
         d->has_pcfg = 1;
+    }
+    if (e->has_acpl_cfg && acpl1) {
+        d->pcfg1 = e->acpl1_cfg;
+        d->has_pcfg1 = 1;
     }
     if (!d->have_shape) {
         d->shape = sh;
@@ -1172,12 +1224,29 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     d->mode = e->mode;
     if (acpl3)
         d->acpl3 = 1;
-    /* stereo processing, ungroup */
-    if ((r->mask & 3) == 3)
-        ac4_unmix(d->spec[CH_L], d->spec[CH_R],
-                  d->spec_n[CH_L] < d->spec_n[CH_R] ? d->spec_n[CH_L]
-                                                    : d->spec_n[CH_R],
+    if (acpl1)
+        d->acpl1 = acpl1;
+    /* the silent channels: zero */
+    for (k = 0; k < 6; k++)
+        if (silent & (1 << k))
+            d->spec_n[k] = 0;
+    /* stereo processing, ungroup (ASPX_ACPL_1's side track can be
+       shorter (max_sfb_side): both are zero-padded to the longer, as the
+       Python) */
+    if ((r->mask & 3) == 3 && !(silent & (1 << CH_R))) {
+        int nl = d->spec_n[CH_L], nr = d->spec_n[CH_R];
+        if (acpl1 == AC4_ACPL1_PAIR && nl != nr) {
+            int nm = nl > nr ? nl : nr;
+            for (k = nl; k < nm; k++)
+                d->spec[CH_L][k] = 0.0;
+            for (k = nr; k < nm; k++)
+                d->spec[CH_R][k] = 0.0;
+            d->spec_n[CH_L] = d->spec_n[CH_R] = nm;
+            nl = nr = nm;
+        }
+        ac4_unmix(d->spec[CH_L], d->spec[CH_R], nl < nr ? nl : nr,
                   &e->lr.st, &e->lr.fr[0]);
+    }
     if ((r->mask & 0x30) == 0x30)
         ac4_unmix(d->spec[CH_LS], d->spec[CH_RS],
                   d->spec_n[CH_LS] < d->spec_n[CH_RS] ? d->spec_n[CH_LS]
@@ -1188,6 +1257,12 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         int w, sum = 0;
         if (!(r->mask & (1 << k)))
             continue;
+        if (silent & (1 << k)) {
+            r->nwin[k] = 1;
+            r->wlen[k][0] = d->fl;
+            memset(r->win + k * FRAME, 0, sizeof(double) * (size_t)d->fl);
+            continue;
+        }
         fr = chan_src(e, k)->fr;
         ac4_ungroup(d->spec[k], d->spec_n[k], fr, r->win + k * FRAME,
                     r->wlen[k]);
@@ -1223,6 +1298,8 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
 fail:
     d->fstate = fstate0;
     d->aq = aq0;
+    memcpy(d->aq1, aq10, sizeof(aq10));
+    memcpy(d->aq1n, aq1n0, sizeof(aq1n0));
     /* a frame concealed after it was put on the late list (a rule checked
        after add_pending) is not judged by the late check: it keeps its
        reason, is counted once, and its A-SPX does not feed the check's
@@ -1268,6 +1345,8 @@ static void parse_held(ac4dec *d, const uint8_t *nx, size_t nx_len,
         r->af[0].kind = r->af[1].kind = r->af[2].kind = AC4_GRP_NONE;
         r->af[0].acpl.kind = r->af[1].acpl.kind = r->af[2].acpl.kind =
             AC4_GRP_NONE;
+        r->af[0].acpl1_kind = r->af[1].acpl1_kind = r->af[2].acpl1_kind =
+            AC4_GRP_NONE;
         return;
     }
     parse_frame(d, data, d->raw_len, nx, nx_len, has_next, r);
@@ -1279,9 +1358,11 @@ static int pair_capable(const ac4dec *d, int p)
     if (d->mode < 0)
         return 0;
     if (d->element == AC4DEC_ELEMENT_PAIR)
-        return p == 0 && d->mode == 1;
+        return p == 0 && d->mode >= 1;
     if (p == 0)
-        return 1;                   /* 5_X codec mode 1 or 4 */
+        return 1;                   /* 5_X codec modes 1 - 4 */
+    if (p == 1 && d->acpl1)
+        return 0;                   /* ASPX_ACPL_1 / _2: no Ls/Rs A-SPX */
     return !d->acpl3 && d->n_ch == 6;   /* Ls/Rs and C (as C/C) */
 }
 
@@ -1405,10 +1486,15 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
         if (p == 0 && d->pair[0].acpl_on) {
             /* the A-CPL upmix (decoder.py): a frame the checks above gave
                its core plays the core (the stereo downmix) on L / R and
-               nothing on C / Ls / Rs */
+               nothing on C / Ls / Rs (a pair element in ASPX_ACPL_1 / _2:
+               its mono core on both) */
             static const int CH5[5] = { CH_L, CH_R, CH_C, CH_LS, CH_RS };
-            int c;
+            int c, on = d->pair[0].acpl_on;
+            if (on == 2 && bad)
+                memcpy(o->pcm[CH_R], o->pcm[CH_L], sizeof(o->pcm[0]));
             for (c = 0; c < 5; c++) {
+                if ((on == 2 && c >= 2) || (on == 3 && c == 2))
+                    continue;
                 if (bad && c < 2)
                     continue;
                 if (bad)
@@ -1470,12 +1556,26 @@ static void synth_one(ac4dec *d)
             if (p == 0 && d->acpl3 && d->n_ch == 6
                 && d->element == AC4DEC_ELEMENT_5X)
                 d->pair[0].acpl_on = 1;
+            if (p == 0 && d->acpl1 == AC4_ACPL1_PAIR)
+                d->pair[0].acpl_on = 2;
+            if (p == 0 && d->acpl1 == AC4_ACPL1_5X && d->n_ch == 6
+                && d->element == AC4DEC_ELEMENT_5X)
+                d->pair[0].acpl_on = 3;
         }
         if (d->pair_active[p]) {
             const double *x[2];
             double *y[2], *dc[2];
             x[0] = d->core[PAIR_CH[p][0]];
             x[1] = d->core[PAIR_CH[p][1]];
+            if (p == 0 && d->acpl1 == AC4_ACPL1_PAIR)
+                x[1] = d->core[CH_L];       /* the "m" track twice */
+            if (p == 0 && d->pair[0].acpl_on >= 2) {
+                const double *res[2];
+                res[0] = d->pair[0].acpl_on == 2 ? d->core[CH_R]
+                                                 : d->core[CH_LS];
+                res[1] = d->pair[0].acpl_on == 2 ? NULL : d->core[CH_RS];
+                ac4_aspx_pair_residual(&d->pair[0], d->qmf, res);
+            }
             y[0] = hf[p][0];
             y[1] = hf[p][1];
             dc[0] = dcore[p][0];

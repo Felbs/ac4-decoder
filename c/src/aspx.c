@@ -664,3 +664,59 @@ void ac4_acpl_data_2ch(ac4_bits *b, const ac4_aspx_books *bk,
         }
     }
 }
+
+/* Table 61 (Tables 63-65), Pseudocode 121: alpha1, beta1 of one module */
+void ac4_acpl_data_1ch(ac4_bits *b, const ac4_aspx_books *bk,
+                       const ac4_acpl1_cfg *cfg, int (*qs)[AC4_ACPL_NB],
+                       int *qn, ac4_acpl1_frame *out)
+{
+    int interp, n_sets, i, p, s, k;
+    int n = cfg->num_param_bands, st = cfg->param_band;
+    int qm = cfg->quant_mode ? 1 : 0;
+    int tsl[2] = { 0, 0 };
+    interp = (int)ac4_bit(b);
+    n_sets = (int)ac4_bit(b) + 1;
+    if (interp == 1)
+        for (i = 0; i < n_sets; i++)
+            tsl[i] = (int)ac4_u(b, 5);
+    if (out) {
+        memset(out, 0, sizeof(*out));
+        out->kind = AC4_GRP_DATA;
+        out->cfg = *cfg;
+        out->interp = interp;
+        out->n_sets = n_sets;
+        out->ts[0] = tsl[0];
+        out->ts[1] = tsl[1];
+    }
+    for (p = 0; p < 2; p++) {             /* ALPHA, BETA */
+        int base = 6 * p + 3 * qm;
+        const int *off = ACPL_CB_OFF[p][qm];
+        for (s = 0; s < n_sets; s++) {
+            int cur[AC4_ACPL_NB];
+            for (k = 0; k < AC4_ACPL_NB; k++)
+                cur[k] = 0;
+            if (ac4_bit(b) == 0) {            /* DIFF_FREQ */
+                int v = ac4_huff_decode(&bk->acpl[base], b);
+                cur[st] = v - off[0];
+                for (k = st + 1; k < n; k++)
+                    cur[k] = cur[k - 1]
+                             + (ac4_huff_decode(&bk->acpl[base + 1], b)
+                                - off[1]);
+            } else {                          /* DIFF_TIME */
+                for (k = st; k < n; k++) {
+                    int v = ac4_huff_decode(&bk->acpl[base + 2], b);
+                    int prev = (qs && k < qn[p]) ? qs[p][k] : 0;
+                    cur[k] = prev + (v - off[2]);
+                }
+            }
+            if (out)
+                for (k = 0; k < n; k++)
+                    out->q[p][s][k] = cur[k];
+            if (qs) {
+                for (k = 0; k < n; k++)
+                    qs[p][k] = cur[k];
+                qn[p] = n;
+            }
+        }
+    }
+}

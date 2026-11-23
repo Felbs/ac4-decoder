@@ -39,6 +39,13 @@ static void sb_to_pb(int nb, int *map)
             map[sb] = t[g];
 }
 
+int ac4_acpl_sb_to_pb(int num_param_bands, int sb)
+{
+    int map[NSB];
+    sb_to_pb(num_param_bands, map);
+    return sb >= 0 && sb < NSB ? map[sb] : 0;
+}
+
 /* Tables 203-206 */
 static const double ALPHA_FINE[33] = {
     -2.0, -1.809375, -1.6375, -1.484375, -1.35, -1.234375, -1.1375,
@@ -383,4 +390,200 @@ void ac4_acpl_run(ac4_acpl_state *s, ac4_acpl_work *w,
                 zi[k][t][sb] = k < 2 ? z[k][1] : z[k][1] * m;
             }
         }
+}
+
+/* ------------------------------------------------- ASPX_ACPL_1 / _2 */
+/* Pseudocode 111 then 112-114 for decorrelator d on n slots of w->vr/vi[d]
+   (after the HIST slots of history taken from s), into w->ur/ui[d]
+   (after MAXL slots), the state carried on: the loops of ac4_acpl_run */
+static void decorr_duck(ac4_acpl_state *s, ac4_acpl_work *w, int d, int n)
+{
+    double (*vr)[NSB] = w->vr[d], (*vi)[NSB] = w->vi[d];
+    double (*ur)[NSB] = w->ur[d], (*ui)[NSB] = w->ui[d];
+    int r, i, t, sb, k, pb15[NSB];
+    memcpy(vr, s->xr[d], sizeof(s->xr[d]));
+    memcpy(vi, s->xi[d], sizeof(s->xi[d]));
+    memcpy(ur, s->yr[d], sizeof(s->yr[d]));
+    memcpy(ui, s->yi[d], sizeof(s->yi[d]));
+    for (r = 0; r < 3; r++) {
+        int lo = REG[r][0], hi = REG[r][1], dl = REG[r][2], L = REG[r][3];
+        double a[MAXL + 1], b[MAXL + 1];
+        a[0] = 1.0;
+        for (i = 1; i <= L; i++)
+            a[i] = COEF[d][r][i - 1];
+        for (i = 0; i <= L; i++)
+            b[i] = a[L - i];
+        for (t = 0; t < n; t++) {
+            int p = HIST + t, q = MAXL + t;
+            for (sb = lo; sb < hi; sb++) {
+                double yr_ = b[0] * vr[p - dl][sb];
+                double yi_ = b[0] * vi[p - dl][sb];
+                for (i = 1; i <= L; i++) {
+                    yr_ = yr_ + (b[i] * vr[p - i - dl][sb]
+                                 - a[i] * ur[q - i][sb]);
+                    yi_ = yi_ + (b[i] * vi[p - i - dl][sb]
+                                 - a[i] * ui[q - i][sb]);
+                }
+                ur[q][sb] = yr_;
+                ui[q][sb] = yi_;
+            }
+        }
+    }
+    memcpy(s->xr[d], vr[n], sizeof(s->xr[d]));
+    memcpy(s->xi[d], vi[n], sizeof(s->xi[d]));
+    memcpy(s->yr[d], ur[n], sizeof(s->yr[d]));
+    memcpy(s->yi[d], ui[n], sizeof(s->yi[d]));
+    sb_to_pb(15, pb15);
+    for (t = 0; t < n; t++) {
+        double g[AC4_ACPL_NB];
+        int q = MAXL + t;
+        for (k = 0; k < AC4_ACPL_NB; k++) {
+            int lo = GROUPS[k][0], wd = GROUPS[k][1] - lo + 1;
+            double e2[NSB], e, pk;
+            for (i = 0; i < wd; i++)
+                e2[i] = abs2(ur[q][lo + i], ui[q][lo + i]);
+            e = ac4_np_sum(e2, wd);
+            pk = DUCK_ALPHA * s->peak[d][k];
+            s->peak[d][k] = pk < e ? e : pk;
+            s->smooth[d][k] = (1.0 - DUCK_ALPHA_SMOOTH) * s->smooth[d][k];
+            s->smooth[d][k] = s->smooth[d][k] + DUCK_ALPHA_SMOOTH * e;
+            s->spd[d][k] = (1.0 - DUCK_ALPHA_SMOOTH) * s->spd[d][k];
+            s->spd[d][k] = s->spd[d][k]
+                           + DUCK_ALPHA_SMOOTH * (s->peak[d][k] - e);
+            if (DUCK_GAMMA * s->spd[d][k] > s->smooth[d][k])
+                g[k] = s->smooth[d][k]
+                       / (DUCK_GAMMA * (s->spd[d][k] + DUCK_EPSILON));
+            else
+                g[k] = 1.0;
+        }
+        for (sb = 0; sb < NSB; sb++) {
+            ur[q][sb] = ur[q][sb] * g[pb15[sb]];
+            ui[q][sb] = ui[q][sb] * g[pb15[sb]];
+        }
+    }
+}
+
+/* acpl.dequantise_1ch for one parameter set: -> a[band], b[band] */
+static void band_values_1ch(const ac4_acpl1_frame *f, int ps, double *a,
+                            double *be)
+{
+    int qm = f->cfg.quant_mode ? 1 : 0, b;
+    for (b = 0; b < f->cfg.num_param_bands; b++) {
+        int qa = clampi(f->q[0][ps][b], Q_LO[0][qm], Q_HI[0][qm]);
+        int qb = clampi(f->q[1][ps][b], Q_LO[1][qm], Q_HI[1][qm]);
+        if (qm) {
+            a[b] = ALPHA_COARSE[qa];
+            be[b] = BETA_COARSE[qb][IBETA_COARSE[qa]];
+        } else {
+            a[b] = ALPHA_FINE[qa];
+            be[b] = BETA_FINE[qb][IBETA_FINE[qa]];
+        }
+    }
+}
+
+void ac4_acpl1_run(ac4_acpl_state *s, ac4_acpl_work *w,
+                   const ac4_acpl1_frame *frames, int kind, int nm, int n,
+                   int nts, int split,
+                   const double (*x0r[2])[64], const double (*x0i[2])[64],
+                   const double (*x1r[2])[64], const double (*x1i[2])[64],
+                   double (*z0r[2])[64], double (*z0i[2])[64],
+                   double (*z1r[2])[64], double (*z1i[2])[64])
+{
+    double (*ip)[AC4_MAX_NTS][NSB] = w->ip;
+    double (*sets)[2][NSB] = w->sets;
+    int m, t, sb, ps, k, tsl[2];
+    if (kind == AC4_GRP_NONE || (kind == AC4_GRP_CONCEALED && !s->warm)) {
+        memset(s, 0, sizeof(*s));
+        for (m = 0; m < nm; m++)
+            for (t = 0; t < n; t++)
+                for (sb = 0; sb < NSB; sb++) {
+                    double ar = x0r[m][t][sb], ai = x0i[m][t][sb];
+                    double br = x1r[m] ? x1r[m][t][sb] : 0.0;
+                    double bi = x1i[m] ? x1i[m][t][sb] : 0.0;
+                    if (split) {
+                        z0r[m][t][sb] = ar + br;
+                        z0i[m][t][sb] = ai + bi;
+                        z1r[m][t][sb] = ar - br;
+                        z1i[m][t][sb] = ai - bi;
+                    } else {
+                        z0r[m][t][sb] = ar;
+                        z0i[m][t][sb] = ai;
+                        z1r[m][t][sb] = 0.0;
+                        z1i[m][t][sb] = 0.0;
+                    }
+                }
+        return;
+    }
+    if (n <= 0)
+        return;
+    for (m = 0; m < nm; m++) {
+        int interp = 0, n_sets = 1;
+        tsl[0] = tsl[1] = 0;
+        if (kind == AC4_GRP_DATA) {
+            const ac4_acpl1_frame *f = &frames[m];
+            int map[NSB];
+            double av[AC4_ACPL_NB], bv[AC4_ACPL_NB];
+            sb_to_pb(f->cfg.num_param_bands, map);
+            n_sets = f->n_sets;
+            for (ps = 0; ps < n_sets; ps++) {
+                band_values_1ch(f, ps, av, bv);
+                for (sb = 0; sb < NSB; sb++) {
+                    sets[2 * m][ps][sb] = av[map[sb]];
+                    sets[2 * m + 1][ps][sb] = bv[map[sb]];
+                }
+            }
+            if (!s->warm)
+                for (k = 0; k < 2; k++)
+                    memcpy(s->prev[2 * m + k], sets[2 * m + k][0],
+                           sizeof(s->prev[0]));
+            interp = f->interp;
+            tsl[0] = f->ts[0];
+            tsl[1] = f->ts[1];
+        } else {                            /* concealed: hold */
+            for (k = 0; k < 2; k++)
+                memcpy(sets[2 * m + k][0], s->prev[2 * m + k],
+                       sizeof(s->prev[0]));
+        }
+        for (k = 0; k < 2; k++)
+            interpolate(s->prev[2 * m + k], sets[2 * m + k], n_sets, interp,
+                        tsl, n, nts, ip[2 * m + k]);
+        if (kind == AC4_GRP_DATA) {         /* Pseudocode 110 */
+            for (k = 0; k < 2; k++)
+                memcpy(s->prev[2 * m + k], sets[2 * m + k][n_sets - 1],
+                       sizeof(s->prev[0]));
+            s->qb[m] = frames[m].cfg.qmf_band;
+        }
+    }
+    s->warm = 1;
+    for (m = 0; m < nm; m++) {
+        for (t = 0; t < n; t++)
+            for (sb = 0; sb < NSB; sb++) {
+                w->vr[m][HIST + t][sb] = 2.0 * x0r[m][t][sb];
+                w->vi[m][HIST + t][sb] = 2.0 * x0i[m][t][sb];
+            }
+        decorr_duck(s, w, m, n);
+    }
+    for (m = 0; m < nm; m++) {
+        int qb = s->qb[m];
+        for (t = 0; t < n; t++)
+            for (sb = 0; sb < NSB; sb++) {
+                double xr2 = 2.0 * x0r[m][t][sb], xi2 = 2.0 * x0i[m][t][sb];
+                if (sb < qb) {
+                    double br = x1r[m] ? 2.0 * x1r[m][t][sb] : 0.0;
+                    double bi = x1i[m] ? 2.0 * x1i[m][t][sb] : 0.0;
+                    z0r[m][t][sb] = 0.5 * (xr2 + br);
+                    z0i[m][t][sb] = 0.5 * (xi2 + bi);
+                    z1r[m][t][sb] = 0.5 * (xr2 - br);
+                    z1i[m][t][sb] = 0.5 * (xi2 - bi);
+                } else {
+                    double a = ip[2 * m][t][sb], b = ip[2 * m + 1][t][sb];
+                    double yr = w->ur[m][MAXL + t][sb];
+                    double yi = w->ui[m][MAXL + t][sb];
+                    z0r[m][t][sb] = 0.5 * (xr2 * (1.0 + a) + yr * b);
+                    z0i[m][t][sb] = 0.5 * (xi2 * (1.0 + a) + yi * b);
+                    z1r[m][t][sb] = 0.5 * (xr2 * (1.0 - a) - yr * b);
+                    z1i[m][t][sb] = 0.5 * (xi2 * (1.0 - a) - yi * b);
+                }
+            }
+    }
 }

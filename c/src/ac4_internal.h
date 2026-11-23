@@ -303,13 +303,27 @@ typedef struct {                /* acpl_config_2ch(), Table 60 */
     int num_param_bands, param_band, quant_mode_0, quant_mode_1;
 } ac4_acpl_cfg;
 
+typedef struct {                /* acpl_config_1ch(), Table 59 */
+    int num_param_bands, param_band, qmf_band, quant_mode;
+} ac4_acpl1_cfg;
+
 /* The parsed element. */
+#define AC4_ACPL1_NONE 0
+#define AC4_ACPL1_5X 1          /* 5_X ASPX_ACPL_1 / _2 (two modules) */
+#define AC4_ACPL1_PAIR 2        /* channel pair ASPX_ACPL_1 / _2 */
 typedef struct {
     int mode;                   /* 5_X_codec_mode or stereo_codec_mode */
     int acpl3;
+    int acpl1;                  /* AC4_ACPL1_*: acpl_data_1ch() blocks */
     int has_aspx_cfg, has_acpl_cfg;
     ac4_aspx_cfg aspx_cfg;      /* valid when has_aspx_cfg */
-    ac4_acpl_cfg acpl_cfg;      /* valid when has_acpl_cfg */
+    ac4_acpl_cfg acpl_cfg;      /* valid when has_acpl_cfg (2ch) */
+    ac4_acpl1_cfg acpl1_cfg;    /* valid when has_acpl_cfg (1ch) */
+    /* the A-SPX blocks after the channel data, in bitstream order: block
+       group (0 L/R, 1 Ls/Rs, 2 C) and two-channel flag; then n_acpl1
+       acpl_data_1ch() (acpl1) or one acpl_data_2ch() (acpl3) */
+    int n_blocks, blk_grp[3], blk_two[3], n_acpl1;
+    int r_silent;               /* the pair's R not coded (ASPX_ACPL_2) */
     size_t audio_size, audio_start;
     size_t bits_end;            /* where the core parse ended */
     ac4_mono lfe;
@@ -437,6 +451,7 @@ void ac4_acpl_data_2ch(ac4_bits *b, const ac4_aspx_books *bk,
 /* the tool's state between frames (acpl.new_state) */
 typedef struct {
     int warm;
+    int qb[2];                  /* 1ch: acpl_qmf_band of the last data */
     double prev[AC4_ACPL_NQ][64];
     double xr[3][14][64], xi[3][14][64];    /* decorrelator input history */
     double yr[3][7][64], yi[3][7][64];      /* and output history */
@@ -454,6 +469,43 @@ typedef struct {
     double xr[2][AC4_MAX_NTS][64], xi[2][AC4_MAX_NTS][64];
     double zr[5][AC4_MAX_NTS][64], zi[5][AC4_MAX_NTS][64];
 } ac4_acpl_work;
+
+/* one frame's parameters of the acpl_data_1ch() modules */
+typedef struct {
+    int kind;                   /* AC4_GRP_* */
+    ac4_acpl1_cfg cfg;
+    int interp, n_sets, ts[2];
+    int q[2][2][AC4_ACPL_NB];   /* alpha1, beta1 per set (Pseudocode 121) */
+} ac4_acpl1_frame;
+
+/* acpl_alpha1 / beta1 q_prev of the two modules */
+typedef struct {
+    int q[2][2][AC4_ACPL_NB];
+    int n[2][2];
+} ac4_acpl1_qstate;
+
+/* Table 197: the parameter band of QMF subband sb at num_param_bands */
+int ac4_acpl_sb_to_pb(int num_param_bands, int sb);
+
+/* acpl_data_1ch (Table 61). With out not NULL, differentially decoded
+   against qs[0..1] (updated). Raises b->eof_code. */
+void ac4_acpl_data_1ch(ac4_bits *b, const ac4_aspx_books *bk,
+                       const ac4_acpl1_cfg *cfg, int (*qs)[AC4_ACPL_NB],
+                       int *qn, ac4_acpl1_frame *out);
+
+/* acpl.render_1ch for one frame of n (<= nts) slots and nm (1 or 2)
+   modules: x0[m] the A-SPX output of module m's core channel, x1[m] its
+   residual (NULL: none); z0[m], z1[m] receive the outputs (unscaled).
+   frames NULL = no data (passthrough: split ? (x0 + x1, x0 - x1) :
+   (x0, 0); state cleared), kind CONCEALED = hold. The state is the 2ch
+   tool's (prev[2 m], prev[2 m + 1] = module m's alpha, beta). */
+void ac4_acpl1_run(ac4_acpl_state *s, ac4_acpl_work *w,
+                   const ac4_acpl1_frame *frames, int kind, int nm, int n,
+                   int nts, int split,
+                   const double (*x0r[2])[64], const double (*x0i[2])[64],
+                   const double (*x1r[2])[64], const double (*x1i[2])[64],
+                   double (*z0r[2])[64], double (*z0i[2])[64],
+                   double (*z1r[2])[64], double (*z1i[2])[64]);
 
 /* acpl.upmix_frame / render for one frame of n (<= nts) slots, nts =
    num_qmf_timeslots: x[c] the pair's QMF slots (re, im: [n][64]); z[ch]
@@ -479,6 +531,8 @@ typedef struct {
     ac4_aspx_tab tab;           /* the tables this frame's data is for */
     ac4_aspx_grp g;
     ac4_acpl_frame acpl;        /* ASPX_ACPL_3 (pair 0 only) */
+    int acpl1_kind;             /* ASPX_ACPL_1 / _2 (pair 0 only) */
+    ac4_acpl1_frame acpl1[2];
 } ac4_aspx_frame;
 
 typedef struct ac4_qmf_tables ac4_qmf_tables;
@@ -505,12 +559,18 @@ typedef struct {
                                                samples */
     int hot_left;               /* burst guard: frames still owed */
     long n_applied;
-    /* A-CPL (ASPX_ACPL_3 decoded to 5.1): on, its state, the upmixed
-       channels' QMF slots (L, R, C, Ls, Rs) and their synthesis banks */
+    /* A-CPL (ASPX_ACPL_3 decoded to 5.1; acpl_on 1), or the 1ch modules
+       of ASPX_ACPL_1 / _2 (acpl_on 2: a pair element, outputs L, R; 3: a
+       5_X element, outputs L, R, -, Ls, Rs): on, its state, the residuals'
+       analysis, the upmixed channels' QMF slots (L, R, C, Ls, Rs) and
+       their synthesis banks */
     int acpl_on;
+    double rana[2][640];
+    double rre[2][AC4_QRING][64], rim[2][AC4_QRING][64];
     ac4_acpl_state acpl;
     ac4_acpl_work acpl_work;
     double ure[5][AC4_QRING][64], uim[5][AC4_QRING][64];
+    double tmp1r[2][AC4_MAX_NTS][64], tmp1i[2][AC4_MAX_NTS][64];
     double usyn[5][1280];
     double upout[5][AC4_MAX_FRAME];   /* the last output frame's upmix */
 } ac4_aspx_pair;
@@ -526,7 +586,11 @@ int ac4_aspx_pair_push(ac4_aspx_pair *p, const ac4_qmf_tables *q,
                        const double *const x[2], const ac4_aspx_frame *f,
                        double *const y[2], double *const dc[2]);
 /* With p->acpl_on, the push / finish that writes output frame j - 1 also
-   writes its A-CPL upmix (L, R, C, Ls, Rs) to p->upout. */
+   writes its A-CPL upmix (L, R, C, Ls, Rs) to p->upout. With acpl_on 2 or
+   3, ac4_aspx_pair_residual analyses core frame j of the residuals
+   (res[m], NULL = silent) before ac4_aspx_pair_push of frame j. */
+void ac4_aspx_pair_residual(ac4_aspx_pair *p, const ac4_qmf_tables *q,
+                            const double *const res[2]);
 /* End of stream: the last frame's output (its envelopes clipped at the
    end of the analysed signal, as at the end of a Python decode pass).
    -> 1 if a frame was written. */
