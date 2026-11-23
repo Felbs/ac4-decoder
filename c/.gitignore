@@ -1,0 +1,7 @@
+*.o
+libac4dec.a
+libac4dec.so
+ac4dec-c
+tests/unit_test
+tests/fuzz_test
+tests/*_asan
