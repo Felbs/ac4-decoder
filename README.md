@@ -815,9 +815,24 @@ reading.
   1.5 dB envelopes dequantised as 3 dB (fixed), and it now fires on no
   capture. It still fires on 7 frames of a public stereo test stream,
   which is louder than the fixed reference.
-* **Broadcaster A's stereo** keeps a 34 dB step down at its A-SPX
-  crossover after the envelope fixes (its 5.1 and broadcaster B do not):
-  its high band is still far too quiet. Not found yet.
+* **Broadcaster A's stereo** plays about 17 dB below its loudness
+  metadata (BS.1770 -41.6 LUFS against loudrelgat -24.5 on its 10 s lane;
+  its SIMPLE stereo and its 5.1 match theirs within 0.3 dB). Phase B2
+  narrowed it to the companding tool: the same programme is on its 5.1
+  (correlation 0.96 with the 5.1's downmix). Without companding the
+  stereo core's per-frame level against that downmix spreads with a
+  standard deviation of 6.5 dB (loud frames 13 dB under, quiet ones 6 dB
+  over: the encoder's compression); the expansion of 5.7.5.2 brings the
+  spread to 2.7 dB, so its shape is right, but leaves the stereo 17 dB
+  under the downmix at the companding scale fitted on the kit
+  (Interpretations), where broadcaster B's stereo sits 0.7 dB under its
+  own 5.1 core and the kit's matches its AAC version. A change of that
+  scale moves every companded stream by the same gain, so it cannot
+  reconcile both; the formulas match the standard as printed (mean level
+  over the crossover's subbands, alpha 0.65, sync and average branches).
+  No decoder error found; open. The 34 dB step down at its A-SPX
+  crossover reported before is not explained by it (the high band is set
+  by the transmitted envelopes, not by the core's level) and stays open.
 * **Pass boundaries.** The output is not fully independent of how the
   frames are split into decode passes (`decode_pass`; the CLI's default
   pass is 1800 frames, 60 s): the last frame of a pass can differ from a
