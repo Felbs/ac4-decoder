@@ -315,7 +315,7 @@ def fake_toc(channel_mode=1, ndot=1, **kw):
                                   groups=[0], pres_substream=0)],
               groups=[dict(substreams=[sub], channel_coded=1,
                            content_classifier=None, language=None)],
-              channel_modes=[channel_mode])
+              channel_modes=[channel_mode], fs_index=1, frame_rate_index=3)
     st.update(kw)
     return st
 

@@ -519,10 +519,9 @@ class Ac4Stream:
                 wins[k][p0:p0 + c] = [np.zeros(1536)]
                 lengths[k][p0:p0 + c] = [1536]
                 counts[k][fi] = 1
-            groups["lr"][fi] = groups["sr"][fi] = groups["c"][fi] = \
-                CONCEALED
-            if "acpl" in groups:
-                groups["acpl"][fi] = CONCEALED
+            for key in ("lr", "sr", "c", "acpl"):
+                if key in groups:
+                    groups[key][fi] = CONCEALED
             self.status[fi] = "audio_size.late"
             self.n_bad += 1
             self.n_ok -= 1
