@@ -863,3 +863,65 @@ def test_fixfix_freq_res_mode_0_reads_one_bit():
     fr = P.aspx_framing(b, dict(num_env_bits_fixfix=1, freq_res_mode=0), 12,
                         False, {}, (0, 0))
     assert fr["num_env"] == 4 and fr["freq_res"] == [1] * 4 and b.p == 4
+
+
+# ------------------------------------------------------ companding (item 4)
+def _levels_ref(Q, ta, tz, sbx, scale):
+    out = []
+    for ts in range(ta, tz):
+        acc = 0.0
+        for sb in range(sbx):
+            re, im = abs(Q[sb, ts].real), abs(Q[sb, ts].imag)
+            acc += max(re, im) + 0.5 * min(re, im)
+        out.append(0.9105 * (acc / sbx) / scale)
+    return np.array(out)
+
+
+@pytest.mark.parametrize("sync,on,avg", [(0, (1, 0), 1), (1, (1,), None),
+                                         (1, (0,), 1), (0, (0, 1), 0)])
+def test_companding_frame_is_5_7_5_2(sync, on, avg):
+    """compand_frame against 5.7.5.2 written out: per slot of each
+    channel's interval L = 0.9105 mean(max(|re|,|im|) + min/2) over
+    subbands 0..sbx-1 (levels relative to COMPAND_SCALE), gain
+    L^((1-a)/a) 2^(1/a); b_compand_avg: the interval's mean level; sync:
+    the channels' mean gain per slot. Companding is on by default, with
+    the levels relative to IMDCT_K * 2^16.5 (README, Interpretations)."""
+    from ac4 import aspx_bands as A
+    from ac4 import aspx_render as R
+    from ac4 import filterbank as FB
+    assert R.COMPANDING
+    assert R.COMPAND_SCALE == FB.IMDCT_K * 2.0 ** 16.5
+    rng = np.random.default_rng(11)
+    geo = A.geometry(1536)
+    Qs = [(rng.standard_normal((64, 96)) + 1j * rng.standard_normal((64, 96)))
+          * 1e5 for _ in range(2)]
+    orig = [q.copy() for q in Qs]
+    fl = [dict(on=on[0] if sync else on[i], avg=avg, sync=sync)
+          for i in range(2)]
+    got = [{"fr": {"borders": [0, 12]}, "compand": fl[0]},
+           {"fr": {"borders": [2, 14]}, "compand": fl[1]}]
+    sbx = 20
+    R.compand_frame(Qs, got, sbx, 1, geo)
+    a = 0.65
+    G, expo = 2 ** (1 / a), (1 - a) / a
+    spans = [(24 + 18 + 0, 24 + 18 + 24), (24 + 18 + 4, 24 + 18 + 28)]
+    Ls = [_levels_ref(o, ta, tz, sbx, R.COMPAND_SCALE)
+          for o, (ta, tz) in zip(orig, spans)]
+    for c in range(2):
+        ta, tz = spans[c]
+        if sync:
+            n = min(len(x) for x in Ls)
+            g = (Ls[0][:n] ** expo + Ls[1][:n] ** expo) / 2
+            if not on[0]:
+                g = np.full(n, g.mean())
+            tz = ta + n
+        elif on[c]:
+            g = Ls[c] ** expo
+        elif avg:
+            g = np.full(tz - ta, Ls[c].mean() ** expo)
+        else:
+            assert np.array_equal(Qs[c], orig[c])
+            continue
+        want = orig[c].copy()
+        want[:sbx, ta:tz] *= g * G
+        assert np.allclose(Qs[c], want, rtol=1e-12)

@@ -98,16 +98,16 @@ TS_OFFSET = 24 - TS_HFGEN
 
 # COMPANDING (TS 103 190-1 5.7.5). The tool's levels L(ts) are not scale
 # invariant (its gain is L^((1 - alpha) / alpha) * 2^(1 / alpha)), and the
-# standard does not say what full scale they refer to. Its fixed point,
-# L = 2^(-1 / (1 - alpha)) = 0.138, sits at programme level only for a
-# full scale of 1, so the levels are taken relative to this decoder's full
-# scale: IMDCT_K * 2^14.5 decoder units, the full scale the loudness
-# metadata of five streams gives (BS.1770 against loudrelgat: 122.1 dB re
-# 1, spread +-1.8 dB; IMDCT_K * 2^14.5 is 122.2 dB). See README,
-# Interpretations.
-COMPANDING = False      # off: see README, Interpretations (companding)
+# standard does not say what full scale they refer to. The scale is taken
+# from an independent reference: the public stereo test signal's AAC
+# version (the same programme, decoded by FFmpeg), whose per-frame levels,
+# spectral shape and loudness this decoder's output matches best with the
+# levels taken relative to IMDCT_K * 2^16.5 decoder units (README,
+# Interpretations: without companding the frame levels' 95th-percentile
+# deviation from the reference is 3.0 dB, with it 0.37 dB).
+COMPANDING = True       # see README, Interpretations (companding)
 COMPAND_ALPHA = 0.65
-COMPAND_SCALE = FB.IMDCT_K * 2.0 ** 14.5
+COMPAND_SCALE = FB.IMDCT_K * 2.0 ** 16.5
 
 
 def compand_levels(Q, sb0, sb1):
@@ -117,61 +117,68 @@ def compand_levels(Q, sb0, sb1):
     return 0.9105 * e.mean(axis=0) / COMPAND_SCALE
 
 
-def compand(Qs, groups, sbx, ts_offset=None, geo=None):
-    """The companding tool (5.7.5.2) on the analysed core of the channels
-    of one A-SPX group, in place, before HF generation (6.2.9). Qs: the
-    channels' QMF matrices (list); groups: per frame the A-SPX data (one
-    dict per channel, with its "compand" flags) or None / CONCEALED. Each
-    frame acts on subbands 0 .. sbx - 1 and on the slots of its A-SPX
-    interval, atsg_sig[0] .. atsg_sig[num_atsg_sig] (x num_ts_in_ats),
-    placed like the envelopes."""
-    geo = geo or A.geometry(1536)
+def compand_frame(Qs, got, sbx, f, geo, ts_offset=None):
+    """The companding tool (5.7.5.2) for frame f of one A-SPX group, in
+    place on the analysed core of its channels (Qs, a list), subbands
+    0 .. sbx - 1 and the slots of each channel's A-SPX interval
+    (atsg_sig[0] .. atsg_sig[num_atsg_sig] x num_ts_in_ats, placed like
+    the envelopes). got: the frame's A-SPX data (one dict per channel,
+    with its "compand" flags). -> the slot ranges it touched."""
     off = geo["ts_offset"] if ts_offset is None else ts_offset
     nts, tia, nats = geo["nts"], geo["tia"], geo["nats"]
-    sbxs = sbx if isinstance(sbx, (list, tuple)) else [sbx] * len(groups)
     a = COMPAND_ALPHA
     G = 2.0 ** (1.0 / a)
     expo = (1.0 - a) / a
+    flags = [c.get("compand") for c in got]
+    if any(fl is None for fl in flags):
+        return []
+    sync = flags[0]["sync"]
+    spans, Ls = [], []
+    for c, Q in zip(got, Qs):
+        bd = c["fr"].get("borders") or [0, nats]
+        ta = max(f * nts + int(bd[0]) * tia + off, 0)
+        tz = min(f * nts + int(bd[-1]) * tia + off, Q.shape[1])
+        spans.append((ta, tz))
+        Ls.append(compand_levels(Q[:, ta:tz], 0, sbx) if tz > ta
+                  else np.zeros(0))
+    if sync:
+        n = min(len(x) for x in Ls)
+        if n == 0:
+            return []
+        gs = np.mean([x[:n] ** expo for x in Ls], axis=0)
+        if flags[0]["on"]:
+            gains = [gs] * len(Qs)
+        elif flags[0]["avg"]:
+            gains = [np.full(n, gs.mean())] * len(Qs)
+        else:
+            return []
+        for (ta, tz), Q, g in zip(spans, Qs, gains):
+            Q[:sbx, ta:ta + n] *= g * G
+        return [(ta, ta + n) for ta, tz in spans]
+    done = []
+    for (ta, tz), Q, L, fl in zip(spans, Qs, Ls, flags):
+        if tz <= ta:
+            done.append((ta, ta))
+            continue
+        if fl["on"]:
+            g = L ** expo
+        elif fl["avg"]:
+            g = np.full(tz - ta, L.mean() ** expo)
+        else:
+            done.append((ta, ta))
+            continue
+        Q[:sbx, ta:tz] *= g * G
+        done.append((ta, tz))
+    return done
+
+
+def compand(Qs, groups, sbx, ts_offset=None, geo=None):
+    """compand_frame for every frame of a pass (in order)."""
+    geo = geo or A.geometry(1536)
+    sbxs = sbx if isinstance(sbx, (list, tuple)) else [sbx] * len(groups)
     for f, got in enumerate(groups):
-        if not isinstance(got, list):
-            continue
-        sbx = sbxs[f]
-        flags = [c.get("compand") for c in got]
-        if any(fl is None for fl in flags):
-            continue
-        sync = flags[0]["sync"]
-        spans, Ls = [], []
-        for c, Q in zip(got, Qs):
-            bd = c["fr"].get("borders") or [0, nats]
-            ta = max(f * nts + int(bd[0]) * tia + off, 0)
-            tz = min(f * nts + int(bd[-1]) * tia + off, Q.shape[1])
-            spans.append((ta, tz))
-            Ls.append(compand_levels(Q[:, ta:tz], 0, sbx) if tz > ta
-                      else np.zeros(0))
-        if sync:
-            n = min(len(x) for x in Ls)
-            if n == 0:
-                continue
-            gs = np.mean([x[:n] ** expo for x in Ls], axis=0)
-            if flags[0]["on"]:
-                gains = [gs] * len(Qs)
-            elif flags[0]["avg"]:
-                gains = [np.full(n, gs.mean())] * len(Qs)
-            else:
-                continue
-            for (ta, tz), Q, g in zip(spans, Qs, gains):
-                Q[:sbx, ta:ta + n] *= g * G
-            continue
-        for (ta, tz), Q, L, fl in zip(spans, Qs, Ls, flags):
-            if tz <= ta:
-                continue
-            if fl["on"]:
-                g = L ** expo
-            elif fl["avg"]:
-                g = np.full(tz - ta, L.mean() ** expo)
-            else:
-                continue
-            Q[:sbx, ta:tz] *= g * G
+        if isinstance(got, list):
+            compand_frame(Qs, got, sbxs[f], f, geo, ts_offset)
 
 
 def t_for(cfg, xover=0):
@@ -270,9 +277,6 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
     for k, x in (("L", pcmL), ("R", pcmR)):
         xx = x[:(len(x) // Q.NSB) * Q.NSB]
         Qan[k] = Q.analyse(xx, w, Q.analysis_matrix())
-    if COMPANDING:
-        compand([Qan["L"], Qan["R"]], groups, [tt["sbx"] for tt in tf],
-                geo=geo)
     # Qh starts as the analysed core everywhere; the high band of each
     # frame with A-SPX data is generated over its A-SPX interval (TNA,
     # pre-flattening; Pseudocode 89) in the loop below. Slots no interval
@@ -351,6 +355,14 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
               else (got[1]["fr"].get("borders") or borders))
         ok = True
         A0 = slot + TSO                          # interval slot 0
+        if COMPANDING:
+            # the companding tool on this frame's interval of the core,
+            # before its HF generation (6.2.9), frame by frame: the slots
+            # of the next interval are not companded yet when this one's
+            # high band is made
+            sp = compand_frame([Qan["L"], Qan["R"]], got, sbx, fi, geo)
+            for k_, (a_, z_) in zip(("L", "R"), sp):
+                Qh[k_][:sbx, a_:z_] = Qan[k_][:sbx, a_:z_]
         for ci, (k, sig, ns, bd, frk) in enumerate(
                 (("L", sigA, nsA, b0, got[0]["fr"]),
                  ("R", sigB, nsB, b1, got[1]["fr"]))):
