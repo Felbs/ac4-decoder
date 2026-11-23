@@ -289,6 +289,8 @@ typedef struct {
     int int_class, num_env, num_noise;
     int freq_res[AC4_ASPX_MAX_ENV];
     int borders[AC4_ASPX_MAX_ENV + 1];
+    int tsg_ptr;                /* aspx_tsg_ptr; -1 for FIXFIX (none) */
+    int sine_at_end;            /* Pseudocode 92's p_sine_at_end: 0 or -1 */
 } ac4_aspx_framing;
 
 typedef struct {                /* one channel of aspx_data_1ch/2ch */
@@ -310,6 +312,10 @@ typedef struct {
     int stop[3][2];
     uint8_t has[3][2];
     int missing;                /* a missing previous_stop_pos was read */
+    /* aspx_tsg_ptr and num_atsg_sig of the previous interval, per channel
+       (Pseudocode 92), and whether there was one */
+    int ptr[3][2], nenv[3][2];
+    uint8_t has_ptr[3][2];
 } ac4_aspx_state;
 
 typedef struct {

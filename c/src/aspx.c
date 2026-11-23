@@ -255,6 +255,20 @@ static int freq_res(const int *borders, int atsg, int tsg_ptr, int mode)
            > ((double)nats / 6.0 + 3.25) ? 1 : 0;
 }
 
+/* Pseudocode 92's p_sine_at_end (aspx_parse.sine_at_end): 0 when the
+   channel's previous interval had aspx_tsg_ptr == num_atsg_sig, else -1;
+   this interval's pair is kept for the next */
+static int sine_at_end(ac4_aspx_state *st, int grp, int ch, int tsg_ptr,
+                       int num_env)
+{
+    int r = (st->has_ptr[grp][ch]
+             && st->ptr[grp][ch] == st->nenv[grp][ch]) ? 0 : -1;
+    st->ptr[grp][ch] = tsg_ptr;
+    st->nenv[grp][ch] = num_env;
+    st->has_ptr[grp][ch] = 1;
+    return r;
+}
+
 static void aspx_framing(ac4_bits *b, const ac4_aspx_cfg *cfg, int b_iframe,
                          ac4_aspx_state *st, int grp, int ch,
                          ac4_aspx_framing *f)
@@ -267,7 +281,7 @@ static void aspx_framing(ac4_bits *b, const ac4_aspx_cfg *cfg, int b_iframe,
     if (ic == FIXFIX) {
         int envbits = cfg->num_env_bits_fixfix + 1;
         num_env = 1 << ac4_u(b, envbits);
-        tsg_ptr = 0;
+        tsg_ptr = -1;                     /* FIXFIX: no aspx_tsg_ptr */
         for (i = 0; i < num_env; i++)       /* Python round(): half even */
             a[i] = (int)nearbyint((double)(i * nats) / (double)num_env);
         a[num_env] = nats;
@@ -339,10 +353,13 @@ static void aspx_framing(ac4_bits *b, const ac4_aspx_cfg *cfg, int b_iframe,
             f->freq_res[e] = (int)ac4_bit(b);
     } else {
         for (e = 0; e < num_env; e++)
-            f->freq_res[e] = freq_res(a, e, tsg_ptr, cfg->freq_res_mode);
+            f->freq_res[e] = freq_res(a, e, tsg_ptr < 0 ? 0 : tsg_ptr,
+                                      cfg->freq_res_mode);
     }
     st->stop[grp][ch] = a[num_env];
     st->has[grp][ch] = 1;
+    f->tsg_ptr = tsg_ptr;
+    f->sine_at_end = sine_at_end(st, grp, ch, tsg_ptr, num_env);
     f->num_env = num_env;
     f->num_noise = num_env > 1 ? 2 : 1;
     f->int_class = ic;
@@ -505,6 +522,9 @@ void ac4_aspx_data(ac4_bits *b, const ac4_aspx_books *bk,
     c1->fr = c0->fr;
     q1 = q0;
     if (balance == 1) {
+        /* channel 1's p_sine_at_end comes from its own previous interval */
+        c1->fr.sine_at_end = sine_at_end(st, grp, 1, c0->fr.tsg_ptr,
+                                         c0->fr.num_env);
         /* channel 1 uses channel 0's framing, so its previous_stop_pos
            (Pseudocode 76, per channel) is channel 0's stop border too
            (aspx_parse.BALANCE_SHARES_STOP) */

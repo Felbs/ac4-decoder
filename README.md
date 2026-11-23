@@ -162,6 +162,18 @@ at 0.9 of full scale):
   in its high band); 62 dB on B's 5.1 core, 93 dB or more on A's streams.
   The largest frame-peak rise: +0.4 dB on one frame; burst-guard firings
   on B's stereo unchanged (27 and 31 frames on its two captures).
+* **A-SPX transient envelope** (Pseudocodes 92, 95, 99). The envelope that
+  starts at a transient (`atsg == aspx_tsg_ptr`), and envelope 0 when the
+  previous interval of the channel ended on its pointer (`p_sine_at_end`),
+  take no noise factor in their gain and no noise term in their boost;
+  both decoders applied them to every envelope. Readings: FIXFIX carries
+  no `aspx_tsg_ptr`, taken as -1 ("none", the value the field's `tmp - 1`
+  coding gives); Pseudocode 95 computes a `b_sine_at_end` from the
+  current interval but tests `p_sine_at_end`, which Pseudocode 92 defines
+  from the previous one; that one is used. Rare on air (8 of 2,363
+  envelopes on broadcaster B's 5.1, 8 of 2,670 on its stereo, 4 of 1,218
+  and 10 of 632 on broadcaster A's 10 s lanes): worst change 3.7e-4 of
+  full scale, SNR 99 dB (broadcaster B stereo); 109 dB or more elsewhere.
 * **The late `audio_size` check** could judge a frame already concealed
   for another reason again: the Python counted it twice in `n_bad`, the C
   replaced its reason. Now it keeps its first reason and is counted once.
@@ -407,11 +419,6 @@ reading.
   with one envelope). Inherited unchanged from the original receiver.
 * `channels.asf_scalefac_data` and `channels.asf_snf_data` refer to an
   undefined name (`NUM_SFB_48`). Nothing calls them; they are kept as copied.
-* **A-SPX transient envelope** (found 2026-11-23, not fixed): Pseudocode 95
-  leaves out the noise factor of the envelope at `aspx_tsg_ptr` (and
-  `p_sine_at_end`), and Pseudocode 99 the noise term of the boost for it;
-  both decoders apply them to every envelope (no sinusoids are rendered,
-  see above).
 
 ## Tests
 
@@ -429,7 +436,7 @@ control, the QMF round trip, the stream resampler, the MP4 reader on
 synthetic files, the C kernels against the Python reference, and the
 fixes of 2026-11-23 (`channel_mode` codes, each channel's framing, the
 noise fill generator and levels, the A-SPX limiter against the
-standard's pseudocode, the noise index across envelopes, no HF patch
+standard's pseudocode, the noise index across envelopes, the transient envelope, no HF patch
 without A-SPX data, all six channels time-aligned, the late check on an
 already concealed frame).
 

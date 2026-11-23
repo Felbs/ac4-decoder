@@ -213,12 +213,16 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None):
         b1 = (borders if got[0].get("balance") == 1
               else (got[1]["fr"].get("borders") or borders))
         ok = True
-        for k, sig, ns, bd in (("L", sigA, nsA, b0), ("R", sigB, nsB, b1)):
+        for k, sig, ns, bd, frk in (("L", sigA, nsA, b0, got[0]["fr"]),
+                                    ("R", sigB, nsB, b1, got[1]["fr"])):
             est = E.estimate(Qh[k], t, bd, slot, 2, ts_off=TS_OFFSET)
             if est.shape != sig.shape:
                 ok = False
                 break
-            g, nl = E.adjust(Qh[k], t, sig, est, lim, ns[:, :est.shape[1]])
+            # Pseudocodes 95 and 99: the envelope at aspx_tsg_ptr (and at
+            # p_sine_at_end) takes no noise factor in its gain or boost
+            g, nl = E.adjust(Qh[k], t, sig, est, lim, ns[:, :est.shape[1]],
+                             E.transient_envelopes(frk, est.shape[1]))
             t0 = slot + int(bd[0]) * 2 + TS_OFFSET     # atsg_sig[0], slots
             for e in range(est.shape[1]):
                 ta = slot + int(bd[e]) * 2 + TS_OFFSET

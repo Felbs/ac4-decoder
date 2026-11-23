@@ -118,7 +118,10 @@ def aspx_framing(b, cfg, nats, b_iframe, state, key):
     if ic == FIXFIX:
         envbits = cfg["num_env_bits_fixfix"] + 1
         num_env = 1 << b.u(envbits)
-        tsg_ptr = 0
+        # FIXFIX has no aspx_tsg_ptr (Table 53): -1, "no pointer", for the
+        # envelope adjustment (Pseudocodes 95 and 99); Pseudocode 76 passes
+        # 0 to freq_res, which gives the same (atsg < tsg_ptr is false)
+        tsg_ptr = -1
         borders = tab_border(nats, num_env)
     else:
         if ic == FIXVAR:
@@ -155,11 +158,25 @@ def aspx_framing(b, cfg, nats, b_iframe, state, key):
     if cfg["freq_res_mode"] == 0:
         fr = [b.u(1) for _ in range(num_env)]
     else:
-        fr = [freq_res(borders, e, tsg_ptr, nats, cfg["freq_res_mode"])
+        fr = [freq_res(borders, e, max(tsg_ptr, 0), nats,
+                       cfg["freq_res_mode"])
               for e in range(num_env)]
     state[key] = borders[num_env]                    # previous_stop_pos
     return dict(num_env=num_env, num_noise=2 if num_env > 1 else 1,
-                freq_res=fr, int_class=ic, borders=borders)
+                freq_res=fr, int_class=ic, borders=borders,
+                tsg_ptr=tsg_ptr, sine_at_end=sine_at_end(state, key,
+                                                         tsg_ptr, num_env))
+
+
+def sine_at_end(state, key, tsg_ptr, num_env):
+    """Pseudocode 92's p_sine_at_end for this interval (0 when the previous
+    interval of the same channel had aspx_tsg_ptr_prev == num_atsg_sig_prev,
+    else -1), and the channel's (tsg_ptr, num_env) kept for the next one.
+    Read with dict.get, so a TrackingState does not count it as a missing
+    previous_stop_pos."""
+    prev = dict.get(state, ("ptr", key))
+    state[("ptr", key)] = (tsg_ptr, num_env)
+    return 0 if prev is not None and prev[0] == prev[1] else -1
 
 
 def tab_border(nats, n):
@@ -324,6 +341,11 @@ def aspx_data(b, tabs, t, cfg, nats, b_iframe, two_ch, state, grp):
                      dir_noise=d_noise, balance=0, ch=0, ah=ah[0])]
     balance = b.u(1)
     f1, q1 = f0, q0
+    if balance == 1:
+        # channel 1 uses channel 0's framing; its p_sine_at_end (Pseudocode
+        # 92) still comes from its own previous interval
+        f1 = dict(f0, sine_at_end=sine_at_end(
+            state, (grp, 1), f0["tsg_ptr"], f0["num_env"]))
     if balance == 1 and BALANCE_SHARES_STOP:
         # channel 1 uses channel 0's framing, so its previous_stop_pos
         # (Pseudocode 76, per channel) is channel 0's stop border too

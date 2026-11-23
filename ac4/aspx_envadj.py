@@ -208,12 +208,37 @@ def gain_unlimited(sig_sb, est):
     return np.sqrt(sig_sb / (EPSILON + est))
 
 
-def adjust(Qh, t, sig_sb, est, lim, noise_sb=None):
-    """Pseudocodes 94..101.  -> (gain, adjusted noise level) per subband/env."""
+def transient_envelopes(fr, n_env):
+    """The envelopes Pseudocodes 95 and 99 treat apart: atsg ==
+    aspx_tsg_ptr (the envelope that starts at a transient) and atsg ==
+    p_sine_at_end (Pseudocode 92: envelope 0 when the previous interval's
+    pointer was at its end, num_atsg_sig_prev). -> bool per envelope.
+
+    FIXFIX intervals carry no aspx_tsg_ptr (Table 53); aspx_parse gives
+    them -1, the value the field's own coding (tmp - 1) uses for "none"."""
+    ptr = fr.get("tsg_ptr", -1)
+    end = fr.get("sine_at_end", -1)
+    return np.array([e == ptr or e == end for e in range(n_env)], bool)
+
+
+def adjust(Qh, t, sig_sb, est, lim, noise_sb=None, transient=None):
+    """Pseudocodes 94..101.  -> (gain, adjusted noise level) per subband/env.
+
+    transient (bool per envelope, transient_envelopes()): in those
+    envelopes the gain leaves out the noise factor (Pseudocode 95: denom
+    is not multiplied by 1 + scf_noise_sb) and the boost's denominator
+    leaves out the noise level (Pseudocode 99). No sinusoids are rendered
+    (sine_lev_sb = 0, sine_area_sb = 0)."""
     n_sb, n_env = est.shape
     if noise_sb is None:
         noise_sb = np.zeros_like(est)
+    if transient is None:
+        transient = np.zeros(n_env, bool)
+    transient = np.asarray(transient, bool)[:n_env]
     gain = np.sqrt(sig_sb / (EPSILON + est) / (1.0 + noise_sb))
+    if transient.any():
+        gain[:, transient] = np.sqrt(sig_sb[:, transient]
+                                     / (EPSILON + est[:, transient]))
     # Pseudocode 94: the noise level shares the band energy with the signal
     sig_noise_fact = sig_sb / (1.0 + noise_sb)
     noise_lev = np.sqrt(sig_noise_fact * noise_sb)
@@ -248,7 +273,8 @@ def adjust(Qh, t, sig_sb, est, lim, noise_sb=None):
             continue
         nom = EPSILON0 + sig_sb[lo:hi].sum(axis=0)
         den = EPSILON0 + (est[lo:hi] * lim_gain[lo:hi] ** 2).sum(axis=0)
-        den = den + (noise_lim[lo:hi] ** 2).sum(axis=0)
+        den = den + np.where(transient, 0.0,
+                             (noise_lim[lo:hi] ** 2).sum(axis=0))
         boost[lo:hi] = np.minimum(np.sqrt(nom / den), MAX_BOOST_FACT)
     return lim_gain * boost, noise_lim * boost   # Pseudocode 101
 

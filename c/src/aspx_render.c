@@ -487,19 +487,29 @@ static void estimate(const ac4_aspx_pair *p, int c, const ac4_aspx_tab *t,
 
 /* Pseudocodes 94..101 (aspx_envadj.adjust) */
 static void adjust(const ac4_aspx_tab *t, int n_sb, int n_env, mat_t sig,
-                   mat_t est, mat_t noise, mat_t gain_out, mat_t noise_out)
+                   mat_t est, mat_t noise, const ac4_aspx_framing *fr,
+                   mat_t gain_out, mat_t noise_out)
 {
+    /* Pseudocodes 95 and 99: the envelope at aspx_tsg_ptr (and at
+       p_sine_at_end) has no noise factor in its gain and no noise term in
+       its boost (aspx_envadj.transient_envelopes) */
+    int tr[AC4_ASPX_MAX_ENV];
     static const double ZERO = 0.0;
     double gain[NSB][AC4_ASPX_MAX_ENV], noise_lev[NSB][AC4_ASPX_MAX_ENV];
     double maxg[NSB][AC4_ASPX_MAX_ENV], lim_gain[NSB][AC4_ASPX_MAX_ENV];
     double noise_lim[NSB][AC4_ASPX_MAX_ENV], boost[NSB][AC4_ASPX_MAX_ENV];
     int k, e, i;
     (void)ZERO;
+    for (e = 0; e < n_env; e++)
+        tr[e] = e == fr->tsg_ptr || e == fr->sine_at_end;
     for (k = 0; k < n_sb; k++)
         for (e = 0; e < n_env; e++) {
             double snf;
-            gain[k][e] = sqrt(sig[k][e] / (EPSILON + est[k][e])
-                              / (1.0 + noise[k][e]));
+            if (tr[e])
+                gain[k][e] = sqrt(sig[k][e] / (EPSILON + est[k][e]));
+            else
+                gain[k][e] = sqrt(sig[k][e] / (EPSILON + est[k][e])
+                                  / (1.0 + noise[k][e]));
             snf = sig[k][e] / (1.0 + noise[k][e]);
             noise_lev[k][e] = sqrt(snf * noise[k][e]);
             maxg[k][e] = 0.0;
@@ -559,7 +569,7 @@ static void adjust(const ac4_aspx_tab *t, int n_sb, int n_env, mat_t sig,
             den = EPSILON0 + den;
             for (k = lo; k < hi; k++)
                 dn += noise_lim[k][e] * noise_lim[k][e];
-            den = den + dn;
+            den = den + (tr[e] ? 0.0 : dn);
             v = np_min(sqrt(nom / den), MAX_BOOST_FACT);
             for (k = lo; k < hi; k++)
                 boost[k][e] = v;
@@ -640,7 +650,8 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
         const int *bd = c ? b1 : b0;
         int ne = c ? ne1 : ne0;
         estimate(p, c, t, bd, ne, slot, nts, est);
-        adjust(t, n_sb, ne, c ? sigB : sigA, est, c ? nsB : nsA, g, nl);
+        adjust(t, n_sb, ne, c ? sigB : sigA, est, c ? nsB : nsA,
+               c ? &d1->fr : &d0->fr, g, nl);
         /* atsg_sig[0] in QMF slots: Pseudocode 103 counts the noise index
            from the start of the frame's first envelope */
         t0 = slot + (long long)bd[0] * 2 + TS_OFFSET;

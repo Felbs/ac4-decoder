@@ -555,17 +555,21 @@ def test_aspx_noise_index_runs_on_across_envelopes(monkeypatch):
             assert np.allclose(Qh[sbx:sbx + n_sb, ts], nt[idx]), (f, ts)
 
 
-def _limiter_reference(sig, est, noise, lim, sbx):
+def _limiter_reference(sig, est, noise, lim, sbx, transient=()):
     """TS 103 190-1 V1.4.1 Pseudocodes 94, 95 (no sines), 96-101, written
     out loop by loop; limiter group sbg = subbands sbg_lim[sbg] - sbx ..
-    sbg_lim[sbg+1] - sbx - 1."""
+    sbg_lim[sbg+1] - sbx - 1. `transient`: the envelopes atsg ==
+    aspx_tsg_ptr or p_sine_at_end (no noise factor in Pseudocode 95, no
+    noise term in Pseudocode 99)."""
     EPS, EPS0 = 1.0, 1e-12
     LIM_GAIN, MAX_SIG_GAIN, MAX_BOOST = 1.41254, 1e5, 1.584893192
     n_sb, n_env = sig.shape
     out_g = np.zeros_like(sig)
     out_n = np.zeros_like(sig)
     for a in range(n_env):
-        gain = [np.sqrt(sig[s, a] / ((EPS + est[s, a]) * (1 + noise[s, a])))
+        tr = a in transient
+        gain = [np.sqrt(sig[s, a] / ((EPS + est[s, a])
+                                     * (1 if tr else 1 + noise[s, a])))
                 for s in range(n_sb)]
         nlev = [np.sqrt(sig[s, a] / (1 + noise[s, a]) * noise[s, a])
                 for s in range(n_sb)]
@@ -586,8 +590,8 @@ def _limiter_reference(sig, est, noise, lim, sbx):
         for g in range(len(lim) - 1):
             r = range(lim[g] - sbx, lim[g + 1] - sbx)
             nom = EPS0 + sum(sig[s, a] for s in r)
-            den = EPS0 + sum(est[s, a] * glim[s] ** 2 + nlim[s] ** 2
-                             for s in r)
+            den = EPS0 + sum(est[s, a] * glim[s] ** 2
+                             + (0 if tr else nlim[s] ** 2) for s in r)
             boost_g.append(np.sqrt(nom / den))
         for s in range(n_sb):
             b = min(boost_g[grp[s]], MAX_BOOST)
@@ -617,3 +621,91 @@ def test_aspx_limiter_groups_include_their_top_subband():
     g, nl = E.adjust(None, t, sig, est, lim, noise)
     rg, rn = _limiter_reference(sig, est, noise, lim, sbx)
     assert np.allclose(g, rg, rtol=1e-12) and np.allclose(nl, rn, rtol=1e-12)
+
+
+def test_aspx_transient_envelope_has_no_noise_factor():
+    """Pseudocode 95: the envelope atsg == aspx_tsg_ptr (or p_sine_at_end)
+    takes sqrt(scf_sig / (EPSILON + est)), without the 1 + scf_noise
+    factor; Pseudocode 99 leaves its noise level out of the boost's
+    denominator. Before the fix both decoders treated it like any other
+    envelope. Checked against the pseudocode written out loop by loop."""
+    from ac4 import aspx_envadj as E
+    sbx = 20
+    lim = [20, 23, 25, 29]
+    t = {"sbx": sbx}
+    n_sb = lim[-1] - sbx
+    rng = np.random.default_rng(7)
+    sig = rng.uniform(0.5, 2.0, (n_sb, 3))
+    est = rng.uniform(0.5, 2.0, (n_sb, 3))
+    noise = rng.uniform(0.5, 3.0, (n_sb, 3))          # loud noise floor
+    for tr in ((1,), (0, 2), ()):
+        flags = np.array([e in tr for e in range(3)])
+        g, nl = E.adjust(None, t, sig, est, lim, noise, flags)
+        rg, rn = _limiter_reference(sig, est, noise, lim, sbx, tr)
+        assert np.allclose(g, rg, rtol=1e-12), tr
+        assert np.allclose(nl, rn, rtol=1e-12), tr
+    # and it matters: the transient envelope's gain is the larger one
+    g0, _ = E.adjust(None, t, sig, est, lim, noise, np.zeros(3, bool))
+    g1, _ = E.adjust(None, t, sig, est, lim, noise,
+                     np.array([False, True, False]))
+    assert (g1[:, 1] > g0[:, 1] * 1.01).any()
+    assert np.array_equal(g1[:, [0, 2]], g0[:, [0, 2]])
+
+
+def test_aspx_transient_envelopes_from_the_framing(monkeypatch):
+    """Which envelopes are 'transient': atsg == aspx_tsg_ptr, and envelope
+    0 when the previous interval of the same channel ended on its pointer
+    (Pseudocode 92: aspx_tsg_ptr_prev == num_atsg_sig_prev). FIXFIX has no
+    pointer (-1). The renderer passes them to adjust() per channel."""
+    from ac4 import aspx_envadj as E
+    from ac4 import aspx_parse as P
+    from ac4 import aspx_render as R37
+    from ac4 import aspx_env as V
+    st = {}
+    assert P.sine_at_end(st, (0, 0), 2, 2) == -1       # no previous
+    assert P.sine_at_end(st, (0, 0), 1, 3) == 0        # previous 2 == 2
+    assert P.sine_at_end(st, (0, 0), -1, 1) == -1      # previous 1 != 3
+    assert P.sine_at_end(st, (0, 1), 0, 1) == -1       # per channel
+    tr = E.transient_envelopes
+    assert list(tr({"tsg_ptr": 1, "sine_at_end": -1}, 3)) == [0, 1, 0]
+    assert list(tr({"tsg_ptr": -1, "sine_at_end": 0}, 2)) == [1, 0]
+    assert list(tr({"tsg_ptr": 2, "sine_at_end": -1}, 2)) == [0, 0]
+    assert not tr({}, 2).any()
+    # FIXFIX: no pointer
+    bits = _BitList([0, 1])                       # FIXFIX, num_env 2
+    fr = P.aspx_framing(bits, {"num_env_bits_fixfix": 0,
+                               "freq_res_mode": 1}, 12, False, {}, (0, 0))
+    assert fr["tsg_ptr"] == -1 and fr["sine_at_end"] == -1
+    # the renderer hands each channel's flags to adjust()
+    cfg, t = _aspx_cfg()
+    n_sb = t["num_sb_aspx"]
+    got = [{"fr": {"borders": [0, 4, 12], "tsg_ptr": 1, "sine_at_end": -1},
+            "balance": 1},
+           {"fr": {"borders": [0, 4, 12], "tsg_ptr": 1, "sine_at_end": 0},
+            "balance": 1}]
+    monkeypatch.setattr(V, "reconstruct", lambda d, t, m, p: (None, p))
+    monkeypatch.setattr(E, "noise_qscf", lambda d, t, p: (None, p))
+    monkeypatch.setattr(E, "map_scf_joint",
+                        lambda *a: (np.zeros((n_sb, 2)), np.zeros((n_sb, 2))))
+    monkeypatch.setattr(E, "map_noise_joint",
+                        lambda *a: (np.zeros((n_sb, 2)), np.zeros((n_sb, 2))))
+    seen = []
+    monkeypatch.setattr(E, "adjust", lambda *a: (
+        seen.append(list(a[6])), (np.zeros((n_sb, 2)), np.zeros((n_sb, 2))))[1])
+    x = np.zeros(3 * 1536)
+    R37.apply_hf_pair(x, x, [None, got, None], cfg)
+    assert seen == [[False, True], [True, True]]
+
+
+class _BitList:
+    """A bit reader over a list of bits (u(n) MSB first)."""
+
+    def __init__(self, bits):
+        self.bits, self.p = list(bits), 0
+
+    def u(self, n):
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | self.bits[self.p]
+            self.p += 1
+        return v
