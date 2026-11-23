@@ -383,3 +383,285 @@ def test_c_decoder_at_every_frame_length(tmp_path, fri):
     up, down = TABLE_83[fri][1]
     n_ext = -(-5 * fl * up // down)
     assert np.fromfile(raw2, "<f8").size == 2 * n_ext
+
+
+# --------------------------------------------- A-CPL: ASPX_ACPL_1 / _2
+from test_acpl import _Ref                                   # noqa: E402
+
+
+class _Ref1(_Ref):
+    """Pseudocodes 109-116 for the modules of acpl_data_1ch(), sample by
+    sample (decorrelators and ducker from test_acpl._Ref)."""
+
+    def __init__(self, n_mod):
+        super().__init__()
+        self.prevs = [None] * n_mod
+
+    def module(self, m, x0, x1, fr):
+        from ac4 import acpl as ACPL
+        cfg = fr["cfg"]
+        pb = ACPL.sb_to_pb(cfg["num_param_bands"])
+        tab = ((ACPL.ALPHA_FINE, ACPL.IBETA_FINE, ACPL.BETA_FINE)
+               if cfg["quant_mode"] == 0 else
+               (ACPL.ALPHA_COARSE, ACPL.IBETA_COARSE, ACPL.BETA_COARSE))
+        sets = [{"a": [tab[0][qa] for qa in fr["q"][0][ps]],
+                 "b": [tab[2][qb][tab[1][qa]]
+                       for qa, qb in zip(fr["q"][0][ps], fr["q"][1][ps])]}
+                for ps in range(len(fr["q"][0]))]
+        if self.prevs[m] is None:
+            self.prevs[m] = {k: [sets[0][k][pb[sb]] for sb in range(64)]
+                             for k in ("a", "b")}
+        self.prev = self.prevs[m]
+        n = len(x0)
+        x0in = [[2 * x0[t][s] for s in range(64)] for t in range(n)]
+        x1in = [[2 * x1[t][s] for s in range(64)] for t in range(n)]
+        y = self.duck(m, self.decorrelate(m, x0in))
+        z0 = [[0j] * 64 for _ in range(n)]
+        z1 = [[0j] * 64 for _ in range(n)]
+        for sb in range(64):
+            for ts in range(n):
+                a = self.interpolate("a", sets, pb, fr["interp"],
+                                     fr["timeslots"], sb, ts)
+                b = self.interpolate("b", sets, pb, fr["interp"],
+                                     fr["timeslots"], sb, ts)
+                if sb < cfg["qmf_band"]:
+                    z0[ts][sb] = 0.5 * (x0in[ts][sb] + x1in[ts][sb])
+                    z1[ts][sb] = 0.5 * (x0in[ts][sb] - x1in[ts][sb])
+                else:
+                    z0[ts][sb] = 0.5 * (x0in[ts][sb] * (1 + a)
+                                        + y[ts][sb] * b)
+                    z1[ts][sb] = 0.5 * (x0in[ts][sb] * (1 - a)
+                                        - y[ts][sb] * b)
+        self.prevs[m] = {k: [sets[-1][k][pb[sb]] for sb in range(64)]
+                         for k in ("a", "b")}
+        return z0, z1
+
+
+def _frame_1ch(rng, cfg, n_sets, interp):
+    from ac4 import acpl_parse as AP
+    q = []
+    for data_type, _ in AP.DATA_1CH:
+        lo, hi = AP.Q_RANGE[(data_type, AP.QUANT[cfg["quant_mode"]])]
+        q.append(rng.integers(lo, hi + 1,
+                              (n_sets, cfg["num_param_bands"])).tolist())
+    ts = sorted(rng.integers(0, 24, n_sets).tolist()) if interp else []
+    return dict(cfg=cfg, q=q, interp=interp, timeslots=tuple(ts))
+
+
+@pytest.mark.parametrize("nb,qm,qmf_band,n_mod", [
+    (15, 0, 0, 2), (9, 1, 0, 1), (12, 0, 5, 2), (7, 1, 3, 1)])
+def test_acpl_1ch_against_the_pseudocode(nb, qm, qmf_band, n_mod):
+    """acpl.render_1ch against Pseudocodes 109-116 written out sample by
+    sample: one or two modules (decorrelators D0, D1), full and partial
+    (acpl_qmf_band, with a residual), one and two parameter sets, smooth
+    and steep interpolation, the state carried over four frames."""
+    from ac4 import acpl as ACPL
+    rng = np.random.default_rng(nb + qmf_band)
+    cfg = dict(num_param_bands=nb, quant_mode=qm, qmf_band=qmf_band,
+               param_band=int(ACPL.sb_to_pb(nb)[qmf_band]) if qmf_band
+               else 0)
+    frames = [[_frame_1ch(rng, cfg, ns, it) for _ in range(n_mod)]
+              for ns, it in ((1, 0), (2, 0), (1, 1), (2, 1))]
+    n = 24 * len(frames)
+
+    def cplx():
+        return rng.standard_normal((64, n)) + 1j * rng.standard_normal(
+            (64, n))
+    Q0 = [cplx() for _ in range(n_mod)]
+    Q1 = [cplx() if qmf_band else None for _ in range(n_mod)]
+    got = ACPL.render_1ch(Q0, Q1, frames, ts_offset=0)
+    ref = _Ref1(n_mod)
+    for f, fr in enumerate(frames):
+        sl = slice(24 * f, 24 * f + 24)
+        for m in range(n_mod):
+            x1 = (Q1[m][:, sl] if Q1[m] is not None
+                  else np.zeros((64, 24))).T.tolist()
+            z0, z1 = ref.module(m, Q0[m][:, sl].T.tolist(), x1, fr[m])
+            assert np.allclose(got[m][0][:, sl], np.array(z0).T,
+                               rtol=1e-11, atol=1e-11), (f, m, "z0")
+            assert np.allclose(got[m][1][:, sl], np.array(z1).T,
+                               rtol=1e-11, atol=1e-11), (f, m, "z1")
+
+
+def test_acpl_1ch_without_data_and_concealed():
+    """No data: 5_X keeps the core on z0 and silence on z1; a pair splits
+    (x0 + x1, x0 - x1). A concealed frame after data holds the
+    parameters."""
+    from ac4 import acpl as ACPL
+    rng = np.random.default_rng(2)
+    cfg = dict(num_param_bands=15, quant_mode=0, qmf_band=0, param_band=0)
+    fr = [_frame_1ch(rng, cfg, 1, 0)]
+    n = 96
+    Q0 = [rng.standard_normal((64, n)) + 0j]
+    Q1 = [rng.standard_normal((64, n)) + 0j]
+    z = ACPL.render_1ch(Q0, Q1, [None, ACPL.CONCEALED, fr, ACPL.CONCEALED],
+                        ts_offset=0)
+    assert np.array_equal(z[0][0][:, :48], Q0[0][:, :48])
+    assert not np.any(z[0][1][:, :48])
+    zs = ACPL.render_1ch(Q0, Q1, [None, None], ts_offset=0, split=True)
+    assert np.allclose(zs[0][0][:, :48], Q0[0][:, :48] + Q1[0][:, :48])
+    assert np.allclose(zs[0][1][:, :48], Q0[0][:, :48] - Q1[0][:, :48])
+    held = ACPL.render_1ch(Q0, Q1, [None, None, fr, fr], ts_offset=0)
+    assert np.allclose(z[0][0], held[0][0], atol=1e-13)
+    assert np.allclose(z[0][1], held[0][1], atol=1e-13)
+
+
+def _huff_put(w, book, sym):
+    n, code = _huff_code(book, sym)
+    w.u(n, code)
+
+
+def test_acpl_config_and_data_1ch_parse():
+    """Tables 59, 61, 63-65: acpl_config_1ch (PARTIAL reads
+    acpl_qmf_band_minus1, the parameters starting at its band) and
+    acpl_data_1ch, written with the codebooks, differentially decoded
+    (Pseudocode 121) with the books' cb_off."""
+    from ac4 import acpl as ACPL
+    from ac4 import acpl_parse as AP
+    from ac4 import hcb as H
+    books = AP.load_books(H.parse_c(H.DEFAULT_C))
+    w = BW().u(2, 1).u(1, 0).u(3, 4)        # 12 bands, fine, qmf_band 5
+    cfg = AP.acpl_config_1ch(Bits(w.bytes()), AP.PARTIAL)
+    assert cfg["num_param_bands"] == 12 and cfg["qmf_band"] == 5
+    assert cfg["param_band"] == int(ACPL.sb_to_pb(12)[5]) == 4
+    full = AP.acpl_config_1ch(Bits(BW().u(2, 3).u(1, 1).bytes()), AP.FULL)
+    assert (full["num_param_bands"], full["qmf_band"],
+            full["param_band"], full["quant_mode"]) == (7, 0, 0, 1)
+    # one parameter set, steep at slot 9; alpha DIFF_FREQ, beta DIFF_TIME
+    w = BW().u(1, 1).u(1, 0).u(5, 9)
+    w.u(1, 0)
+    _huff_put(w, books["ACPL_HCB_ALPHA_FINE_F0"], 20)
+    for d in range(4 + 1, 12):
+        _huff_put(w, books["ACPL_HCB_ALPHA_FINE_DF"], 32 + (d % 3) - 1)
+    w.u(1, 1)
+    for d in range(4, 12):
+        _huff_put(w, books["ACPL_HCB_BETA_FINE_DT"], 8 + 1)
+    data = AP.acpl_data_1ch(Bits(w.bytes()), books, cfg)
+    assert data["framing"] == dict(interpolation_type=1, num_param_sets=1,
+                                   param_timeslot=[9])
+    q_prev = [None, [2] * 12]
+    q = AP.quantised_1ch(data, cfg, q_prev)
+    alpha = [0] * 4 + [20]
+    for d in range(5, 12):
+        alpha.append(alpha[-1] + (d % 3) - 1)
+    assert q[0] == [alpha] and q[1] == [[0] * 4 + [3] * 8]
+    assert q_prev == [alpha, [0] * 4 + [3] * 8]
+
+
+def _aspx_acpl_pair(mode, seed):
+    """A channel_pair_element I-frame in stereo_codec_mode 2 (ASPX_ACPL_1)
+    or 3 (ASPX_ACPL_2), written bit by bit: aspx_config, acpl_config_1ch,
+    companding_control(1), the core track(s), aspx_data_1ch (FIXFIX, one
+    envelope), acpl_data_1ch (one parameter set, frequency coded)."""
+    from ac4 import aspx_bands as A
+    from ac4 import aspx_parse as P
+    from ac4 import acpl_parse as AP
+    from ac4 import hcb as H
+    from ac4 import spectral as S
+    rng = np.random.default_rng(seed)
+    T = CH.load_tables()
+    arrays = H.parse_c(H.DEFAULT_C)
+    books = AP.load_books(arrays)
+    abooks = {n[:-4]: S.Huff(arrays[n], arrays[n[:-4] + "_CW"])
+              for n in arrays if n.endswith("_LEN") and n.startswith("ASPX_")}
+    cfg = dict(quant_mode_env=0, start_freq=2, stop_freq=1,
+               master_freq_scale=1, interpolation=0, preflat=0, limiter=1,
+               noise_sbg=1, num_env_bits_fixfix=0, freq_res_mode=1)
+    t = A.tables_for(cfg, 0)
+    w = BW().u(2, mode)
+    for k in ("quant_mode_env", "start_freq", "stop_freq",
+              "master_freq_scale", "interpolation", "preflat", "limiter",
+              "noise_sbg", "num_env_bits_fixfix", "freq_res_mode"):
+        w.u({"start_freq": 3, "stop_freq": 2, "noise_sbg": 2,
+             "freq_res_mode": 2}.get(k, 1), cfg[k])
+    nb = 9
+    w.u(2, 2).u(1, 0)                         # acpl_config_1ch: 9, fine
+    if mode == 2:
+        w.u(3, 3)                             # acpl_qmf_band 4
+    w.u(1, 1)                                 # companding: on
+    band = CH.SFB_TABLE[1536]
+
+    def track(nbands, nbits):
+        w.u(4, 11).u(5, nbands - 1)           # one section, codebook 11
+        for _ in range(band[nbands] // 2):
+            a, b = rng.integers(1, 6), rng.integers(0, 6)
+            _huff_put(w, T["cb"][11], int(a) * 17 + int(b))
+            for v in (a, b):
+                if v:
+                    w.u(1, int(rng.integers(0, 2)))
+        w.u(8, 100)                           # reference scale factor
+        for _ in range(nbands - 1):
+            _huff_put(w, T["sf"], 60)         # same scale factor
+        w.u(1, 0)                             # no noise fill
+    if mode == 2:
+        w.u(1, 0)                             # no MDCT stereo processing
+        w.u(1, 0).u(1, 1).u(6, 20)            # m: ASF, long, max_sfb 20
+        w.u(1, 0).u(1, 1).u(5, 6)             # s: ASF, long, max_sfb_side 6
+        track(20, 6)
+        track(6, 6)
+    else:
+        w.u(1, 0).u(1, 1).u(6, 20)
+        track(20, 6)
+    # aspx_data_1ch
+    w.u(3, 0)                                 # aspx_xover_subband_offset
+    w.u(1, 0).u(1, 0)                         # FIXFIX, one envelope
+    w.u(1, 0).u(1, 0)                         # delta_dir: frequency
+    for _ in range(t["n_noise"]):
+        w.u(2, 1)                             # aspx_tna_mode
+    w.u(1, 0).u(1, 0).u(1, 0)                 # no ah, fic, tic
+    _huff_put(w, abooks["ASPX_HCB_ENV_LEVEL_15_F0"], 30)
+    dfc = (len(abooks["ASPX_HCB_ENV_LEVEL_15_DF"].map) - 1) // 2
+    for _ in range(t["n_lo"] - 1):
+        _huff_put(w, abooks["ASPX_HCB_ENV_LEVEL_15_DF"], dfc)
+    _huff_put(w, abooks["ASPX_HCB_NOISE_LEVEL_F0"], 10)
+    nfc = (len(abooks["ASPX_HCB_NOISE_LEVEL_DF"].map) - 1) // 2
+    for _ in range(t["n_noise"] - 1):
+        _huff_put(w, abooks["ASPX_HCB_NOISE_LEVEL_DF"], nfc)
+    # acpl_data_1ch: smooth, one set; alpha and beta frequency coded
+    w.u(1, 0).u(1, 0)
+    start = int(__import__("ac4.acpl", fromlist=["x"]).sb_to_pb(nb)[4]) \
+        if mode == 2 else 0
+    for name, f0, off in (("ALPHA", 22, 32), ("BETA", 3, 8)):
+        w.u(1, 0)
+        _huff_put(w, books[f"ACPL_HCB_{name}_FINE_F0"], f0)
+        for _ in range(start + 1, nb):
+            _huff_put(w, books[f"ACPL_HCB_{name}_FINE_DF"],
+                      off + int(rng.integers(-1, 2)))
+    w.align()
+    body = w.bytes()
+    return BW().u(15, len(body)).u(1, 0).bytes() + body
+
+
+@pytest.mark.parametrize("mode", [2, 3])
+def test_pair_aspx_acpl_stream(tmp_path, mode):
+    """A stereo stream in ASPX_ACPL_1 / _2 (written bit by bit) decodes
+    with nothing concealed (every frame closes on audio_size), to two
+    different, non-silent channels; the C decoder gives the same samples
+    when it is built."""
+    import os
+    import subprocess
+    from ac4.decoder import Decoder
+    from test_inputs import syncframe
+    frames = [_frame(_aspx_acpl_pair(mode, i), seq=5 + i, fri=3)
+              for i in range(8)]
+    dec = Decoder("pair", guard=False)
+    dec.hf_ratio = None              # (the synthetic envelopes are loud)
+    y = dec.decode_pass(frames)
+    assert dec.n_concealed == 0, dict(dec.concealed.reasons)
+    assert dec.stream.acpl1 == "pair"
+    s = slice(4 * 1536, None)
+    rl, rr = (np.sqrt(np.mean(y[s, c] ** 2)) for c in (0, 1))
+    assert rl > 0 and rr > 0
+    assert np.abs(y[s, 0] - y[s, 1]).max() > 0.01 * max(rl, rr)
+    if os.path.exists(C_CLI):
+        src = tmp_path / "p.ac4"
+        src.write_bytes(b"".join(syncframe(f) for f in frames))
+        raw = tmp_path / "p.f64"
+        subprocess.run([C_CLI, str(src), str(tmp_path / "p.wav"), "--f64",
+                        str(raw), "--internal", "--no-guard", "-q"],
+                       check=True)
+        got = np.fromfile(raw, "<f8").reshape(-1, 2)
+        dref = Decoder("pair", guard=False)
+        ref = dref.decode_pass(frames)
+        assert got.shape == ref.shape
+        assert np.abs(got - ref).max() <= 1e-9 * np.abs(ref).max()

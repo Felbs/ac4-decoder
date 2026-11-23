@@ -251,6 +251,7 @@ BITSTREAM_ORDER = {
     "pair": ("L", "R"),
     "5_X": ("lfe", "L", "R", "Ls", "Rs", "C"),
     "acpl3": ("lfe", "L", "R"),
+    "acpl12": ("lfe", "L", "R", "C"),
 }
 
 

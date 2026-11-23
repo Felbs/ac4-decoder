@@ -421,7 +421,8 @@ def test_late_closure_counts_an_already_concealed_frame_once(monkeypatch):
     for fi in range(n):
         sub = b"BAD" if fi in (bad_already, bad_late) else b"\0\0\0"
         pending.append(dict(fi=fi, sub=sub + bytes(13), bits=0, ifr=False,
-                            start=0, size=0, acpl3=False, five=False,
+                            start=0, size=0, acpl3=False,
+                            blocks=((0, True),), acpl1=0,
                             wpos={"L": fi, "R": fi}))
     groups = {"lr": [None] * n, "sr": [None] * n}
     s.status = [None] * n

@@ -180,7 +180,7 @@ def t_for(cfg, xover=0):
 
 def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
                   acpl_groups=None, acpl_state0=None, acpl_log=None,
-                  frame_len=1536, t_start=None):
+                  frame_len=1536, t_start=None, acpl_1ch=None):
     """Steps 2-5 for the L/R pair, JOINTLY.
 
     Three things run on from one frame to the next: the noise-table index
@@ -215,6 +215,12 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
     the last frame with data before it); out["t_before"][i] are those in
     force before group i (and one more after the last), for the caller to
     carry into its next call.
+
+    acpl_1ch (ASPX_ACPL_1 / _2): dict(res=[residual pcm per module, the
+    same length as pcmL], split=bool, five=bool). The modules take the
+    A-SPX output of L (and, five, of R) as x0 and the residual's analysis
+    as x1 (acpl.render_1ch); out["up"] receives L and R (a pair: z0, z1)
+    or L, Ls, R, Rs (five: z0 / z1 of each module, z1 times sqrt 2).
     """
     geo = A.geometry(frame_len)
     NT, TIA, TSO, NATS = geo["nts"], geo["tia"], geo["ts_offset"], geo["nats"]
@@ -233,7 +239,7 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
             out[k] = Q.synthesise(Qa[k], w, Q.synthesis_matrix(255))
         if acpl_groups is not None:
             out["up"] = _upmix(Qa["L"], Qa["R"], acpl_groups, acpl_state0,
-                               acpl_log, w, geo)
+                               acpl_log, w, geo, acpl_1ch)
         return out, 0
     # the tables of each frame: those its A-SPX blocks were sent with
     # (aspx_xover_subband_offset of the last I-frame, Pseudocode 68), held
@@ -401,15 +407,32 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
         out[k] = Q.synthesise(Qh[k], w, Q.synthesis_matrix(255))
     if acpl_groups is not None:
         out["up"] = _upmix(Qh["L"], Qh["R"], acpl_groups, acpl_state0,
-                           acpl_log, w, geo)
+                           acpl_log, w, geo, acpl_1ch)
     out["t_before"] = before
     return out, applied
 
 
-def _upmix(QL, QR, acpl_groups, state0, log, w, geo):
-    """A-CPL (acpl.render) on the pair's QMF matrices, then synthesis of
-    the five channels."""
+def _upmix(QL, QR, acpl_groups, state0, log, w, geo, acpl_1ch=None):
+    """A-CPL (acpl.render, or acpl.render_1ch) on the pair's QMF matrices,
+    then synthesis of the output channels."""
     from . import acpl as ACPL
+    if acpl_1ch is not None:
+        five = acpl_1ch["five"]
+        q0s = [QL, QR] if five else [QL]
+        q1s = []
+        for x in acpl_1ch["res"]:
+            xx = x[:(len(x) // Q.NSB) * Q.NSB]
+            q1s.append(Q.analyse(xx, w, Q.analysis_matrix()))
+        zs = ACPL.render_1ch(q0s, q1s, acpl_groups, state0=state0,
+                             state_log=log, ts_offset=geo["ts_offset"],
+                             nts=geo["nts"], split=acpl_1ch["split"])
+        if five:
+            up = {"L": zs[0][0], "Ls": zs[0][1] * ACPL.SQRT2,
+                  "R": zs[1][0], "Rs": zs[1][1] * ACPL.SQRT2}
+        else:
+            up = {"L": zs[0][0], "R": zs[0][1]}
+        return {k: Q.synthesise(v, w, Q.synthesis_matrix(255))
+                for k, v in up.items()}
     up = ACPL.render(QL, QR, acpl_groups, state0=state0, state_log=log,
                      ts_offset=geo["ts_offset"], nts=geo["nts"])
     return {k: Q.synthesise(v, w, Q.synthesis_matrix(255))

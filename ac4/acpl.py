@@ -379,3 +379,148 @@ def render(QL, QR, groups, state0=None, state_log=None, ts_offset=4,
         state_log.append(copy_state(s))
     return out
 
+
+# ------------------------------------------------- ASPX_ACPL_1 / _2 (1ch)
+# Advanced coupling with acpl_data_1ch(): one ACplModule per coupled pair
+# (TS 103 190-1 5.7.7.5, Pseudocode 115, 116; 5.7.7.6.1, Pseudocode 117;
+# 5.7.7.6.3, Pseudocode 120). Module m takes the A-SPX output x0 of its
+# core channel and, in ASPX_ACPL_1, a residual x1 (used only below
+# acpl_qmf_band), decorrelates 2 x0 with decorrelator D_m and the transient
+# ducker, and gives
+#     sb <  acpl_qmf_band:  z0 = (x0in + x1in) / 2, z1 = (x0in - x1in) / 2
+#     sb >= acpl_qmf_band:  z0 = (x0in (1 + a) + y b) / 2,
+#                           z1 = (x0in (1 - a) - y b) / 2
+# with a, b the interpolated alpha and beta (Pseudocode 109 on each). The
+# readings of the ASPX_ACPL_3 upmix (cold start, frames without data,
+# concealed frames, the ducker per time slot) apply unchanged.
+QUANTITIES_1CH = ("a", "b")
+
+
+def dequantise_1ch(q, cfg):
+    """5.7.7.7 for an acpl_data_1ch(): acpl_alpha1_q, acpl_beta1_q ->
+    dict a, b of float arrays (num_param_sets, num_param_bands), clamped
+    like dequantise_2ch."""
+    from .acpl_parse import Q_RANGE, QUANT
+    qm = cfg["quant_mode"]
+    alpha, ibeta, beta = ((ALPHA_FINE, IBETA_FINE, BETA_FINE) if qm == 0
+                          else (ALPHA_COARSE, IBETA_COARSE, BETA_COARSE))
+    lo, hi = Q_RANGE[("ALPHA", QUANT[qm])]
+    qa = np.clip(np.asarray(q[0], int), lo, hi)
+    lo, hi = Q_RANGE[("BETA", QUANT[qm])]
+    qb = np.clip(np.asarray(q[1], int), lo, hi)
+    return {"a": np.asarray(alpha, float)[qa],
+            "b": np.asarray(beta, float)[qb, np.asarray(ibeta)[qa]]}
+
+
+def new_state_1ch(n_mod=2):
+    """The 1ch tool's state between frames (cold): per module its
+    parameters' acpl_param_prev; decorrelators and duckers as new_state
+    (module m uses decorrelator D_m)."""
+    s = new_state()
+    s["prev"] = [{k: np.zeros(NSB) for k in QUANTITIES_1CH}
+                 for _ in range(n_mod)]
+    s["qb"] = [0] * n_mod           # acpl_qmf_band of the last parameters
+    return s
+
+
+def copy_state_1ch(s):
+    c = copy_state(dict(s, prev={}))
+    c["prev"] = [{k: v.copy() for k, v in p.items()} for p in s["prev"]]
+    c["qb"] = list(s["qb"])
+    return c
+
+
+def upmix_frame_1ch(x0s, x1s, frames, s, nts=NTS):
+    """One frame of Pseudocodes 115 / 117 / 120 before the output scaling.
+    x0s: per module (n, 64) complex, the A-SPX output of its core channel;
+    x1s: per module the residual (n, 64) or None (ASPX_ACPL_2); frames: per
+    module dict(cfg, interp, timeslots, q), or None to hold the previous
+    parameters (a concealed frame). -> per module (z0, z1)."""
+    n = x0s[0].shape[0]
+    ts = np.arange(n)
+    nm = len(x0s)
+    ip = []
+    for m in range(nm):
+        fr = frames[m] if frames is not None else None
+        prev = s["prev"][m]
+        if fr is not None:
+            cfg = fr["cfg"]
+            pbmap = sb_to_pb(cfg["num_param_bands"])
+            dq = dequantise_1ch(fr["q"], cfg)
+            sets = {k: v[:, pbmap] for k, v in dq.items()}
+            if not s["warm"]:
+                prev = s["prev"][m] = {k: v[0].copy()
+                                       for k, v in sets.items()}
+            it, tsl = fr["interp"], fr["timeslots"]
+        else:
+            sets = {k: prev[k][None, :] for k in QUANTITIES_1CH}
+            it, tsl = 0, ()
+        ip.append({k: interpolate(prev[k], sets[k], it, tsl, ts, nts)
+                   for k in QUANTITIES_1CH})
+        if fr is not None:                              # Pseudocode 110
+            s["prev"][m] = {k: v[-1].copy() for k, v in sets.items()}
+            s["qb"][m] = fr["cfg"].get("qmf_band", 0)
+    s["warm"] = True
+    v = np.zeros((3, n, NSB), complex)
+    for m in range(nm):
+        v[m] = 2.0 * x0s[m]
+    y = duck(decorrelate(v, s), s)
+    out = []
+    for m in range(nm):
+        x0in = 2.0 * x0s[m]
+        x1in = (2.0 * x1s[m] if x1s[m] is not None
+                else np.zeros_like(x0in))
+        qb = s["qb"][m]
+        a, b = ip[m]["a"], ip[m]["b"]
+        z0 = 0.5 * (x0in * (1.0 + a) + y[m] * b)
+        z1 = 0.5 * (x0in * (1.0 - a) - y[m] * b)
+        if qb:
+            z0[:, :qb] = 0.5 * (x0in[:, :qb] + x1in[:, :qb])
+            z1[:, :qb] = 0.5 * (x0in[:, :qb] - x1in[:, :qb])
+        out.append((z0, z1))
+    return out
+
+
+def render_1ch(Q0s, Q1s, groups, state0=None, state_log=None, ts_offset=4,
+               nts=NTS, split=False):
+    """The 1ch upmix of a decode pass. Q0s: per module (64, n_slots)
+    complex, the A-SPX output of its core channel; Q1s: per module the
+    residual's analysis or None; groups: per frame None, CONCEALED (hold),
+    or the list of the modules' parameters. -> per module (z0, z1) of
+    (64, n_slots).
+
+    Frames without A-CPL data (before the first acpl_config_1ch): with
+    split (a channel_pair_element) z0 = x0 + x1, z1 = x0 - x1 (the module's
+    own rule below acpl_qmf_band, over every band: the mono core on both
+    channels in ASPX_ACPL_2); otherwise (5_X, 7_X) z0 = x0, z1 = 0, as the
+    ASPX_ACPL_3 upmix plays the core on L / R and nothing on the others."""
+    nm = len(Q0s)
+    n_slots = Q0s[0].shape[1]
+    if split:
+        out = [(Q0s[m] + (0 if Q1s[m] is None else Q1s[m]),
+                Q0s[m] - (0 if Q1s[m] is None else Q1s[m]))
+               for m in range(nm)]
+    else:
+        out = [(Q0s[m].copy(), np.zeros_like(Q0s[m])) for m in range(nm)]
+    s = copy_state_1ch(state0) if state0 is not None else new_state_1ch(nm)
+    for f, g in enumerate(groups):
+        if state_log is not None:
+            state_log.append(copy_state_1ch(s))
+        a = nts * f + ts_offset
+        z = min(a + nts, n_slots)
+        if g is None or (g is CONCEALED and not s["warm"]):
+            s = new_state_1ch(nm)                     # passthrough, cleared
+            continue
+        if z <= a:
+            continue
+        res = upmix_frame_1ch(
+            [Q0s[m][:, a:z].T for m in range(nm)],
+            [None if Q1s[m] is None else Q1s[m][:, a:z].T
+             for m in range(nm)],
+            None if g is CONCEALED else g, s, nts)
+        for m in range(nm):
+            out[m][0][:, a:z] = res[m][0].T
+            out[m][1][:, a:z] = res[m][1].T
+    if state_log is not None:
+        state_log.append(copy_state_1ch(s))
+    return out

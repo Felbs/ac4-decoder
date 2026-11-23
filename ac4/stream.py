@@ -59,6 +59,7 @@ class Ac4Stream:
         self.selected = None        # index of the presentation decoded last
         self.last_toc = None
         self.acpl3 = False      # 13.25: set once the stream shows a 2-ch core + A-CPL
+        self.acpl1 = None       # "5_X" / "pair": ASPX_ACPL_1 / _2 seen
         self.T = C.load_tables()
         arrays = H.parse_c(H.DEFAULT_C)
         self.tabs = {n[:-4]: S.Huff(arrays[n], arrays[n[:-4] + "_CW"])
@@ -70,6 +71,8 @@ class Ac4Stream:
         # acpl_<SET>_q_prev of the eleven sets (Pseudocode 121), rolled back
         # with a concealed frame like the A-SPX framing state
         self.acpl_q = [None] * 11
+        # the same for the modules of ASPX_ACPL_1 / _2 (alpha1, beta1 each)
+        self.acpl_q1 = [[None, None], [None, None]]
         for nm in self.tabs:
             P.CENTRE[nm] = 0 if nm.endswith("_F0") else \
                 (len(arrays[nm + "_LEN"]) - 1) // 2
@@ -151,6 +154,7 @@ class Ac4Stream:
             wpos = {k: len(v) for k, v in wins.items()}
             fstate0 = dict(self.fstate)
             acpl_q0 = list(self.acpl_q)
+            acpl_q10 = [list(x) for x in self.acpl_q1]
             seq = None
             brk = False
             resume = None       # the counter to expect after an outlier
@@ -275,65 +279,78 @@ class Ac4Stream:
                 got_acpl = None
                 end = r["bits"]
                 acpl3 = bool(r.get("acpl3"))
-                five = self.element != "pair" and not acpl3
-                has_aspx = not (self.element == "pair" and r["mode"][1] == 0)
+                acpl1 = r.get("acpl1")
+                blocks = tuple(r.get("aspx_blocks", ()))
+                five = (1, True) in blocks       # the Ls/Rs pair has A-SPX
+                has_aspx = bool(blocks)
                 if cfg and has_aspx:
                     from .toc import Bits
                     b = Bits(sub)
                     b.p = r["bits"]
                     t = R37.t_for(cfg)
+                    got = {}
                     try:
-                        aspx_lr = P.aspx_data(b, self.tabs, t, cfg,
-                                              self.nats, ifr, True,
-                                              self.fstate, 0)
-                        if five:
-                            aspx_sr = P.aspx_data(b, self.tabs, t, cfg,
-                                                  self.nats, ifr, True,
-                                                  self.fstate, 1)
-                            aspx_c = P.aspx_data(b, self.tabs, t, cfg,
-                                                 self.nats, ifr, False,
-                                                 self.fstate, 2)
+                        for grp, two in blocks:
+                            got[grp] = P.aspx_data(b, self.tabs, t, cfg,
+                                                   self.nats, ifr, two,
+                                                   self.fstate, grp)
                     except Exception as e:                     # noqa: BLE001
                         if on:
                             raise RB.Damaged("aspx.parse", str(e)[:60]) \
                                 if not isinstance(e, RB.Damaged) else e
                         # (checks off: a later block mis-parsing does not
                         # cost an earlier one, as before)
+                    aspx_lr, aspx_sr, aspx_c = (got.get(0), got.get(1),
+                                                got.get(2))
                     end = b.p
-                    # ASPX_ACPL_3: acpl_data_2ch() closes the frame
+                    # ASPX_ACPL_3: acpl_data_2ch() closes the frame;
+                    # ASPX_ACPL_1 / _2: one acpl_data_1ch() per module
                     acfg = r.get("acpl") or self.acpl_cfg
-                    if acpl3 and acfg:
+                    if (acpl3 or acpl1) and acfg:
                         try:
-                            ad = AP.acpl_data_2ch(b, self.acpl_books, acfg)
+                            if acpl3:
+                                ads = [AP.acpl_data_2ch(b, self.acpl_books,
+                                                        acfg)]
+                            else:
+                                ads = [AP.acpl_data_1ch(b, self.acpl_books,
+                                                        acfg)
+                                       for _ in range(r["acpl_blocks"])]
                         except Exception as e:                 # noqa: BLE001
                             if on:
                                 raise RB.Damaged("acpl.parse", str(e)[:60])
-                            ad = None
+                            ads = None
                         else:
                             end = b.p
-                        if ad is not None:
+                        if ads is not None:
                             # differential decoding (Pseudocode 121)
-                            q = AP.quantised_2ch(ad, acfg, self.acpl_q)
-                            fr_a = ad["framing"]
-                            got_acpl = dict(
-                                cfg=acfg, q=q,
-                                interp=fr_a["interpolation_type"],
-                                timeslots=tuple(fr_a["param_timeslot"]),
-                                clamped=AP.out_of_range_2ch(q, acfg))
+                            mods = []
+                            for k, ad in enumerate(ads):
+                                qp = (self.acpl_q if acpl3
+                                      else self.acpl_q1[k])
+                                q = AP.quantised_2ch(ad, acfg, qp)
+                                fr_a = ad["framing"]
+                                mods.append(dict(
+                                    cfg=acfg, q=q,
+                                    interp=fr_a["interpolation_type"],
+                                    timeslots=tuple(fr_a["param_timeslot"]),
+                                    clamped=AP.out_of_range_2ch(q, acfg)))
+                            got_acpl = mods[0] if acpl3 else mods
                 r["end"] = end
                 # every block of audio_data() parsed?  Not before the first
                 # aspx_config (the A-SPX blocks cannot be sized) nor, for
                 # ASPX_ACPL_3, before the first acpl_config_2ch
                 complete = ((bool(cfg) or not has_aspx)
-                            and (not acpl3 or bool(r.get("acpl")
-                                                   or self.acpl_cfg)))
+                            and (not (acpl3 or acpl1)
+                                 or bool(r.get("acpl") or self.acpl_cfg)))
                 if on:
                     RB.check_closure(r, len(sub), complete)
                     if not cfg and has_aspx:
                         pending.append(dict(
                             fi=fi, sub=sub, bits=r["bits"], ifr=ifr,
                             start=r["audio_start"], size=r["audio_size"],
-                            acpl3=acpl3, five=five, wpos=wpos))
+                            acpl3=acpl3, blocks=blocks,
+                            acpl1=r.get("acpl_blocks", 0) if acpl1 else 0,
+                            wpos=wpos))
                 # spectral noise fill (TS 103 190-1 5.1.4): one generator
                 # per frame, reset from sequence_counter (Pseudocode 24),
                 # run through the element's channels in bitstream order
@@ -341,7 +358,16 @@ class Ac4Stream:
                 # each channel's OWN framing: with b_enable_mdct_stereo_proc
                 # = 0 the two channels of a pair carry separate sf_info and
                 # can differ (with it on, both are the shared one)
-                fm = {"L": r["L"]["framing"], "R": r["R"]["framing"]}
+                fm = {"L": r["L"]["framing"]}
+                if r.get("R") is not None:
+                    fm["R"] = r["R"]["framing"]
+                # channels the element does not code (ASPX_ACPL_2: R of a
+                # pair, Ls / Rs of a 5_X element; 5.3.4.1, Table 181): one
+                # silent long block each
+                silent = [k for k in ("R", "Ls", "Rs")
+                          if k in chans and r.get(k, 0) is None
+                          or (acpl1 == "5_X" and k in ("Ls", "Rs")
+                              and k in chans)]
                 # ASPX_ACPL_3 (E77) carries the 5.1 programme as a TWO-channel
                 # core plus A-CPL; Ls/Rs/C do not exist as coded channels, so
                 # this frame has only a pair to give no matter what `chans`
@@ -362,6 +388,9 @@ class Ac4Stream:
                     for k in list(wins):
                         if k not in chans:
                             wins.pop(k); lengths.pop(k); counts.pop(k)
+                elif acpl1 == "5_X":
+                    fm.update({"C": r["C"]["framing"],
+                               "lfe": r["lfe"]["framing"]})
                 elif self.element != "pair":
                     fm.update({"Ls": r["Ls"]["framing"],
                                "Rs": r["Rs"]["framing"],
@@ -369,7 +398,9 @@ class Ac4Stream:
                                "lfe": r["lfe"]["framing"]})
                 order = R.BITSTREAM_ORDER["pair" if self.element == "pair"
                                           else ("acpl3" if acpl3
-                                                else "5_X")]
+                                                else ("acpl12" if acpl1
+                                                      else "5_X"))]
+                order = tuple(k for k in order if r.get(k) is not None)
                 pk = {}
                 for k in order:
                     if k in chans:
@@ -411,16 +442,28 @@ class Ac4Stream:
                 if self.toc_shape is None:
                     self.toc_shape = RB.toc_shape(st)
                 self.mode = r["mode"]
-                if "L" in pk:
-                    pk["L"], pk["R"] = R.unmix(pk["L"], pk["R"],
-                                               r["st_lr"], fm["L"])
+                if "L" in pk and "R" in pk:
+                    a, c = pk["L"], pk["R"]
+                    if len(a) != len(c):        # max_sfb_side (ASPX_ACPL_1)
+                        n = max(len(a), len(c))
+                        a = np.concatenate([a, np.zeros(n - len(a))])
+                        c = np.concatenate([c, np.zeros(n - len(c))])
+                    pk["L"], pk["R"] = R.unmix(a, c, r["st_lr"], fm["L"])
                 if "Ls" in pk:
                     pk["Ls"], pk["Rs"] = R.unmix(pk["Ls"], pk["Rs"],
                                                  r["st_sr"], fm["Ls"])
                 u, seq_l = {}, {}
+                fl_ = self.frame_len or RT.DEFAULT_FRAME
                 for k in chans:
-                    u[k], seq_l[k] = R.ungroup(pk[k], fm[k])
+                    if k in silent:
+                        u[k], seq_l[k] = [np.zeros(fl_)], [fl_]
+                    else:
+                        u[k], seq_l[k] = R.ungroup(pk[k], fm[k])
                 got_lr = aspx_lr
+                if acpl1 == "pair" and aspx_lr:
+                    # the "m" track's aspx_data_1ch, rendered as the
+                    # centre is (the same channel twice)
+                    got_lr = [aspx_lr[0], aspx_lr[0]]
                 got_sr = aspx_sr if "Ls" in pk else None
                 # the centre's aspx_data_1ch, as a "pair" of the same
                 # channel twice (decoder.py renders it with the pair
@@ -436,14 +479,17 @@ class Ac4Stream:
                     sync, on, avg = comp
                     flag = (lambda i: on[0] if sync else
                             (on[i] if i < len(on) else 0))
-                    for grp, idx in ((got_lr, (0, 1)), (got_sr, (3, 4)),
+                    lr_idx = (0, 0) if acpl1 == "pair" else (0, 1)
+                    for grp, idx in ((got_lr, lr_idx), (got_sr, (3, 4)),
                                      (got_c, (2, 2))):
                         if isinstance(grp, list):
                             for ch, i in zip(grp, idx):
                                 ch["compand"] = dict(on=flag(i), avg=avg,
                                                      sync=sync)
-                if not acpl3:
+                if not (acpl3 or acpl1):
                     got_acpl = None
+                if acpl1:
+                    self.acpl1 = acpl1
                 self.n_ok += 1
                 self.status.append(None)
                 self.seq_break.append(brk)
@@ -457,6 +503,7 @@ class Ac4Stream:
                 # A-SPX framing state goes back to before it (hold).
                 self.fstate = fstate0
                 self.acpl_q = acpl_q0
+                self.acpl_q1 = acpl_q10
                 reason = RB.reason_of(e)
                 fl = self.frame_len or RT.DEFAULT_FRAME
                 if self.frame_len is None:
@@ -546,17 +593,16 @@ class Ac4Stream:
             b = Bits(pd["sub"])
             b.p = pd["bits"]
             try:
-                P.aspx_data(b, self.tabs, t, cfg, self.nats, pd["ifr"],
-                            True, state, 0)
-                if pd["five"]:
+                for grp, two in pd["blocks"]:
                     P.aspx_data(b, self.tabs, t, cfg, self.nats, pd["ifr"],
-                                True, state, 1)
-                    P.aspx_data(b, self.tabs, t, cfg, self.nats, pd["ifr"],
-                                False, state, 2)
-                if pd["acpl3"]:
+                                two, state, grp)
+                if pd["acpl3"] or pd["acpl1"]:
                     if not acfg:
                         continue
-                    AP.acpl_data_2ch(b, self.acpl_books, acfg)
+                    if pd["acpl3"]:
+                        AP.acpl_data_2ch(b, self.acpl_books, acfg)
+                    for _ in range(pd["acpl1"]):
+                        AP.acpl_data_1ch(b, self.acpl_books, acfg)
                 stop = pd["start"] + 8 * pd["size"]
                 ok = stop - 7 <= b.p <= stop
             except Exception:                                  # noqa: BLE001

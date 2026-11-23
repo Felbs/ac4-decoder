@@ -21,6 +21,25 @@ DATA_2CH = (("ALPHA", 0), ("ALPHA", 0), ("BETA", 0), ("BETA", 0),
             ("GAMMA", 1), ("GAMMA", 1), ("GAMMA", 1))
 
 
+# Table 142's helper acpl_1ch_mode
+PARTIAL, FULL = 0, 1
+
+
+def acpl_config_1ch(b, mode):
+    """Table 59. mode PARTIAL (ASPX_ACPL_1): acpl_qmf_band_minus1 follows,
+    and the parameters start at the band holding it (sb_to_pb); FULL
+    (ASPX_ACPL_2): every band, acpl_qmf_band 0."""
+    from .acpl import sb_to_pb
+    nb = NUM_PARAM_BANDS[b.u(2)]
+    qm = b.u(1)
+    qmf_band = param_band = 0
+    if mode == PARTIAL:
+        qmf_band = b.u(3) + 1
+        param_band = int(sb_to_pb(nb)[qmf_band])
+    return dict(num_param_bands=nb, param_band=param_band,
+                qmf_band=qmf_band, quant_mode=qm, mode=mode)
+
+
 def acpl_config_2ch(b):
     """Table 60: four bits, no conditionals."""
     nid = b.u(2)
@@ -59,6 +78,23 @@ def _huff_data(b, books, data_type, qmode, n_bands, start):
         for _ in range(start, n_bands):
             vals.append(book.decode(b))
     return diff_type, vals
+
+
+# Table 61, in bitstream order
+DATA_1CH = (("ALPHA", 0), ("BETA", 0))
+SETS_1CH = ("alpha1", "beta1")
+
+
+def acpl_data_1ch(b, books, cfg):
+    """Table 61 (with Tables 63 to 65). -> dict of the raw symbols."""
+    fr = _framing(b)
+    n, st = cfg["num_param_bands"], cfg["param_band"]
+    params = []
+    for data_type, _ in DATA_1CH:
+        params.append([_huff_data(b, books, data_type, cfg["quant_mode"], n,
+                                  st)
+                       for _ in range(fr["num_param_sets"])])
+    return dict(framing=fr, params=params)
 
 
 def acpl_data_2ch(b, books, cfg):
@@ -109,16 +145,23 @@ SETS_2CH = ("alpha1", "alpha2", "beta1", "beta2", "beta3", "gamma1",
             "gamma2", "gamma3", "gamma4", "gamma5", "gamma6")
 
 
+def _modes(cfg):
+    if "quant_mode" in cfg:                     # acpl_config_1ch
+        return (cfg["quant_mode"], cfg["quant_mode"]), DATA_1CH
+    return (cfg["quant_mode_0"], cfg["quant_mode_1"]), DATA_2CH
+
+
 def quantised_2ch(data, cfg, q_prev):
-    """Pseudocode 121 for the eleven sets of one acpl_data_2ch(): the
-    symbols of acpl_data_2ch() -> acpl_<SET>_q, a list of 11 lists of
-    num_param_sets lists of num_param_bands ints (bands below param_band
-    are 0). q_prev (list of 11 lists, or None entries: the last set of the
-    previous frame) is updated in place."""
+    """Pseudocode 121 for the eleven sets of one acpl_data_2ch() (or the
+    two of an acpl_data_1ch(), cfg from acpl_config_1ch): the symbols ->
+    acpl_<SET>_q, a list of 11 (2) lists of num_param_sets lists of
+    num_param_bands ints (bands below param_band are 0). q_prev (list of 11
+    (2) lists, or None entries: the last set of the previous frame) is
+    updated in place."""
     n, st = cfg["num_param_bands"], cfg["param_band"]
-    qm = (cfg["quant_mode_0"], cfg["quant_mode_1"])
+    qm, kinds = _modes(cfg)
     out = []
-    for k, ((data_type, which), sets) in enumerate(zip(DATA_2CH,
+    for k, ((data_type, which), sets) in enumerate(zip(kinds,
                                                         data["params"])):
         q = QUANT[qm[which]]
         per_set = []
@@ -141,10 +184,13 @@ def quantised_2ch(data, cfg, q_prev):
     return out
 
 
+quantised_1ch = quantised_2ch
+
+
 def out_of_range_2ch(q, cfg):
     """-> True when a value of quantised_2ch's output leaves Q_RANGE."""
-    qm = (cfg["quant_mode_0"], cfg["quant_mode_1"])
-    for (data_type, which), sets in zip(DATA_2CH, q):
+    qm, kinds = _modes(cfg)
+    for (data_type, which), sets in zip(kinds, q):
         lo, hi = Q_RANGE[(data_type, QUANT[qm[which]])]
         if any(not lo <= v <= hi for cur in sets for v in cur):
             return True

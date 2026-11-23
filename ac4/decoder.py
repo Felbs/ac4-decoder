@@ -155,6 +155,7 @@ class Decoder:
                                 language=language)
         self.fb_state = {k: None for k in self.chans}
         self.lead_pcm = {k: np.zeros(0) for k in ("L", "R", "Ls", "Rs", "C")}
+        self.lead_core = {}
         self.lead_groups = {"lr": [], "sr": [], "c": []}
         # the last HF_DELAY core samples of every channel: the delay line
         # of the channels that do not go through the QMF bank
@@ -211,6 +212,7 @@ class Decoder:
         self.frame = fl
         self.fb_state = {k: None for k in self.chans}
         self.lead_pcm = {k: np.zeros(0) for k in self.lead_pcm}
+        self.lead_core = {}
         self.lead_groups = {k: [] for k in self.lead_groups}
         self.lead_acpl = []
         self.hf_state = {k: [None] for k in self.hf_state}
@@ -240,11 +242,13 @@ class Decoder:
         if mode is None:
             return False
         if self.element == "pair":
-            return gkey == "lr" and mode[1] == 1
+            return gkey == "lr" and mode[1] >= 1
         if gkey == "lr":
             return True
         if gkey == "c" and not SC.CENTRE_ASPX:
             return False
+        if gkey == "sr" and self.stream.acpl1:
+            return False                # ASPX_ACPL_1 / _2: no Ls/Rs A-SPX
         return not (self.acpl3 or self.stream.acpl3) and len(self.chans) == 6
 
     def decode_pass(self, frames):
@@ -349,6 +353,13 @@ class Decoder:
         # the A-CPL upmix: an ASPX_ACPL_3 stream decoded to 5.1
         upmix = ((self.acpl3 or dec.acpl3) and "C" in chans
                  and self.element == "5_X")
+        # ASPX_ACPL_1 / _2: the pair element always (its only stereo);
+        # the 5_X element decoded to 5.1
+        a1 = dec.acpl1
+        up1 = bool(a1 == "pair" or (a1 == "5_X" and "C" in chans
+                                    and self.element == "5_X"))
+        if up1:
+            upmix = True
         ga = grp.get("acpl") or [None] * len(grp["lr"])
         for (ka, kb), gkey in ((("L", "R"), "lr"), (("Ls", "Rs"), "sr"),
                                (("C", "C"), "c")):
@@ -361,7 +372,15 @@ class Decoder:
             if self._pair_capable(gkey):
                 lead = min(len(self.lead_pcm[ka]), LEAD * FRAME)
                 pa = np.concatenate([self.lead_pcm[ka][-lead:], pcm[ka]])
-                pb = np.concatenate([self.lead_pcm[kb][-lead:], pcm[kb]])
+                kb_ = "L" if (a1 == "pair" and gkey == "lr") else kb
+                pb = np.concatenate([self.lead_pcm[kb_][-lead:], pcm[kb_]])
+                a1ch = None
+                if up1 and gkey == "lr":
+                    rk = ("R",) if a1 == "pair" else ("Ls", "Rs")
+                    a1ch = dict(res=[np.concatenate(
+                        [self.lead_core.get(k, np.zeros(0))[-lead:], core[k]])
+                        for k in rk],
+                        split=a1 == "pair", five=a1 == "5_X")
                 gg = self.lead_groups[gkey][-LEAD:] + gl
                 n_lead = len(gg) - len(gl)
                 hs, slog = self.hf_state[gkey], []
@@ -378,7 +397,8 @@ class Decoder:
                         acpl_state0=(acs[max(0, len(acs) - 1 - n_lead)]
                                      if up else None),
                         acpl_log=alog if up else None,
-                        frame_len=FRAME, t_start=self.t_hold[gkey])
+                        frame_len=FRAME, t_start=self.t_hold[gkey],
+                        acpl_1ch=a1ch)
                     bad = np.zeros(len(gl) + 1, dtype=bool)
                     pcm[ka], pcm[kb], nb_, self.hf_hot[gkey] = \
                         core_for_bursts(hf["L"][lead:], hf["R"][lead:],
@@ -392,12 +412,15 @@ class Decoder:
                                         bad_out=bad, FRAME=FRAME)
                     via_qmf |= {ka, kb}
                     if up:
-                        # the five channels of the upmix; a frame whose
+                        # the channels of the upmix; a frame whose
                         # A-SPX output the checks above replaced by its
                         # core plays the core (the stereo downmix) on
-                        # L / R and nothing on C / Ls / Rs
+                        # L / R and nothing on C / Ls / Rs (a pair element
+                        # in ASPX_ACPL_1 / _2: its mono core on both)
                         n = len(pcm[ka])
-                        for k in ("L", "R", "C", "Ls", "Rs"):
+                        if a1 == "pair":
+                            pcm[kb] = pcm[ka]
+                        for k in hf["up"]:
                             v = hf["up"][k][lead:lead + n]
                             if k in (ka, kb):
                                 v = np.where(np.repeat(bad, FRAME)[:n],
@@ -406,7 +429,7 @@ class Decoder:
                                 v = np.where(np.repeat(bad, FRAME)[:n],
                                              0.0, v)
                             pcm[k] = v
-                        via_qmf |= {"C", "Ls", "Rs"}
+                        via_qmf |= set(hf["up"])
                         self.acpl_state = alog[-(LEAD + 1):]
                     if nb_:
                         self.n_burst += nb_
@@ -443,6 +466,9 @@ class Decoder:
             if k not in via_qmf:
                 pcm[k] = x[:len(core[k])]
             self.core_tail[k] = x[-HF_DELAY:]
+            # the core of the last LEAD frames (ASPX_ACPL_1 residuals)
+            self.lead_core[k] = np.concatenate(
+                [self.lead_core.get(k, np.zeros(0)), core[k]])[-LEAD * FRAME:]
         return np.column_stack([pcm[k] for k in chans])
 
 

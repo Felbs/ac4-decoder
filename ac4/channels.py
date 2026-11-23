@@ -846,14 +846,51 @@ def _acpl3_core(b, T, b_iframe, sub):
                 bits=b.p, nbits=len(sub) * 8, coding_config=None)
 
 
+def _acpl12_5x(b, T, b_iframe, sub, codec_mode, has_lfe=True):
+    """5_X_codec_mode 2 / 3 = ASPX_ACPL_1 / ASPX_ACPL_2 (Table 25): a
+    three-track core (two_channel_data A, B and mono_data C, coding_config
+    0) plus, in ASPX_ACPL_1, two residual tracks; A-SPX on the A/B pair
+    and the centre; two acpl_data_1ch() (5.7.7.6.1)."""
+    from .acpl_parse import acpl_config_1ch, PARTIAL, FULL
+    aspx = acpl = None
+    if b_iframe:
+        aspx = aspx_config(b)
+        acpl = acpl_config_1ch(b, PARTIAL if codec_mode == 2 else FULL)
+    lfe = mono_data(b, T, b_lfe=True) if has_lfe else None
+    comp = companding_control(b, 3)
+    coding_config = b.u(1)
+    if coding_config:
+        raise ValueError("ASPX_ACPL coding_config 1 (three_channel_data) "
+                         "not implemented")
+    l, r, st_lr = two_channel_data(b, T)            # A, B (Table 181)
+    if codec_mode == 2:
+        raise ValueError("5_X ASPX_ACPL_1 residual tracks (max_sfb_master,"
+                         " Tables B.8-B.19) not implemented")
+    centre = mono_data(b, T, b_lfe=False)
+    return dict(lfe=lfe, L=l, R=r, C=centre, st_lr=st_lr, aspx=aspx,
+                acpl=acpl, acpl1="5_X", codec_mode=codec_mode, compand=comp,
+                bits=b.p, nbits=len(sub) * 8, coding_config=coding_config,
+                aspx_blocks=((0, True), (2, False)), acpl_blocks=2)
+
+
 def decode_element(sub, T, b_iframe=False):
-    """The whole 5.1 element.  -> dict of six channels + the bit position."""
+    """The whole 5.1 element.  -> dict of six channels + the bit position.
+
+    aspx_blocks: the (block group, two-channel) A-SPX blocks that follow
+    the channel data, in bitstream order (group 0 the L/R pair, 1 Ls/Rs,
+    2 the centre); acpl_blocks: how many acpl_data_1ch() follow them (the
+    ASPX_ACPL_3 acpl_data_2ch() is flagged by acpl3)."""
     b = Bits(sub)
     asz, a0 = audio_size(b)
     codec_mode = b.u(3)
     if codec_mode == 4:
         r = _acpl3_core(b, T, b_iframe, sub)
-        r.update(audio_size=asz, audio_start=a0, mode=("5_X", 4))
+        r.update(audio_size=asz, audio_start=a0, mode=("5_X", 4),
+                 aspx_blocks=((0, True),), acpl_blocks=0)
+        return r
+    if codec_mode in (2, 3):
+        r = _acpl12_5x(b, T, b_iframe, sub, codec_mode)
+        r.update(audio_size=asz, audio_start=a0, mode=("5_X", codec_mode))
         return r
     if codec_mode != 1:
         raise ValueError(f"5_X_codec_mode {codec_mode} is not ASPX")
@@ -871,7 +908,9 @@ def decode_element(sub, T, b_iframe=False):
                 st_lr=st_lr, st_sr=st_sr, aspx=aspx, codec_mode=codec_mode,
                 compand=comp,
                 bits=b.p, nbits=len(sub) * 8, coding_config=coding_config,
-                audio_size=asz, audio_start=a0, mode=("5_X", 1))
+                audio_size=asz, audio_start=a0, mode=("5_X", 1),
+                aspx_blocks=((0, True), (1, True), (2, False)),
+                acpl_blocks=0)
 
 
 def audio_size(b):
