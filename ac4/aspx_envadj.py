@@ -111,19 +111,37 @@ def estimate(Qh, t, borders, sl0, nts_in_ats, ts_off=0):
     return est
 
 
-def map_scf(qscf_env, t, fr, n_sb):
-    """Pseudocode 82 + 91: dequantise the signal envelope onto QMF subbands."""
+# THE SCALE OF THE ENVELOPES. scf_sig_sbg is an absolute QMF-domain energy
+# on the standard's scale (Pseudocode 82: num_qmf_subbands * 2^(q / a)).
+# This decoder's samples are the standard's times filterbank.IMDCT_K
+# (sqrt(2 * 1536)), so the energies it compares them with (est) are
+# IMDCT_K^2 larger: the dequantised envelopes take the same factor.
+# (Until the 1.5 dB envelopes were dequantised with a = 2, an a = 1 that
+# inflated the envelopes of FIXFIX one-envelope intervals stood in for
+# this factor on average; the frames it overshot were the "A-SPX bursts".)
+ENV_SCALE = 64.0 * 2.0 * 1536.0
+
+
+def env_a(qmode):
+    """Pseudocodes 82, 84: a = 2 for aspx_qmode_env 0 (1.5 dB steps), 1 for
+    aspx_qmode_env 1 (3.0 dB). aspx_data forces qmode 0 for a FIXFIX
+    interval with one envelope, whatever aspx_quant_mode_env says."""
+    return 2 if qmode == 0 else 1
+
+
+def map_scf(qscf_env, t, fr, n_sb, a=1):
+    """Pseudocode 82 + 91: dequantise the signal envelope onto QMF subbands.
+    a: env_a(the channel's aspx_qmode_env)."""
     n_env = len(qscf_env)
     out = np.zeros((n_sb, n_env))
     for e, q in enumerate(qscf_env):
         tbl = t["hi"] if fr["freq_res"][e] else t["lo"]
-        a = 2 if 0 else 1                       # qmode 1 -> 3.0 dB -> a = 1
         for sbg, val in enumerate(q):
             if sbg + 1 >= len(tbl):
                 break
             lo = tbl[sbg] - t["sbx"]
             hi = min(tbl[sbg + 1] - t["sbx"], n_sb)
-            out[max(lo, 0):hi, e] = 64.0 * (2.0 ** (val / a))
+            out[max(lo, 0):hi, e] = ENV_SCALE * (2.0 ** (val / a))
     return out
 
 
@@ -156,7 +174,7 @@ def map_scf_joint(qa, qb, t, fr, n_sb, a=1):
             if hi <= lo:
                 continue
             va, vb = qa[e][sbg], qb[e][sbg]
-            nom = (2.0 ** (va / a + 1)) * 64.0
+            nom = (2.0 ** (va / a + 1)) * ENV_SCALE
             A[lo:hi, e] = nom / (1.0 + 2.0 ** (PAN_OFFSET - vb / a))
             B[lo:hi, e] = nom / (1.0 + 2.0 ** (vb / a - PAN_OFFSET))
     return A, B

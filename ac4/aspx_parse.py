@@ -354,7 +354,8 @@ def aspx_data(b, tabs, t, cfg, nats, b_iframe, two_ch, state, grp):
         noi = ec_data(b, tabs, t, "NOISE", f0["num_noise"], None, 0, 0,
                       d_noise)
         return [dict(fr=f0, sig=sig, noise=noi, dir_sig=d_sig,
-                     dir_noise=d_noise, balance=0, ch=0, ah=ah[0])]
+                     dir_noise=d_noise, balance=0, ch=0, ah=ah[0],
+                     qmode=q0)]
     balance = b.u(1)
     f1, q1 = f0, q0
     if balance == 1:
@@ -382,6 +383,8 @@ def aspx_data(b, tabs, t, cfg, nats, b_iframe, two_ch, state, grp):
     n0 = ec_data(b, tabs, t, "NOISE", f0["num_noise"], None, 0, 0, d0_noise)
     n1 = ec_data(b, tabs, t, "NOISE", f1["num_noise"], None, 0, sm1, d1_noise)
     return [dict(fr=f0, sig=s0, noise=n0, dir_sig=d0_sig,
-                 dir_noise=d0_noise, balance=balance, ch=0, ah=ah[0]),
+                 dir_noise=d0_noise, balance=balance, ch=0, ah=ah[0],
+                 qmode=q0),
             dict(fr=f1, sig=s1, noise=n1, dir_sig=d1_sig,
-                 dir_noise=d1_noise, balance=balance, ch=1, ah=ah[1])]
+                 dir_noise=d1_noise, balance=balance, ch=1, ah=ah[1],
+                 qmode=q1)]

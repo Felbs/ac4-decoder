@@ -295,3 +295,46 @@ def test_stream_decodes_the_chosen_presentations_substream(monkeypatch):
         seen.clear()
         ST.Ac4Stream("pair", **kw).decode_frames([f])
         assert seen == [want]
+
+
+# ------------------------------------------------------------ A-SPX envelopes
+def test_envelope_dequantisation_uses_the_frames_step():
+    """Pseudocodes 82 and 84: a = 2 for 1.5 dB steps (aspx_qmode_env 0, which
+    aspx_data forces for a FIXFIX interval with one envelope), a = 1 for
+    3 dB; the energies are num_qmf_subbands * 2^(q / a), in this decoder's
+    units (x IMDCT_K^2)."""
+    from ac4 import aspx_envadj as E
+    from ac4 import filterbank as FB
+    t = dict(lo=[10, 14, 18], hi=[10, 12, 14, 16, 18], sbx=10)
+    fr = dict(freq_res=[0])
+    k2 = FB.IMDCT_K ** 2
+    for qmode, a in ((0, 2), (1, 1)):
+        out = E.map_scf([[20, 30]], t, fr, 8, a=E.env_a(qmode))
+        assert np.allclose(out[:4, 0], 64 * k2 * 2.0 ** (20 / a))
+        assert np.allclose(out[4:8, 0], 64 * k2 * 2.0 ** (30 / a))
+        A, B = E.map_scf_joint([[20, 30]], [[12, 16]], t, fr, 8,
+                               a=E.env_a(qmode))
+        nom = 2.0 ** (20 / a + 1) * 64 * k2
+        assert np.isclose(A[0, 0], nom / (1 + 2.0 ** (12 - 12 / a)))
+        assert np.isclose(B[0, 0], nom / (1 + 2.0 ** (12 / a - 12)))
+
+
+def test_fixfix_single_envelope_reports_qmode_0(monkeypatch):
+    """aspx_data hands the renderer the step it decoded with."""
+    from ac4 import aspx_parse as P
+    calls = {}
+
+    def fake_framing(b, cfg, nats, ifr, state, key):
+        return dict(int_class=P.FIXFIX, num_env=1, num_noise=1,
+                    freq_res=[0], borders=[0, 12], tsg_ptr=-1,
+                    sine_at_end=-1)
+
+    monkeypatch.setattr(P, "aspx_framing", fake_framing)
+    monkeypatch.setattr(P, "delta_dir", lambda b, f: ([0], [0]))
+    monkeypatch.setattr(P, "hfgen_iwc", lambda *a, **k: [[0], [0]])
+    monkeypatch.setattr(P, "ec_data",
+                        lambda b, tabs, t, kind, n, fres, q, sm, d:
+                        calls.setdefault(kind, []).append(q) or [[0]])
+    out = P.aspx_data(Bits(bytes(4)), {}, {}, dict(quant_mode_env=1), 12,
+                      False, False, {}, 0)
+    assert out[0]["qmode"] == 0 and calls["SIGNAL"] == [0]

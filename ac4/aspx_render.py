@@ -201,12 +201,15 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
             nb, nprev[1] = E.noise_qscf(got[1], t, nprev[1])
             fr0 = got[0]["fr"]
             borders = fr0.get("borders") or [0, 12]
+            # Pseudocodes 82, 84: 1.5 dB steps (aspx_qmode_env 0) -> a = 2
+            a0 = E.env_a(got[0].get("qmode", 1))
+            a1 = E.env_a(got[1].get("qmode", 1))
             if got[0].get("balance") == 1:
-                sigA, sigB = E.map_scf_joint(qa, qb, t, fr0, n_sb)
+                sigA, sigB = E.map_scf_joint(qa, qb, t, fr0, n_sb, a=a0)
                 nsA, nsB = E.map_noise_joint(na, nb, t, n_sb, sigA.shape[1])
             else:
-                sigA = E.map_scf(qa, t, fr0, n_sb)
-                sigB = E.map_scf(qb, t, got[1]["fr"], n_sb)
+                sigA = E.map_scf(qa, t, fr0, n_sb, a=a0)
+                sigB = E.map_scf(qb, t, got[1]["fr"], n_sb, a=a1)
                 dqa = [[2.0 ** (E.NOISE_FLOOR_OFFSET - v) for v in e]
                        for e in na]
                 dqb = [[2.0 ** (E.NOISE_FLOOR_OFFSET - v) for v in e]

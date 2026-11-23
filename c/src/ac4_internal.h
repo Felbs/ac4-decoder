@@ -346,6 +346,7 @@ typedef struct {
 typedef struct {                /* one channel of aspx_data_1ch/2ch */
     ac4_aspx_framing fr;
     int balance, ch;
+    int qmode;                  /* aspx_qmode_env: 0 = 1.5 dB, 1 = 3 dB */
     int dir_sig[AC4_ASPX_MAX_ENV], dir_noise[2];
     int n_sig[AC4_ASPX_MAX_ENV];
     int sig[AC4_ASPX_MAX_ENV][AC4_ASPX_MAX_SBG];

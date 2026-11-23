@@ -311,10 +311,20 @@ static int pow2(double x, double *out)
 
 typedef double mat_t[NSB][AC4_ASPX_MAX_ENV];
 
-/* Pseudocode 82 + 91 (map_scf, a = 1 as the Python) */
+/* the envelopes' scale: num_qmf_subbands * IMDCT_K^2 (aspx_envadj.
+   ENV_SCALE: the standard's absolute energies in this decoder's units) */
+#define ENV_SCALE (64.0 * 2.0 * 1536.0)
+
+/* Pseudocodes 82, 84: a = 2 for 1.5 dB steps (aspx_qmode_env 0) */
+static double env_a(int qmode)
+{
+    return qmode == 0 ? 2.0 : 1.0;
+}
+
+/* Pseudocode 82 + 91 (map_scf) */
 static int map_scf(long long q[AC4_ASPX_MAX_ENV][AC4_ASPX_MAX_SBG],
                    const int *nq, int n_env, const ac4_aspx_tab *t,
-                   const ac4_aspx_framing *fr, int n_sb, mat_t out)
+                   const ac4_aspx_framing *fr, int n_sb, double a, mat_t out)
 {
     int e, s, k;
     for (k = 0; k < n_sb; k++)
@@ -332,9 +342,9 @@ static int map_scf(long long q[AC4_ASPX_MAX_ENV][AC4_ASPX_MAX_SBG],
             hi = tbl[s + 1] - t->sbx;
             if (hi > n_sb)
                 hi = n_sb;
-            if (pow2((double)q[e][s], &v) != 0)
+            if (pow2((double)q[e][s] / a, &v) != 0)
                 return -1;
-            v = 64.0 * v;
+            v = ENV_SCALE * v;
             for (k = lo < 0 ? 0 : lo; k < hi; k++)
                 out[k][e] = v;
         }
@@ -342,13 +352,13 @@ static int map_scf(long long q[AC4_ASPX_MAX_ENV][AC4_ASPX_MAX_SBG],
     return 0;
 }
 
-/* Pseudocode 84 (map_scf_joint, a = 1) */
+/* Pseudocode 84 (map_scf_joint) */
 static int map_scf_joint(long long qa[AC4_ASPX_MAX_ENV][AC4_ASPX_MAX_SBG],
                          const int *na,
                          long long qb[AC4_ASPX_MAX_ENV][AC4_ASPX_MAX_SBG],
                          const int *nb, int n_env, const ac4_aspx_tab *t,
-                         const ac4_aspx_framing *fr, int n_sb, mat_t A,
-                         mat_t B)
+                         const ac4_aspx_framing *fr, int n_sb, double a,
+                         mat_t A, mat_t B)
 {
     int e, s, k;
     for (k = 0; k < n_sb; k++)
@@ -373,12 +383,12 @@ static int map_scf_joint(long long qa[AC4_ASPX_MAX_ENV][AC4_ASPX_MAX_SBG],
                 continue;
             va = (double)qa[e][s];
             vb = (double)qb[e][s];
-            if (pow2(va + 1.0, &nom) != 0)
+            if (pow2(va / a + 1.0, &nom) != 0)
                 return -1;
-            nom = nom * 64.0;
-            if (pow2((double)PAN_OFFSET - vb, &pa) != 0)
+            nom = nom * ENV_SCALE;
+            if (pow2((double)PAN_OFFSET - vb / a, &pa) != 0)
                 return -1;
-            if (pow2(vb - (double)PAN_OFFSET, &pb) != 0)
+            if (pow2(vb / a - (double)PAN_OFFSET, &pb) != 0)
                 return -1;
             for (k = lo; k < hi; k++) {
                 A[k][e] = nom / (1.0 + pa);
@@ -627,17 +637,19 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
     ne1 = d1->fr.num_env;
     if (joint) {
         int ne = ne0 < ne1 ? ne0 : ne1;
-        if (map_scf_joint(qa, nqa, qb, nqb, ne, t, &d0->fr, n_sb, sigA,
-                          sigB) != 0)
+        if (map_scf_joint(qa, nqa, qb, nqb, ne, t, &d0->fr, n_sb,
+                          env_a(d0->qmode), sigA, sigB) != 0)
             return;
         if (map_noise_joint(na, d0->fr.num_noise, nb, d1->fr.num_noise, t,
                             n_sb, ne, nsA, nsB) != 0)
             return;
         ne0 = ne1 = ne;
     } else {
-        if (map_scf(qa, nqa, ne0, t, &d0->fr, n_sb, sigA) != 0)
+        if (map_scf(qa, nqa, ne0, t, &d0->fr, n_sb, env_a(d0->qmode),
+                    sigA) != 0)
             return;
-        if (map_scf(qb, nqb, ne1, t, &d1->fr, n_sb, sigB) != 0)
+        if (map_scf(qb, nqb, ne1, t, &d1->fr, n_sb, env_a(d1->qmode),
+                    sigB) != 0)
             return;
         if (map_noise(na, d0->fr.num_noise, t, n_sb, ne0, nsA) != 0)
             return;

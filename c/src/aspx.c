@@ -516,6 +516,7 @@ void ac4_aspx_data(ac4_bits *b, const ac4_aspx_books *bk,
         ec_noise(b, bk, t, c0, 0);
         c0->balance = 0;
         c0->ch = 0;
+        c0->qmode = q0;
         return;
     }
     balance = (int)ac4_bit(b);
@@ -547,6 +548,8 @@ void ac4_aspx_data(ac4_bits *b, const ac4_aspx_books *bk,
     c0->balance = c1->balance = balance;
     c0->ch = 0;
     c1->ch = 1;
+    c0->qmode = q0;
+    c1->qmode = q1;
 }
 
 /* ------------------------------------------------------------ A-CPL */
