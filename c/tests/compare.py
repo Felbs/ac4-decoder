@@ -50,7 +50,11 @@ from ac4.resample import StreamResampler              # noqa: E402
 C_CLI = os.path.join(REPO, "c", "ac4dec-c")
 OUT = os.path.expanduser(os.environ.get("AC4_CPORT_OUT", "~/.cache/ac4-cport"))
 CHANS6 = ("L", "R", "C", "LFE", "Ls", "Rs")
-MAX_PASS = 1800
+# the Python's decode pass (frames). The C streams without passes and
+# equals a one-pass Python decode; the default, 1800, is the CLI's, whose
+# pass boundaries differ from one pass in the last frame of each pass
+# (README, Known issues): set AC4_MAX_PASS=1000000 for longer inputs.
+MAX_PASS = int(os.environ.get("AC4_MAX_PASS", "1800"))
 FRAME = 1536
 
 def python_reference(path, max_pass=MAX_PASS):
@@ -117,7 +121,7 @@ def compare(path, tag):
     fs = REF_PEAK[element] / 0.9
     names = CHANS6 if ref.shape[1] == 6 else CHANS6[:2]
     py_wav = os.path.join(OUT, tag + ".py.wav")
-    PYCLI.decode_file(path, py_wav, quiet=True)
+    PYCLI.decode_file(path, py_wav, quiet=True, max_pass=MAX_PASS)
     w_py, w_c = read_wav16(py_wav), read_wav16(c_wav)
     print(f"\n{tag}  ({os.path.basename(path)}, element {element}"
           f"{', ASPX_ACPL_3 core' if dec.acpl3 else ''}, {n_frames} frames, "

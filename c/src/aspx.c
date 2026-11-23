@@ -381,8 +381,16 @@ static void aspx_framing(ac4_bits *b, const ac4_aspx_cfg *cfg, int nats,
                 ac4_fail(b, AC4E_ASPX_BORDERS);
     }
     if (cfg->freq_res_mode == 0) {
-        for (e = 0; e < num_env; e++)
-            f->freq_res[e] = (int)ac4_bit(b);
+        /* Table 53: FIXFIX sends one aspx_freq_res for every envelope
+           (Pseudocode 76) */
+        if (ic == FIXFIX) {
+            int v = (int)ac4_bit(b);
+            for (e = 0; e < num_env; e++)
+                f->freq_res[e] = v;
+        } else {
+            for (e = 0; e < num_env; e++)
+                f->freq_res[e] = (int)ac4_bit(b);
+        }
     } else {
         for (e = 0; e < num_env; e++)
             f->freq_res[e] = freq_res(a, e, tsg_ptr < 0 ? 0 : tsg_ptr,
@@ -407,34 +415,38 @@ static void delta_dir(ac4_bits *b, const ac4_aspx_framing *f, int *ds,
         dn[e] = (int)ac4_bit(b);
 }
 
-static void skip_bits(ac4_bits *b, int n)
+
+static void read_bits(ac4_bits *b, int n, uint8_t *dst)
 {
     int i;
     for (i = 0; i < n; i++)
-        ac4_bit(b);
+        dst[i] = (uint8_t)ac4_bit(b);
 }
 
-/* Tables 55 and 56 (add-harmonic flags read, not used: the Python keeps
-   them but never renders them) */
+/* Tables 55 and 56: TNA modes, add-harmonic, FIC and TIC flags into
+   c[0] (and c[1]); with aspx_balance 1 channel 1 takes channel 0's TNA
+   modes */
 static void hfgen_iwc(ac4_bits *b, const ac4_aspx_tab *t, int two_ch,
-                      int balance, int nats)
+                      int balance, int nats, ac4_aspx_chd *c)
 {
-    int n_noise = t->n_noise, n_hi = t->n_hi, i;
+    int n_noise = t->n_noise, n_hi = t->n_hi, i, k;
     for (i = 0; i < n_noise; i++)
-        ac4_u(b, 2);                          /* aspx_tna_mode ch0 */
+        c[0].tna[i] = (uint8_t)ac4_u(b, 2);  /* aspx_tna_mode ch0 */
     if (two_ch) {
         if (balance == 0)
             for (i = 0; i < n_noise; i++)
-                ac4_u(b, 2);                  /* aspx_tna_mode ch1 */
-        if (ac4_bit(b))                       /* aspx_ah_left */
-            skip_bits(b, n_hi);
-        if (ac4_bit(b))                       /* aspx_ah_right */
-            skip_bits(b, n_hi);
+                c[1].tna[i] = (uint8_t)ac4_u(b, 2);
+        else
+            memcpy(c[1].tna, c[0].tna, sizeof(c[0].tna));
+        for (k = 0; k < 2; k++)
+            if (ac4_bit(b))                   /* aspx_ah_left / _right */
+                read_bits(b, n_hi, c[k].ah);
         if (ac4_bit(b)) {                     /* aspx_fic_present */
-            if (ac4_bit(b))
-                skip_bits(b, n_hi);
-            if (ac4_bit(b))
-                skip_bits(b, n_hi);
+            for (k = 0; k < 2; k++)
+                if (ac4_bit(b)) {             /* aspx_fic_left / _right */
+                    c[k].has_fic = 1;
+                    read_bits(b, n_hi, c[k].fic);
+                }
         }
         if (ac4_bit(b)) {                     /* aspx_tic_present */
             int copy = (int)ac4_bit(b), left = 0, right = 0;
@@ -442,18 +454,30 @@ static void hfgen_iwc(ac4_bits *b, const ac4_aspx_tab *t, int two_ch,
                 left = (int)ac4_bit(b);
                 right = (int)ac4_bit(b);
             }
-            if (copy || left)
-                skip_bits(b, nats);
-            if (right)
-                skip_bits(b, nats);
+            if (copy || left) {
+                c[0].has_tic = 1;
+                read_bits(b, nats, c[0].tic);
+            }
+            if (right) {
+                c[1].has_tic = 1;
+                read_bits(b, nats, c[1].tic);
+            }
+            if (copy) {
+                c[1].has_tic = 1;
+                memcpy(c[1].tic, c[0].tic, sizeof(c[0].tic));
+            }
         }
     } else {
         if (ac4_bit(b))                       /* aspx_ah_present */
-            skip_bits(b, n_hi);
-        if (ac4_bit(b))                       /* aspx_fic_present */
-            skip_bits(b, n_hi);
-        if (ac4_bit(b))                       /* aspx_tic_present */
-            skip_bits(b, nats);
+            read_bits(b, n_hi, c[0].ah);
+        if (ac4_bit(b)) {                     /* aspx_fic_present */
+            c[0].has_fic = 1;
+            read_bits(b, n_hi, c[0].fic);
+        }
+        if (ac4_bit(b)) {                     /* aspx_tic_present */
+            c[0].has_tic = 1;
+            read_bits(b, nats, c[0].tic);
+        }
     }
 }
 
@@ -551,7 +575,7 @@ void ac4_aspx_data(ac4_bits *b, const ac4_aspx_books *bk,
         q0 = 0;
     if (!two_ch) {
         delta_dir(b, &c0->fr, c0->dir_sig, c0->dir_noise);
-        hfgen_iwc(b, t, 0, 0, nats);
+        hfgen_iwc(b, t, 0, 0, nats, out->c);
         ec_sig(b, bk, t, c0, q0, 0);
         ec_noise(b, bk, t, c0, 0);
         c0->balance = 0;
@@ -579,7 +603,7 @@ void ac4_aspx_data(ac4_bits *b, const ac4_aspx_books *bk,
     }
     delta_dir(b, &c0->fr, c0->dir_sig, c0->dir_noise);
     delta_dir(b, &c1->fr, c1->dir_sig, c1->dir_noise);
-    hfgen_iwc(b, t, 1, balance, nats);
+    hfgen_iwc(b, t, 1, balance, nats, out->c);
     sm1 = balance ? 1 : 0;
     ec_sig(b, bk, t, c0, q0, 0);
     ec_sig(b, bk, t, c1, q1, sm1);

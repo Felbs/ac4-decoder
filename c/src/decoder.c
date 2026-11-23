@@ -1278,6 +1278,8 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         if (r->af[k].kind == AC4_GRP_DATA) {
             r->af[k].has_tab = 1;
             r->af[k].tab = gtab[k];
+            r->af[k].preflat = cfg->preflat;
+            r->af[k].interpolation = cfg->interpolation;
         }
     if (!(r->mask & (1 << CH_LS)))
         r->af[1].kind = AC4_GRP_NONE;

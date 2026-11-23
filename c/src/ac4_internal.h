@@ -379,6 +379,12 @@ typedef struct {
 typedef struct {                /* one channel of aspx_data_1ch/2ch */
     ac4_aspx_framing fr;
     int balance, ch;
+    /* aspx_hfgen_iwc (Tables 55, 56): TNA modes per noise group, add-
+       harmonic flags per high-resolution group, FIC flags (has_fic) per
+       high-resolution group, TIC flags (has_tic) per A-SPX timeslot */
+    uint8_t tna[AC4_ASPX_MAX_NOISE], ah[AC4_ASPX_MAX_SBG];
+    int has_fic, has_tic;
+    uint8_t fic[AC4_ASPX_MAX_SBG], tic[AC4_ASPX_MAX_NATS];
     int qmode;                  /* aspx_qmode_env: 0 = 1.5 dB, 1 = 3 dB */
     int dir_sig[AC4_ASPX_MAX_ENV], dir_noise[2];
     int n_sig[AC4_ASPX_MAX_ENV];
@@ -529,6 +535,7 @@ typedef struct {
     int kind;                   /* AC4_GRP_* */
     int has_tab;
     ac4_aspx_tab tab;           /* the tables this frame's data is for */
+    int preflat, interpolation; /* aspx_config's, for this frame */
     ac4_aspx_grp g;
     ac4_acpl_frame acpl;        /* ASPX_ACPL_3 (pair 0 only) */
     int acpl1_kind;             /* ASPX_ACPL_1 / _2 (pair 0 only) */
@@ -543,6 +550,17 @@ typedef struct {
     int fl, nts, tia, nats, tso;    /* the time grid (Table 192) */
     long long n_in;             /* core frames taken */
     double ana[2][640];
+    /* the analysed core (QinASPX), kept apart from the output ring
+       qre / qim (TNA, pre-flattening and interleaved waveform coding
+       read it) */
+    double are[2][AC4_QRING][64], aim[2][AC4_QRING][64];
+    /* the A-SPX tools' state per channel (aspx_tools.new_state): chirp
+       factors and TNA modes of the previous interval, sine_idx_sb of its
+       last envelope, the tone generator's index (-1: first frame) */
+    double chirp[2][AC4_ASPX_MAX_NOISE];
+    int tna_prev[2][AC4_ASPX_MAX_NOISE], n_tna[2];
+    uint8_t sine_sb[2][64];
+    int n_sine_sb[2], sine_idx[2];
     double syn[2][1280];
     double qre[2][AC4_QRING][64], qim[2][AC4_QRING][64];
     /* envelope state (aspx_render.apply_hf_pair) */

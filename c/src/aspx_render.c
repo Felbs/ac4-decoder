@@ -204,6 +204,7 @@ void ac4_aspx_pair_init(ac4_aspx_pair *p, int fl)
 {
     int hf = fl >= 1536 ? 6 : 3;
     memset(p, 0, sizeof(*p));
+    p->sine_idx[0] = p->sine_idx[1] = -1;
     p->fl = fl;
     p->nts = fl / 64;
     p->tia = fl >= 1536 ? 2 : 1;
@@ -218,21 +219,246 @@ static int effective(const ac4_aspx_frame *f)
     return f->kind != AC4_GRP_NONE && f->has_tab;
 }
 
-/* HF generation for one slot (aspx_hfgen.hf_generate): the patches copy
-   the slot's analysed low subbands up */
-static void hf_generate(const ac4_aspx_tab *t, double *re, double *im)
+/* ------------------------------------------------------------ tools
+ * aspx_tools.py: TNA (Pseudocodes 86-88, Table 195), pre-flattening
+ * (Pseudocode 85), HF signal creation (Pseudocode 89), sinusoids
+ * (Pseudocodes 92-94, 104, 105), interleaved waveform coding (5.7.6.5.3).
+ * An interval's slot ts is analysis slot A0 + ts, A0 = nts f + TS_OFFSET. */
+static const double NEW_CHIRP[4][4] = {
+    { 0.0, 0.6, 0.9, 0.98 }, { 0.6, 0.75, 0.9, 0.98 },
+    { 0.0, 0.75, 0.9, 0.98 }, { 0.0, 0.75, 0.9, 0.98 } };
+static const double SINE_RE[4] = { 1.0, 0.0, -1.0, 0.0 };
+static const double SINE_IM[4] = { 0.0, 1.0, 0.0, -1.0 };
+
+/* analysis slot ts of channel c, 0 outside [0, nts) */
+static void ana_at(const ac4_aspx_pair *p, int c, long long ts,
+                   long long nts, int sb, double *re, double *im)
 {
-    double r0[NSB], i0[NSB];
-    int p, k;
-    memcpy(r0, re, sizeof(r0));
-    memcpy(i0, im, sizeof(i0));
-    for (p = 0; p < t->n_patches; p++) {
-        int n = t->patch_num_sb[p], st = t->patch_start_sb[p];
-        int dst = t->patches[p];
-        for (k = 0; k < n; k++) {
-            re[dst + k] = r0[st + k];
-            im[dst + k] = i0[st + k];
+    if (ts < 0 || ts >= nts) {
+        *re = *im = 0.0;
+        return;
+    }
+    *re = p->are[c][QI(ts)][sb];
+    *im = p->aim[c][QI(ts)][sb];
+}
+
+/* Pseudocodes 86, 87 for subbands below sba */
+static void tna_alpha(const ac4_aspx_pair *p, int c, int sba, long long a0,
+                      long long nts, double *a0r, double *a0i, double *a1r,
+                      double *a1i)
+{
+    int sb, hf = p->fl >= 1536 ? 6 : 3;
+    for (sb = 0; sb < sba; sb++) {
+        double cr[3][3], ci[3][3], dr, di, nr, ni, m12;
+        int i, j, m;
+        for (i = 0; i < 3; i++)
+            for (j = 0; j < 3; j++)
+                cr[i][j] = ci[i][j] = 0.0;
+        for (m = 0; m < p->nts + hf; m += 2) {
+            double xr[3], xi[3];
+            for (i = 0; i < 3; i++)
+                ana_at(p, c, a0 + m - 2 * i, nts, sb, &xr[i], &xi[i]);
+            /* cov[i][j] += x[i] * conj(x[j]) for (0,1) (0,2) (1,1) (1,2)
+               (2,2) */
+            cr[0][1] += xr[0] * xr[1] + xi[0] * xi[1];
+            ci[0][1] += xi[0] * xr[1] - xr[0] * xi[1];
+            cr[0][2] += xr[0] * xr[2] + xi[0] * xi[2];
+            ci[0][2] += xi[0] * xr[2] - xr[0] * xi[2];
+            cr[1][1] += xr[1] * xr[1] + xi[1] * xi[1];
+            ci[1][1] += xi[1] * xr[1] - xr[1] * xi[1];
+            cr[1][2] += xr[1] * xr[2] + xi[1] * xi[2];
+            ci[1][2] += xi[1] * xr[2] - xr[1] * xi[2];
+            cr[2][2] += xr[2] * xr[2] + xi[2] * xi[2];
+            ci[2][2] += xi[2] * xr[2] - xr[2] * xi[2];
         }
+        /* denom = c22 c11 - |c12|^2 / (1 + EPSILON_INV) */
+        m12 = hypot(cr[1][2], ci[1][2]);
+        dr = cr[2][2] * cr[1][1] - ci[2][2] * ci[1][1];
+        di = cr[2][2] * ci[1][1] + ci[2][2] * cr[1][1];
+        dr = dr - m12 * m12 * (1.0 / (1.0 + 9.5367431640625e-07));
+        a1r[sb] = a1i[sb] = 0.0;
+        if (!(dr == 0.0 && di == 0.0)) {
+            /* (c01 c12 - c02 c11) / denom */
+            double pr = (cr[0][1] * cr[1][2] - ci[0][1] * ci[1][2])
+                        - (cr[0][2] * cr[1][1] - ci[0][2] * ci[1][1]);
+            double pi = (cr[0][1] * ci[1][2] + ci[0][1] * cr[1][2])
+                        - (cr[0][2] * ci[1][1] + ci[0][2] * cr[1][1]);
+            double den = dr * dr + di * di;
+            a1r[sb] = (pr * dr + pi * di) / den;
+            a1i[sb] = (pi * dr - pr * di) / den;
+        }
+        a0r[sb] = a0i[sb] = 0.0;
+        if (!(cr[1][1] == 0.0 && ci[1][1] == 0.0)) {
+            /* (-c01 + a1 conj(c12)) / c11 */
+            double tr_ = a1r[sb] * cr[1][2] + a1i[sb] * ci[1][2];
+            double ti = a1i[sb] * cr[1][2] - a1r[sb] * ci[1][2];
+            double den = cr[1][1] * cr[1][1] + ci[1][1] * ci[1][1];
+            nr = -cr[0][1] + tr_;
+            ni = -ci[0][1] + ti;
+            a0r[sb] = (nr * cr[1][1] + ni * ci[1][1]) / den;
+            a0i[sb] = (ni * cr[1][1] - nr * ci[1][1]) / den;
+        }
+        if (hypot(a0r[sb], a0i[sb]) >= 4.0 || hypot(a1r[sb], a1i[sb]) >= 4.0)
+            a0r[sb] = a0i[sb] = a1r[sb] = a1i[sb] = 0.0;
+    }
+}
+
+/* Pseudocode 88 */
+static void chirps(ac4_aspx_pair *p, int c, const uint8_t *tna, int n,
+                   double *out)
+{
+    int g;
+    if (p->n_tna[c] != n) {
+        for (g = 0; g < n; g++) {
+            p->chirp[c][g] = 0.0;
+            p->tna_prev[c][g] = 0;
+        }
+    }
+    for (g = 0; g < n; g++) {
+        double nc = NEW_CHIRP[p->tna_prev[c][g]][tna[g]];
+        if (nc < p->chirp[c][g])
+            nc = 0.75 * nc + 0.25 * p->chirp[c][g];
+        else
+            nc = 0.90625 * nc + 0.09375 * p->chirp[c][g];
+        out[g] = nc < 0.015625 ? 0.0 : nc;
+    }
+    for (g = 0; g < n; g++) {
+        p->chirp[c][g] = out[g];
+        p->tna_prev[c][g] = tna[g];
+    }
+    p->n_tna[c] = n;
+}
+
+/* aspx_tools.polyfit3: the normal equations, Gaussian elimination with
+   partial pivoting; -> coef[0..3], highest power first */
+static void polyfit3(int n, const double *x, const double *y, double *coef)
+{
+    double A[4][4], v[4], cf[4];
+    int r, c, i, k;
+    for (r = 0; r < 4; r++) {
+        for (c = 0; c < 4; c++) {
+            double s = 0.0;
+            for (i = 0; i < n; i++)
+                s += pow(x[i], (double)(r + c));
+            A[r][c] = s;
+        }
+        {
+            double s = 0.0;
+            for (i = 0; i < n; i++)
+                s += pow(x[i], (double)r) * y[i];
+            v[r] = s;
+        }
+    }
+    for (c = 0; c < 4; c++) {
+        int pv = c;
+        double best = fabs(A[c][c]);
+        for (r = c + 1; r < 4; r++)
+            if (fabs(A[r][c]) > best) {
+                best = fabs(A[r][c]);
+                pv = r;
+            }
+        if (pv != c) {
+            for (k = 0; k < 4; k++) {
+                double tmp = A[c][k];
+                A[c][k] = A[pv][k];
+                A[pv][k] = tmp;
+            }
+            {
+                double tmp = v[c];
+                v[c] = v[pv];
+                v[pv] = tmp;
+            }
+        }
+        if (A[c][c] == 0.0)
+            continue;
+        for (r = c + 1; r < 4; r++) {
+            double f = A[r][c] / A[c][c];
+            for (k = c; k < 4; k++)
+                A[r][k] = A[r][k] - f * A[c][k];
+            v[r] = v[r] - f * v[c];
+        }
+    }
+    for (r = 3; r >= 0; r--) {
+        double s = v[r];
+        for (k = r + 1; k < 4; k++)
+            s = s - A[r][k] * cf[k];
+        cf[r] = A[r][r] != 0.0 ? s / A[r][r] : 0.0;
+    }
+    for (r = 0; r < 4; r++)
+        coef[r] = cf[3 - r];
+}
+
+/* Pseudocode 85 over analysis slots [ta, tz) */
+static void preflat_gain(const ac4_aspx_pair *p, int c, int sbx,
+                         long long ta, long long tz, double *gv)
+{
+    double pw[64], x[64], poly[4], mean = 0.0;
+    int sb, k;
+    long long ts;
+    for (sb = 0; sb < sbx; sb++) {
+        double e = 0.0;
+        for (ts = ta; ts < tz; ts++) {
+            double re = p->are[c][QI(ts)][sb], im = p->aim[c][QI(ts)][sb];
+            e += re * re;
+            e += im * im;
+        }
+        pw[sb] = 10.0 * log10(e / (double)(tz - ta > 1 ? tz - ta : 1) + 1.0);
+        x[sb] = (double)sb;
+    }
+    for (sb = 0; sb < sbx; sb++)
+        mean += pw[sb];
+    mean /= sbx;
+    polyfit3(sbx, x, pw, poly);
+    for (sb = 0; sb < sbx; sb++) {
+        double sl = 0.0;
+        for (k = 3; k >= 0; k--)
+            sl += pow(x[sb], (double)k) * poly[3 - k];
+        gv[sb] = pow(10.0, (mean - sl) / 20.0);
+    }
+}
+
+/* Pseudocode 89 over analysis slots [ta, tz) into the output ring */
+static void generate(ac4_aspx_pair *p, int c, const ac4_aspx_tab *t,
+                     long long ta, long long tz, long long nts,
+                     const double *a0r, const double *a0i, const double *a1r,
+                     const double *a1i, const double *chirp, const double *gv)
+{
+    int i, sb, sum_sb = 0, g = 0;
+    long long ts;
+    for (i = 0; i < t->n_patches; i++) {
+        for (sb = 0; sb < t->patch_num_sb[i]; sb++) {
+            int hi = t->sbx + sum_sb + sb, pp = t->patch_start_sb[i] + sb;
+            double ch;
+            if (g + 1 <= t->n_noise && t->noise[g + 1] == hi)
+                g++;
+            ch = g < t->n_noise ? chirp[g] : 0.0;
+            for (ts = ta; ts < tz; ts++) {
+                double xr = p->are[c][QI(ts)][pp], xi = p->aim[c][QI(ts)][pp];
+                if (ch != 0.0) {
+                    double r2, i2, r4, i4, cr, ci;
+                    ana_at(p, c, ts - 2, nts, pp, &r2, &i2);
+                    ana_at(p, c, ts - 4, nts, pp, &r4, &i4);
+                    if (ts - 2 >= nts)
+                        r2 = i2 = 0.0;
+                    cr = ch * a0r[pp];
+                    ci = ch * a0i[pp];
+                    xr = xr + (cr * r2 - ci * i2);
+                    xi = xi + (cr * i2 + ci * r2);
+                    cr = ch * ch * a1r[pp];
+                    ci = ch * ch * a1i[pp];
+                    xr = xr + (cr * r4 - ci * i4);
+                    xi = xi + (cr * i4 + ci * r4);
+                }
+                if (gv) {
+                    double gg = 1.0 / gv[pp];
+                    xr = xr * gg;
+                    xi = xi * gg;
+                }
+                p->qre[c][QI(ts)][hi] = xr;
+                p->qim[c][QI(ts)][hi] = xi;
+            }
+        }
+        sum_sb += t->patch_num_sb[i];
     }
 }
 
@@ -514,7 +740,9 @@ static void estimate(const ac4_aspx_pair *p, int c, const ac4_aspx_tab *t,
 /* Pseudocodes 94..101 (aspx_envadj.adjust) */
 static void adjust(const ac4_aspx_tab *t, int n_sb, int n_env, mat_t sig,
                    mat_t est, mat_t noise, const ac4_aspx_framing *fr,
-                   mat_t gain_out, mat_t noise_out)
+                   const uint8_t (*sidx)[AC4_ASPX_MAX_ENV],
+                   const uint8_t (*area)[AC4_ASPX_MAX_ENV],
+                   mat_t gain_out, mat_t noise_out, mat_t sine_out)
 {
     /* Pseudocodes 95 and 99: the envelope at aspx_tsg_ptr (and at
        p_sine_at_end) has no noise factor in its gain and no noise term in
@@ -524,6 +752,7 @@ static void adjust(const ac4_aspx_tab *t, int n_sb, int n_env, mat_t sig,
     double gain[NSB][AC4_ASPX_MAX_ENV], noise_lev[NSB][AC4_ASPX_MAX_ENV];
     double maxg[NSB][AC4_ASPX_MAX_ENV], lim_gain[NSB][AC4_ASPX_MAX_ENV];
     double noise_lim[NSB][AC4_ASPX_MAX_ENV], boost[NSB][AC4_ASPX_MAX_ENV];
+    double sine_lev[NSB][AC4_ASPX_MAX_ENV];
     int k, e, i;
     (void)ZERO;
     for (e = 0; e < n_env; e++)
@@ -538,6 +767,12 @@ static void adjust(const ac4_aspx_tab *t, int n_sb, int n_env, mat_t sig,
                                   / (1.0 + noise[k][e]));
             snf = sig[k][e] / (1.0 + noise[k][e]);
             noise_lev[k][e] = sqrt(snf * noise[k][e]);
+            /* Pseudocodes 94, 95: the sinusoids */
+            sine_lev[k][e] = sqrt(snf * (double)sidx[k][e]);
+            if (area[k][e])
+                gain[k][e] = sqrt(sig[k][e] * noise[k][e]
+                                  / ((EPSILON + est[k][e])
+                                     * (1.0 + noise[k][e])));
             maxg[k][e] = 0.0;
             boost[k][e] = 1.0;
         }
@@ -586,7 +821,7 @@ static void adjust(const ac4_aspx_tab *t, int n_sb, int n_env, mat_t sig,
         if (hi <= lo)
             continue;
         for (e = 0; e < n_env; e++) {
-            double nom = 0.0, den = 0.0, dn = 0.0, v;
+            double nom = 0.0, den = 0.0, dn = 0.0, ds = 0.0, v;
             for (k = lo; k < hi; k++)
                 nom += sig[k][e];
             nom = EPSILON0 + nom;
@@ -594,8 +829,14 @@ static void adjust(const ac4_aspx_tab *t, int n_sb, int n_env, mat_t sig,
                 den += est[k][e] * (lim_gain[k][e] * lim_gain[k][e]);
             den = EPSILON0 + den;
             for (k = lo; k < hi; k++)
-                dn += noise_lim[k][e] * noise_lim[k][e];
-            den = den + (tr[e] ? 0.0 : dn);
+                ds += sine_lev[k][e] * sine_lev[k][e];
+            den = den + ds;
+            /* Pseudocode 99: the noise counts where there is no sinusoid
+               and the envelope is not a transient one */
+            for (k = lo; k < hi; k++)
+                dn += (sine_lev[k][e] == 0.0 && !tr[e])
+                      ? noise_lim[k][e] * noise_lim[k][e] : 0.0;
+            den = den + dn;
             v = np_min(sqrt(nom / den), MAX_BOOST_FACT);
             for (k = lo; k < hi; k++)
                 boost[k][e] = v;
@@ -605,7 +846,81 @@ static void adjust(const ac4_aspx_tab *t, int n_sb, int n_env, mat_t sig,
         for (e = 0; e < n_env; e++) {
             gain_out[k][e] = lim_gain[k][e] * boost[k][e];
             noise_out[k][e] = noise_lim[k][e] * boost[k][e];
+            sine_out[k][e] = sine_lev[k][e] * boost[k][e];
         }
+}
+
+/* Pseudocode 90, aspx_interpolation 0 (aspx_envadj.estimate_groups):
+   the mean energy over each subband group of the envelope's resolution */
+static void estimate_groups(const ac4_aspx_pair *p, int c,
+                            const ac4_aspx_tab *t,
+                            const ac4_aspx_framing *fr, const int *bd,
+                            int n_env, long long slot, long long nts,
+                            mat_t est)
+{
+    int n_sb = t->num_sb, e, k, g;
+    static double buf[64 * 2 * AC4_MAX_NTS];
+    for (k = 0; k < n_sb; k++)
+        for (e = 0; e < n_env; e++)
+            est[k][e] = 0.0;
+    for (e = 0; e < n_env; e++) {
+        long long ta = (long long)bd[e] * p->tia + p->tso + slot;
+        long long tz = (long long)bd[e + 1] * p->tia + p->tso + slot, ts;
+        const int *tab = fr->freq_res[e] ? t->hi : t->lo;
+        int ng = fr->freq_res[e] ? t->n_hi : t->n_lo;
+        if (ta < 0)
+            ta = 0;
+        if (tz > nts)
+            tz = nts;
+        if (tz <= ta)
+            continue;
+        for (g = 0; g < ng; g++) {
+            int n = 0, sb;
+            double m;
+            for (sb = tab[g]; sb < tab[g + 1]; sb++)
+                for (ts = ta; ts < tz; ts++) {
+                    double h = hypot(p->qre[c][QI(ts)][sb],
+                                     p->qim[c][QI(ts)][sb]);
+                    buf[n++] = h * h;
+                }
+            m = ac4_np_sum(buf, n) / (double)n;
+            for (sb = tab[g]; sb < tab[g + 1]; sb++)
+                est[sb - t->sbx][e] = m;
+        }
+    }
+}
+
+/* Pseudocodes 92, 93 for one channel: sine_idx_sb and sine_area_sb */
+static void sines(const ac4_aspx_pair *p, int c, const ac4_aspx_tab *t,
+                  const ac4_aspx_chd *d, int n_env,
+                  uint8_t (*sidx)[AC4_ASPX_MAX_ENV],
+                  uint8_t (*area)[AC4_ASPX_MAX_ENV])
+{
+    int e, g, k, n_sb = t->num_sb;
+    for (k = 0; k < n_sb; k++)
+        for (e = 0; e < n_env; e++)
+            sidx[k][e] = area[k][e] = 0;
+    for (e = 0; e < n_env; e++)
+        for (g = 0; g < t->n_hi; g++) {
+            int a = t->hi[g] - t->sbx, z = t->hi[g + 1] - t->sbx, mid;
+            if (!d->ah[g])
+                continue;
+            mid = (int)(0.5 * (double)(z + a));
+            if (e >= d->fr.tsg_ptr || d->fr.sine_at_end == 0
+                || (mid < p->n_sine_sb[c] && p->sine_sb[c][mid]))
+                sidx[mid][e] = 1;
+        }
+    for (e = 0; e < n_env; e++) {
+        const int *tab = d->fr.freq_res[e] ? t->hi : t->lo;
+        int ng = d->fr.freq_res[e] ? t->n_hi : t->n_lo;
+        for (g = 0; g < ng; g++) {
+            int a = tab[g] - t->sbx, z = tab[g + 1] - t->sbx, any = 0;
+            for (k = a; k < z; k++)
+                any |= sidx[k][e];
+            for (k = a; k < z; k++)
+                area[k][e] = (uint8_t)any;
+        }
+    }
 }
 
 /* the body of apply_hf_pair's loop for one frame at QMF slot `slot`;
@@ -676,22 +991,60 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
     b1 = joint ? b0 : d1->fr.borders;
     for (c = 0; c < 2; c++) {
         const int *bd = c ? b1 : b0;
-        int ne = c ? ne1 : ne0;
-        estimate(p, c, t, bd, ne, slot, nts, est);
+        int ne = c ? ne1 : ne0, si, sbase, last_si;
+        const ac4_aspx_chd *dc = c ? d1 : d0;
+        long long a0 = slot + p->tso, ta_i, tz_i, ts;
+        double ch[AC4_ASPX_MAX_NOISE], a0r[64], a0i[64], a1r[64], a1i[64];
+        double gv[64];
+        int any = 0, i;
+        uint8_t sidx[NSB][AC4_ASPX_MAX_ENV], area[NSB][AC4_ASPX_MAX_ENV];
+        mat_t sl;
+        ta_i = a0 + (long long)bd[0] * p->tia;
+        tz_i = a0 + (long long)bd[ne] * p->tia;
+        if (ta_i < 0)
+            ta_i = 0;
+        if (tz_i > nts)
+            tz_i = nts;
+        /* HF generation over the interval (Pseudocodes 85-89) */
+        chirps(p, c, dc->tna, t->n_noise, ch);
+        for (i = 0; i < t->n_noise; i++)
+            any |= ch[i] != 0.0;
+        if (any)
+            tna_alpha(p, c, t->sba, a0, nts, a0r, a0i, a1r, a1i);
+        else
+            for (i = 0; i < t->sba; i++)
+                a0r[i] = a0i[i] = a1r[i] = a1i[i] = 0.0;
+        if (f->preflat && tz_i > ta_i)
+            preflat_gain(p, c, sbx, ta_i, tz_i, gv);
+        if (tz_i > ta_i)
+            generate(p, c, t, ta_i, tz_i, nts, a0r, a0i, a1r, a1i, ch,
+                     f->preflat ? gv : NULL);
+        if (f->interpolation == 0)
+            estimate_groups(p, c, t, &dc->fr, bd, ne, slot, nts, est);
+        else
+            estimate(p, c, t, bd, ne, slot, nts, est);
+        sines(p, c, t, dc, ne, sidx, area);
         adjust(t, n_sb, ne, c ? sigB : sigA, est, c ? nsB : nsA,
-               c ? &d1->fr : &d0->fr, g, nl);
+               c ? &d1->fr : &d0->fr, (const uint8_t (*)[AC4_ASPX_MAX_ENV])
+               sidx, (const uint8_t (*)[AC4_ASPX_MAX_ENV])area, g, nl, sl);
         /* atsg_sig[0] in QMF slots: Pseudocode 103 counts the noise index
            from the start of the frame's first envelope */
         t0 = slot + (long long)bd[0] * p->tia + p->tso;
+        si = p->sine_idx[c];
+        sbase = si < 0 ? 1 : (si + 1) % 4;
+        last_si = si;
         for (e = 0; e < ne; e++) {
             long long ta = slot + (long long)bd[e] * p->tia + p->tso;
-            long long tz = slot + (long long)bd[e + 1] * p->tia + p->tso, ts;
+            long long tz = slot + (long long)bd[e + 1] * p->tia + p->tso;
+            int has_sine = 0;
             if (ta < 0)
                 ta = 0;
             if (tz > nts)
                 tz = nts;
             if (tz <= ta)
                 continue;
+            for (k = 0; k < n_sb; k++)
+                has_sine |= sl[k][e] != 0.0;
             for (ts = ta; ts < tz; ts++) {
                 double *qr = p->qre[c][QI(ts)], *qi = p->qim[c][QI(ts)];
                 for (k = 0; k < n_sb; k++) {
@@ -705,6 +1058,7 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
                 double *qr = p->qre[c][QI(ts)], *qi = p->qim[c][QI(ts)];
                 long long base = (long long)p->idx_noise
                                  + (long long)n_sb * (ts - t0);
+                int ix = (int)(((sbase + ts - t0) % 4 + 4) % 4);
                 for (k = 0; k < n_sb; k++) {
                     int kk = (int)((base + k + 1) % 512);
                     double lv = nl[k][e];
@@ -713,8 +1067,49 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
                     qr[sbx + k] += lv * nr - 0.0 * ni;
                     qi[sbx + k] += lv * ni + 0.0 * nr;
                 }
+                if (has_sine)
+                    for (k = 0; k < n_sb; k++) {
+                        /* Pseudocodes 104, 105 */
+                        double sgn = (k + sbx) % 2 ? -1.0 : 1.0;
+                        qr[sbx + k] += sl[k][e] * SINE_RE[ix];
+                        qi[sbx + k] += sl[k][e] * sgn * SINE_IM[ix];
+                    }
+                last_si = ix;
             }
         }
+        p->sine_idx[c] = last_si;
+        for (k = 0; k < n_sb; k++)
+            p->sine_sb[c][k] = ne > 0 ? sidx[k][ne - 1] : 0;
+        p->n_sine_sb[c] = n_sb;
+        /* interleaved waveform coding (5.7.6.5.3): the core above sbx is
+           added in the FIC groups and replaces the band in the TIC slots */
+        if (dc->has_fic)
+            for (i = 0; i < t->n_hi; i++) {
+                int sb;
+                if (!dc->fic[i])
+                    continue;
+                for (sb = t->hi[i]; sb < t->hi[i + 1]; sb++)
+                    for (ts = ta_i; ts < tz_i; ts++) {
+                        p->qre[c][QI(ts)][sb] += p->are[c][QI(ts)][sb];
+                        p->qim[c][QI(ts)][sb] += p->aim[c][QI(ts)][sb];
+                    }
+            }
+        if (dc->has_tic)
+            for (i = 0; i < p->nats; i++) {
+                long long a_ = a0 + (long long)i * p->tia, z_ = a_ + p->tia;
+                int sb;
+                if (!dc->tic[i])
+                    continue;
+                if (a_ < 0)
+                    a_ = 0;
+                if (z_ > nts)
+                    z_ = nts;
+                for (ts = a_; ts < z_; ts++)
+                    for (sb = sbx; sb < sbx + n_sb; sb++) {
+                        p->qre[c][QI(ts)][sb] = p->are[c][QI(ts)][sb];
+                        p->qim[c][QI(ts)][sb] = p->aim[c][QI(ts)][sb];
+                    }
+            }
     }
     p->n_applied++;
     {
@@ -947,13 +1342,12 @@ int ac4_aspx_pair_push(ac4_aspx_pair *p, const ac4_qmf_tables *q,
     for (c = 0; c < 2; c++)
         for (i = 0; i < nt; i++) {
             long long ts = s0 + i;
-            const ac4_aspx_frame *own = i < p->tso ? &p->prev : f;
-            double *re = p->qre[c][QI(ts)], *im = p->qim[c][QI(ts)];
+            double *re = p->are[c][QI(ts)], *im = p->aim[c][QI(ts)];
             qmf_analyse_slot(q, p->ana[c], x[c] + 64 * i, re, im);
-            if (j == 0 && i < p->tso)
-                own = NULL;               /* no frame before the first */
-            if (own && effective(own))
-                hf_generate(&own->tab, re, im);
+            /* the output starts as the core; apply_frame generates the
+               high band over each interval */
+            memcpy(p->qre[c][QI(ts)], re, sizeof(p->qre[c][0]));
+            memcpy(p->qim[c][QI(ts)], im, sizeof(p->qim[c][0]));
         }
     if (j >= 1) {
         apply_frame(p, &p->prev, s0 - nt, s0 + nt);
