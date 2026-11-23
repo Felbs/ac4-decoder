@@ -375,13 +375,21 @@ class Ac4Stream:
         do not close. Only when at least LATE_MAJORITY of the judged frames
         close: otherwise the configuration evidently changed at the I-frame
         and nothing is concluded. Frames whose framing needs a
-        previous_stop_pos from before the pass are not judged."""
+        previous_stop_pos from before the pass are not judged, nor are
+        frames concealed for another reason (each frame is counted once,
+        under its first reason)."""
         from .toc import Bits
         cfg, acfg = self.cfg, self.acpl_cfg
         t = R37.t_for(cfg)
         state = RB.TrackingState()
         verdicts = []
         for pd in pending:
+            if self.status[pd["fi"]] is not None:
+                # concealed already (a rule checked after the frame was
+                # put on this list): it is not judged again, counted
+                # again, nor does its A-SPX feed the tracking state (the
+                # decode rolled its state back too)
+                continue
             state.missing = False
             b = Bits(pd["sub"])
             b.p = pd["bits"]

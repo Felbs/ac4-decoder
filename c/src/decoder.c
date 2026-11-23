@@ -707,8 +707,9 @@ static void late_closure(ac4dec *d)
             if (ver[i] != 0)
                 continue;
             r = rec_at(d, d->pend[i].index);
-            if (!r)
-                continue;           /* already synthesised: too late */
+            if (!r || r->code != AC4E_NONE)
+                continue;           /* already synthesised: too late; or
+                                       concealed already */
             brk = r->seq_jump;      /* (the Python keeps seq_break) */
             rec_conceal(d, r, AC4E_AUDIO_LATE);
             r->seq_jump = brk;
@@ -953,6 +954,14 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
 
 fail:
     d->fstate = fstate0;
+    /* a frame concealed after it was put on the late list (a rule checked
+       after add_pending) is not judged by the late check: it keeps its
+       reason, is counted once, and its A-SPX does not feed the check's
+       tracking state */
+    if (d->n_pend && d->pend[d->n_pend - 1].index == r->index) {
+        free(d->pend[d->n_pend - 1].sub);
+        d->n_pend--;
+    }
     rec_conceal(d, r, code);
     {
         int nxt = has_next ? peek_counter(nx, nx_len) : -1;

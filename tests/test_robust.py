@@ -377,3 +377,44 @@ def test_cli_reports_concealed_frames(tmp_path, capsys):
     n_ch, rate, raw = CU.wav_data(out)
     assert len(raw) // (2 * n_ch) == -(-n * 1536 * 1001 // 960)
     assert "5 concealed" in text, text
+
+
+def test_late_closure_counts_an_already_concealed_frame_once(monkeypatch):
+    """A frame put on the pending list and then concealed for another
+    reason keeps that reason: _late_closure neither re-marks it nor counts
+    it in n_bad a second time (nor takes it off n_ok, which never had
+    it); a frame that was accepted and does not close is concealed."""
+    from ac4 import stream as ST
+    s = ST.Ac4Stream("pair")
+    s.cfg = {"stub": 1}
+    monkeypatch.setattr(ST.R37, "t_for", lambda cfg: {})
+
+    def fake_aspx(b, tabs, t, cfg, nats, ifr, two, state, gi):
+        if bytes(b.d[:3]) == b"BAD":
+            b.p += 100                  # runs past audio_size: no close
+    monkeypatch.setattr(ST.P, "aspx_data", fake_aspx)
+    n = 20
+    bad_already, bad_late = 5, 9
+    pending, wins, lengths, counts = [], {}, {}, {}
+    for k in ("L", "R"):
+        wins[k] = [np.ones(1536) for _ in range(n)]
+        lengths[k] = [1536] * n
+        counts[k] = [1] * n
+    for fi in range(n):
+        sub = b"BAD" if fi in (bad_already, bad_late) else b"\0\0\0"
+        pending.append(dict(fi=fi, sub=sub + bytes(13), bits=0, ifr=False,
+                            start=0, size=0, acpl3=False, five=False,
+                            wpos={"L": fi, "R": fi}))
+    groups = {"lr": [None] * n, "sr": [None] * n}
+    s.status = [None] * n
+    s.status[bad_already] = "asf.level"
+    s.n_ok, s.n_bad = n - 1, 1
+    s.damage.add("asf.level")
+    s._late_closure(pending, wins, lengths, counts, groups)
+    assert s.status[bad_already] == "asf.level"
+    assert s.status[bad_late] == "audio_size.late"
+    assert s.n_bad == 2 and s.n_ok == n - 2
+    assert s.n_ok + s.n_bad == n
+    assert s.damage.reasons["audio_size.late"] == 1
+    assert groups["lr"][bad_late] is ST.CONCEALED
+    assert not wins["L"][bad_late].any()
