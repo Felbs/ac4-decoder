@@ -426,6 +426,22 @@ takes `presentation`, `presentation_id` and `language`, and
 `ac4dec_presentations()` lists a frame's presentations. `ac4dec-c IN
 --list`, `--presentation`, `--language` as the Python CLI.
 
+**Phase A figures** (2026-11-23): against the Python on the 12 distinct
+captures, largest difference 4.19e-15 of full scale, 16-bit WAVs
+identical, same per-frame statuses; on the 7 containers of a public
+29.97 fps stereo test signal (sync frames, TS, MP4 with and without
+fragments, muxed with video) 4.45e-15, nothing concealed. Damaged input
+(`robust_compare.py`, 7 cuts, 12 kinds x 20 seeds): the C at the default
+lookahead gives the Python's figures exactly: 11,046 damaged frames, 8,191
+concealed, 984 identical, 1,868 bounded, 3 LOUD, 127 undamaged frames
+concealed, worst peak 4.42x, 3 failing decodes (6 gate messages); at
+lookahead 8: 5 LOUD, 161 collateral, 5 failing decodes (10 messages). This
+is somewhat worse than before phase A (2 LOUD, 75 collateral, 4 messages):
+the high bands now sit at their true level and the centre is on the QMF
+path, so damage there reaches further. On the clean cuts nothing is
+concealed and the guard changes nothing. `make asan` passes (also on two
+capture cuts).
+
 **Status.** It decodes what this package decodes (above), with the same
 damaged-input rules and output guard, as a delay line: frames come out
 `lookahead` frames after they go in (default 180, 6 s; minimum 8 for live
@@ -450,10 +466,14 @@ time; Python with its C kernels built):
 
 | stream | length | Python | C |
 |---|---|---|---|
-| 5.1, codec mode 1 (A-SPX), broadcaster A | 10 s | 4.2x | 23.8x |
-| stereo, broadcaster A | 10 s | 9.1x | 50.0x |
-| 5.1 sent as ASPX_ACPL_3 (A-CPL upmix), broadcaster B | 42 s | 3.5x | 24.5x |
-| stereo, broadcaster B | 42 s | 9.1x | 55.3x |
+| 5.1, codec mode 1 (A-SPX), broadcaster A | 10 s | 3.6x | 20.0x |
+| stereo, broadcaster A | 10 s | 9.1x | 55.6x |
+| 5.1 sent as ASPX_ACPL_3 (A-CPL upmix), broadcaster B | 42 s | 3.5x | 25.1x |
+| stereo, broadcaster B | 42 s | 9.1x | 60.1x |
+
+(Re-measured after phase A. Broadcaster A's 5.1 is 15 % slower: the
+centre now goes through the A-SPX renderer, as a pair of the same
+channel, i.e. two more QMF channels.)
 
 The upmix halves the speed on broadcaster B's 5.1 (7.5x / 51.7x with its
 stereo core only): half the C's time is now QMF synthesis, of seven
