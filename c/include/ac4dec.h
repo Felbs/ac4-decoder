@@ -8,7 +8,7 @@
  *
  * Milestone 1 does NOT render A-SPX or A-CPL: streams that use them decode
  * to their core band (what the Python decoder gives with A-SPX rendering
- * disabled). See c/README.md.
+ * disabled). What milestone 1 leaves out is listed in src/decoder.c.
  *
  * Damaged input never crashes the decoder and never changes the output
  * length: every frame gives exactly one frame of samples (1536 at the

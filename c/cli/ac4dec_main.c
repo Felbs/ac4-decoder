@@ -2,7 +2,7 @@
 /*
  * ac4dec-c -- decode the AC-4 audio track of a fragmented MP4 file to WAV.
  * The C port of `ac4dec` (ac4/cli.py), milestone 1 (core only: no A-SPX,
- * no A-CPL; see c/README.md).
+ * no A-CPL; see include/ac4dec.h).
  *
  *   ac4dec-c IN.m4s OUT.wav [--element auto|5_X|pair] [--channels 2|6]
  *            [--seconds S] [--max-pass N] [--ref-peak X] [--f64 RAW]

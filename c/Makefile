@@ -44,11 +44,20 @@ test: tests/unit_test tests/fuzz_test
 	./tests/unit_test
 	./tests/fuzz_test
 
+# the damaged-input gate under AddressSanitizer + UBSan (slow)
+SAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
+tests/fuzz_test_asan: tests/fuzz_test.c $(SRC) $(HDR)
+	$(CC) $(filter-out -O2,$(CFLAGS)) $(SAN) -o $@ tests/fuzz_test.c $(SRC) $(LDLIBS)
+
+asan: tests/fuzz_test_asan
+	./tests/fuzz_test_asan
+
 # regenerate the tables from ac4/tables/*.json (needs python3)
 tables:
 	python3 tools/gen_tables.py > src/ac4_tables.c
 
 clean:
-	rm -f $(OBJ) libac4dec.a libac4dec.so ac4dec-c tests/unit_test tests/fuzz_test
+	rm -f $(OBJ) libac4dec.a libac4dec.so ac4dec-c tests/unit_test tests/fuzz_test \
+	      tests/fuzz_test_asan
 
-.PHONY: all test clean tables
+.PHONY: all test asan clean tables

@@ -1,0 +1,371 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/*
+ * Damaged-input gate for libac4dec.
+ *
+ *   tests/fuzz_test [CAPTURE.m4s ...]
+ *
+ * Without captures: garbage, empty, NULL and truncated frames, and damaged
+ * MP4 boxes. With captures (arguments, or AC4_TEST_FILES as a colon-
+ * separated list): each capture is decoded clean, then damaged
+ * deterministically (bit flips, byte bursts, truncation, zeroed bytes,
+ * garbage, empty, swapped, repeated and extended frames, runs of damaged
+ * frames, a damaged first-frame TOC) over several seeds, and the MP4
+ * container itself is damaged.
+ *
+ * Required: no crash (build the _asan variant to check memory errors too),
+ * every frame gives exactly the samples the timeline owes it, every sample
+ * is finite. Reported (not gated: the output guard of robust.py is not in
+ * milestone 1): concealed counts and the worst peak against the clean
+ * decode's own peak.
+ */
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "ac4dec.h"
+#include "ac4dec_mp4.h"
+
+static unsigned long long rng_s = 88172645463325252ull;
+
+static unsigned rnd(void)
+{
+    rng_s ^= rng_s << 13;
+    rng_s ^= rng_s >> 7;
+    rng_s ^= rng_s << 17;
+    return (unsigned)(rng_s >> 11);
+}
+
+static int fails;
+
+#define CHECK(c, ...) do { if (!(c)) { fails++; fprintf(stderr, "FAIL: " __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
+
+typedef struct {
+    const uint8_t *p;
+    size_t n;
+} frame_t;
+
+/* decode a frame list; -> peak, checks timing and finiteness */
+static double run(frame_t *fr, long n, ac4dec_element el, int internal,
+                  long *n_conc, double *clean_pk_frames, double *worst_ratio)
+{
+    ac4dec_config cfg;
+    ac4dec *d;
+    long i, total = 0;
+    double pk = 0.0;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.element = el;
+    cfg.internal_rate = internal;
+    d = ac4dec_open(&cfg);
+    if (!d) {
+        CHECK(0, "open failed");
+        return 0.0;
+    }
+    *n_conc = 0;
+    for (i = 0; i < n; i++) {
+        ac4dec_frame o;
+        long want;
+        int c, k, st = ac4dec_decode_frame(d, fr[i].p, fr[i].n, &o);
+        double fpk = 0.0;
+        CHECK(st == AC4DEC_OK || st == AC4DEC_CONCEALED || st == AC4DEC_BAD,
+              "bad status %d", st);
+        if (st != AC4DEC_OK)
+            (*n_conc)++;
+        if (internal) {
+            want = 1536;
+        } else {
+            long long tot = (long long)(i + 1) * 1536;
+            want = (long)((tot * 1001 + 959) / 960) - total;
+        }
+        CHECK(o.n_samples == want, "frame %ld: %d samples, want %ld", i,
+              o.n_samples, want);
+        total += o.n_samples;
+        CHECK(o.n_channels >= 1 && o.n_channels <= 6, "channels %d",
+              o.n_channels);
+        for (c = 0; c < o.n_channels; c++)
+            for (k = 0; k < o.n_samples; k++) {
+                double v = o.pcm[c][k];
+                if (!isfinite(v)) {
+                    CHECK(0, "non-finite sample");
+                    break;
+                }
+                if (fabs(v) > fpk)
+                    fpk = fabs(v);
+            }
+        if (fpk > pk)
+            pk = fpk;
+        if (clean_pk_frames && worst_ratio && clean_pk_frames[0] > 0) {
+            double r = fpk / clean_pk_frames[0];
+            if (r > *worst_ratio)
+                *worst_ratio = r;
+        }
+    }
+    ac4dec_close(d);
+    return pk;
+}
+
+static void synthetic(void)
+{
+    static uint8_t buf[300][4000];
+    frame_t fr[300];
+    long n_conc, i;
+    int el, internal;
+    for (i = 0; i < 300; i++) {
+        size_t n = rnd() % 4000, k;
+        for (k = 0; k < n; k++)
+            buf[i][k] = (uint8_t)rnd();
+        if (i % 7 == 0)
+            n = 0;
+        if (i % 11 == 0)
+            n = rnd() % 6;
+        if (i % 13 == 0) {
+            /* a plausible TOC head: version 2, counter, 48 kHz, 29.97 */
+            buf[i][0] = 0x80;
+            buf[i][1] = (uint8_t)(i & 0x0f);
+            buf[i][2] = 0x0d;
+        }
+        fr[i].p = (i % 17 == 0) ? NULL : buf[i];
+        fr[i].n = fr[i].p ? n : 0;
+    }
+    for (el = 0; el <= 2; el++)
+        for (internal = 0; internal <= 1; internal++)
+            run(fr, 300, (ac4dec_element)el, internal, &n_conc, NULL, NULL);
+    /* the MP4 reader on garbage */
+    for (i = 0; i < 200; i++) {
+        ac4mp4_sample *s = NULL;
+        size_t n = rnd() % 4000, k;
+        long cnt;
+        for (k = 0; k < n; k++)
+            buf[0][k] = (uint8_t)rnd();
+        if (n >= 16 && i % 2) {
+            memcpy(buf[0] + 4, "moof", 4);
+            buf[0][0] = 0;
+            buf[0][1] = 0;
+        }
+        cnt = ac4mp4_samples(buf[0], n, &s);
+        CHECK(cnt >= 0, "mp4 reader failed on garbage");
+        free(s);
+    }
+    printf("synthetic garbage: done\n");
+}
+
+enum { K_FLIP, K_BURST, K_TRUNC, K_ZERO, K_GARBAGE, K_EMPTY, K_SWAP,
+       K_REPEAT, K_EXTEND, K_RUN, K_TOC0, K_COUNT };
+static const char *KNAME[K_COUNT] = { "bitflip", "burst", "truncate",
+    "zeroed", "garbage", "empty", "swap", "repeat", "extend", "run",
+    "toc0" };
+
+static void capture(const char *path, int seeds)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t *data;
+    long sz, n, i, n_conc, k;
+    ac4mp4_sample *smp = NULL;
+    frame_t *fr, *dm;
+    uint8_t **own;
+    double clean_pk, worst = 0.0;
+    long conc_total = 0, dmg_total = 0;
+    ac4dec_element el;
+    if (!f) {
+        fprintf(stderr, "cannot read %s\n", path);
+        fails++;
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    data = (uint8_t *)malloc((size_t)sz);
+    if (!data || fread(data, 1, (size_t)sz, f) != (size_t)sz) {
+        fclose(f);
+        fails++;
+        return;
+    }
+    fclose(f);
+    n = ac4mp4_samples(data, (size_t)sz, &smp);
+    if (n > 600)
+        n = 600;                       /* 20 s per capture is plenty */
+    if (n <= 0) {
+        fprintf(stderr, "%s: no frames\n", path);
+        fails++;
+        free(data);
+        return;
+    }
+    fr = (frame_t *)malloc(sizeof(frame_t) * (size_t)n);
+    dm = (frame_t *)malloc(sizeof(frame_t) * (size_t)(n + 32));
+    own = (uint8_t **)calloc((size_t)(n + 32), sizeof(uint8_t *));
+    for (i = 0; i < n; i++) {
+        fr[i].p = data + smp[i].off;
+        fr[i].n = smp[i].len;
+    }
+    el = AC4DEC_ELEMENT_AUTO;
+    for (i = 0; i < n && el == AC4DEC_ELEMENT_AUTO; i++)
+        el = ac4dec_probe(fr[i].p, fr[i].n);
+    clean_pk = run(fr, n, el, 0, &n_conc, NULL, NULL);
+    CHECK(n_conc == 0, "%s: %ld clean frames concealed", path, n_conc);
+    for (k = 0; k < K_COUNT; k++) {
+        int s;
+        for (s = 0; s < seeds; s++) {
+            long m = n, j, hits = 0;
+            double wr = 0.0;
+            rng_s = 0x9E3779B97F4A7C15ull * (unsigned long long)(k * 101 + s + 1);
+            for (i = 0; i < n; i++)
+                dm[i] = fr[i];
+            for (i = 0; i < n + 32; i++) {
+                free(own[i]);
+                own[i] = NULL;
+            }
+            for (j = 0; j < 6; j++) {
+                long at = k == K_TOC0 ? 0
+                    : 1 + (long)(rnd() % (unsigned)(n - 2));
+                uint8_t *cp;
+                size_t L = dm[at].n, q;
+                hits++;
+                switch (k) {
+                case K_SWAP:
+                    if (at + 1 < m) {
+                        frame_t t = dm[at];
+                        dm[at] = dm[at + 1];
+                        dm[at + 1] = t;
+                    }
+                    continue;
+                case K_REPEAT:
+                    if (at > 0)
+                        dm[at] = dm[at - 1];
+                    continue;
+                case K_EMPTY:
+                    dm[at].n = 0;
+                    continue;
+                default:
+                    break;
+                }
+                cp = (uint8_t *)malloc(L + 64);
+                if (!cp)
+                    continue;
+                memcpy(cp, dm[at].p, L);
+                free(own[at]);
+                own[at] = cp;
+                dm[at].p = cp;
+                switch (k) {
+                case K_FLIP:
+                    for (q = 0; q < 3 && L; q++)
+                        cp[rnd() % L] ^= (uint8_t)(1u << (rnd() % 8));
+                    break;
+                case K_BURST:
+                    if (L > 8) {
+                        size_t o = rnd() % (L - 8);
+                        for (q = 0; q < 8; q++)
+                            cp[o + q] = (uint8_t)rnd();
+                    }
+                    break;
+                case K_TRUNC:
+                    dm[at].n = L ? rnd() % L : 0;
+                    break;
+                case K_ZERO:
+                    if (L > 16) {
+                        size_t o = rnd() % (L - 16);
+                        memset(cp + o, 0, 16);
+                    }
+                    break;
+                case K_GARBAGE:
+                    for (q = 0; q < L; q++)
+                        cp[q] = (uint8_t)rnd();
+                    break;
+                case K_EXTEND:
+                    for (q = 0; q < 64; q++)
+                        cp[L + q] = (uint8_t)rnd();
+                    dm[at].n = L + 64;
+                    break;
+                case K_RUN: {
+                    long r, len = 3 + (long)(rnd() % 18);
+                    for (r = at; r < at + len && r < m; r++) {
+                        if (r != at) {
+                            uint8_t *c2 = (uint8_t *)malloc(dm[r].n + 1);
+                            if (!c2)
+                                break;
+                            memcpy(c2, dm[r].p, dm[r].n);
+                            free(own[r]);
+                            own[r] = c2;
+                            dm[r].p = c2;
+                        }
+                        for (q = 0; q < 4 && dm[r].n; q++)
+                            ((uint8_t *)dm[r].p)[rnd() % dm[r].n] ^= 0xff;
+                    }
+                    break;
+                }
+                case K_TOC0:
+                    if (L > 4)
+                        cp[1 + rnd() % 4] ^= (uint8_t)(1u << (rnd() % 8));
+                    j = 6;
+                    break;
+                default:
+                    break;
+                }
+            }
+            {
+                double pk1 = clean_pk;
+                run(dm, m, el, 0, &n_conc, &pk1, &wr);
+                if (wr > worst)
+                    worst = wr;
+                conc_total += n_conc;
+                dmg_total += hits;
+            }
+        }
+        printf("  %-9s ok\n", KNAME[k]);
+        fflush(stdout);
+    }
+    /* damaged container */
+    for (k = 0; k < 40; k++) {
+        uint8_t *cp = (uint8_t *)malloc((size_t)sz);
+        ac4mp4_sample *s2 = NULL;
+        long cnt, q;
+        memcpy(cp, data, (size_t)sz);
+        rng_s = 1234567ull + (unsigned long long)k;
+        for (q = 0; q < 8; q++)
+            cp[rnd() % (unsigned long)(sz > 4096 ? 4096 : sz)] ^= (uint8_t)rnd();
+        for (q = 0; q < 8; q++)
+            cp[rnd() % (unsigned long)sz] ^= (uint8_t)rnd();
+        cnt = ac4mp4_samples(cp, (size_t)(k % 2 ? sz : sz - (long)(rnd() % 1000)),
+                             &s2);
+        CHECK(cnt >= 0, "mp4 reader failed");
+        for (q = 0; q < cnt; q++)
+            CHECK(s2[q].len == 0 || s2[q].off + s2[q].len <= (size_t)sz,
+                  "sample outside the input");
+        free(s2);
+        free(cp);
+    }
+    printf("%s: %ld frames, clean peak %.4g; %ld damage hits -> %ld frames "
+           "not OK; worst frame peak %.2fx the clean peak\n", path, n,
+           clean_pk, dmg_total, conc_total, worst);
+    for (i = 0; i < n + 32; i++)
+        free(own[i]);
+    free(own);
+    free(fr);
+    free(dm);
+    free(smp);
+    free(data);
+}
+
+int main(int argc, char **argv)
+{
+    int i, seeds = 3;
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    const char *env = getenv("AC4_TEST_FILES");
+    if (getenv("AC4_FUZZ_SEEDS"))
+        seeds = atoi(getenv("AC4_FUZZ_SEEDS"));
+    synthetic();
+    for (i = 1; i < argc; i++)
+        capture(argv[i], seeds);
+    if (argc < 2 && env && *env) {
+        char *list = (char *)malloc(strlen(env) + 1), *p, *save = NULL;
+        strcpy(list, env);
+        for (p = strtok_r(list, ":", &save); p; p = strtok_r(NULL, ":", &save))
+            capture(p, seeds);
+        free(list);
+    }
+    if (fails) {
+        printf("FUZZ GATE FAILED (%d)\n", fails);
+        return 1;
+    }
+    printf("FUZZ GATE PASS\n");
+    return 0;
+}
