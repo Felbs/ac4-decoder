@@ -29,9 +29,16 @@ unusable (skipped). A sample whose size or offset points outside the mdat
 is returned as an EMPTY frame, so the sample count -- and so the timeline
 -- is kept; the decoder conceals it.
 
-Not handled (stage 1): the 'dac4' decoder-specific box is not parsed (the
-decoder reads everything from the in-band table of contents), raw AC-4
-sync frames, MPEG-TS, and non-fragmented MP4 (stsz/stco sample tables).
+NON-FRAGMENTED MP4. The AC-4 track's sample table (stsz or stz2, stsc,
+stco or co64; ISO/IEC 14496-12 8.7) gives its samples; a file can carry
+both (samples in the moov, then fragments), and they come out in that
+order. A sample outside the file is passed on empty.
+
+THE DAC4 BOX. `dac4_payload` returns the AC4SpecificBox payload of the
+AC-4 sample entry and `parse_dac4` reads its ac4_dsi_v1 (TS 103 190-2
+E.6): the stream's rates and, per presentation, what a player needs to
+list and choose it (container.py, cli.py). Raw sync frames and MPEG-TS
+are read by container.py.
 """
 from __future__ import annotations
 
@@ -96,6 +103,119 @@ def ac4_track_ids(d):
                 if et == b"ac-4":
                     out.append(tid)
                 break
+    return out
+
+
+def _ac4_traks(d):
+    """Yield (trak_offset, trak_size, track_id, stbl or None, entry) for each
+    trak of the moov whose first sample entry is 'ac-4' (entry: (offset,
+    size) of that sample entry box)."""
+    for o, sz, t in boxes(d):
+        if t != b"moov":
+            continue
+        for to, tsz, tt in boxes(d, o + 8, o + sz):
+            if tt != b"trak":
+                continue
+            tkhd = _child(d, to, tsz, b"tkhd")
+            if not tkhd:
+                continue
+            ver = d[tkhd[0] + 8]
+            tid_at = tkhd[0] + 12 + (16 if ver == 1 else 8)
+            tid = int.from_bytes(d[tid_at:tid_at + 4], "big")
+            p = (to, tsz)
+            for name in (b"mdia", b"minf", b"stbl"):
+                p = _child(d, p[0], p[1], name)
+                if not p:
+                    break
+            if not p:
+                continue
+            stbl = p
+            stsd = _child(d, stbl[0], stbl[1], b"stsd")
+            if not stsd:
+                continue
+            for eo, esz, et in boxes(d, stsd[0] + 16, stsd[0] + stsd[1]):
+                if et == b"ac-4":
+                    yield to, tsz, tid, stbl, (eo, esz)
+                break
+
+
+def dac4_payload(d):
+    """-> the payload of the dac4 box of the first AC-4 sample entry, or
+    None. AudioSampleEntry: 8-byte box header + 28 bytes, then boxes."""
+    for _to, _tsz, _tid, _stbl, (eo, esz) in _ac4_traks(bytes(d)):
+        for co, csz, ct in boxes(d, eo + 36, eo + esz):
+            if ct == b"dac4":
+                return bytes(d[co + 8:co + csz])
+        return None
+    return None
+
+
+def _u(d, o, n=4):
+    return int.from_bytes(d[o:o + n], "big")
+
+
+def table_samples(d, stbl):
+    """-> [(abs_offset, size)] from a stbl's sample table (stsz/stz2, stsc,
+    stco/co64), or [] when it has none."""
+    so, ssz = stbl
+    stsz = _child(d, so, ssz, b"stsz")
+    stz2 = _child(d, so, ssz, b"stz2")
+    stsc = _child(d, so, ssz, b"stsc")
+    stco = _child(d, so, ssz, b"stco")
+    co64 = _child(d, so, ssz, b"co64")
+    if not stsc or not (stco or co64) or not (stsz or stz2):
+        return []
+    # sizes
+    if stsz:
+        o, bsz = stsz
+        fixed, n = _u(d, o + 12), _u(d, o + 16)
+        if n > MAX_SAMPLES * 64 or (not fixed and o + 20 + 4 * n > o + bsz):
+            return []
+        sizes = ([fixed] * n if fixed else
+                 [_u(d, o + 20 + 4 * i) for i in range(n)])
+    else:
+        o, bsz = stz2
+        fs, n = d[o + 15], _u(d, o + 16)
+        if fs not in (4, 8, 16) or o + 20 + (n * fs + 7) // 8 > o + bsz:
+            return []
+        if fs == 4:
+            sizes = [(d[o + 20 + i // 2] >> (4 if i % 2 == 0 else 0)) & 15
+                     for i in range(n)]
+        else:
+            w = fs // 8
+            sizes = [_u(d, o + 20 + w * i, w) for i in range(n)]
+    # chunk offsets
+    if stco:
+        o, bsz = stco
+        nc = _u(d, o + 12)
+        if o + 16 + 4 * nc > o + bsz:
+            return []
+        chunks = [_u(d, o + 16 + 4 * i) for i in range(nc)]
+    else:
+        o, bsz = co64
+        nc = _u(d, o + 12)
+        if o + 16 + 8 * nc > o + bsz:
+            return []
+        chunks = [_u(d, o + 16 + 8 * i, 8) for i in range(nc)]
+    # sample-to-chunk
+    o, bsz = stsc
+    ne = _u(d, o + 12)
+    if o + 16 + 12 * ne > o + bsz:
+        return []
+    runs = [(_u(d, o + 16 + 12 * i), _u(d, o + 20 + 12 * i))
+            for i in range(ne)]
+    out = []
+    k = 0
+    for ri, (first, per) in enumerate(runs):
+        last = runs[ri + 1][0] - 1 if ri + 1 < len(runs) else len(chunks)
+        for c in range(first - 1, min(last, len(chunks))):
+            pos = chunks[c]
+            for _ in range(per):
+                if k >= len(sizes):
+                    return out
+                out.append((pos, sizes[k]))
+                pos += sizes[k]
+                k += 1
     return out
 
 
@@ -208,6 +328,15 @@ def frames(data, track_id=None):
             ids = []
         track_id = ids[0] if ids else None
     out = []
+    # a non-fragmented file (or the moov part of one): its sample table
+    try:
+        for _to, _tsz, tid, stbl, _e in _ac4_traks(d):
+            if track_id is None or tid == track_id:
+                out.extend(d[p:p + s] if p + s <= len(d) else b""
+                           for p, s in table_samples(d, stbl))
+                break
+    except (IndexError, ValueError):              # a damaged moov
+        pass
     tops = list(boxes(d))
     for i, (o, sz, t) in enumerate(tops):
         if t != b"moof":
@@ -235,3 +364,140 @@ def read_frames(path, track_id=None):
     """frames() on a file."""
     with open(path, "rb") as fh:
         return frames(fh.read(), track_id)
+
+
+# ---------------------------------------------------------------- dac4
+class _B:
+    """MSB-first reader for the DSI (raises IndexError at the end)."""
+
+    def __init__(self, d):
+        self.d, self.p = d, 0
+
+    def u(self, n):
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | ((self.d[self.p >> 3] >> (7 - (self.p & 7))) & 1)
+            self.p += 1
+        return v
+
+    def align(self):
+        self.p = (self.p + 7) & ~7
+
+
+def _substream_group_dsi(b):
+    g = dict(substreams_present=b.u(1), hsf_ext=b.u(1),
+             channel_coded=b.u(1), n_substreams=b.u(8),
+             content_classifier=None, language=None)
+    for _ in range(g["n_substreams"]):
+        b.u(2)                                       # dsi_sf_multiplier
+        if b.u(1):
+            b.u(5)
+        if g["channel_coded"]:
+            b.u(6)
+            b.u(18)                                  # channel groups
+        else:
+            if b.u(1):                               # b_ajoc
+                if b.u(1) == 0:
+                    b.u(4)
+                b.u(6)
+            b.u(4)
+    if b.u(1):                                       # b_content_type
+        g["content_classifier"] = b.u(3)
+        if b.u(1):
+            n = b.u(6)
+            g["language"] = bytes(b.u(8) for _ in range(n)).decode(
+                "ascii", "replace")
+    return g
+
+
+def _presentation_v1_dsi(b, start, pres_bytes):
+    p = dict(config=b.u(5), md_compat=None, presentation_id=None,
+             channel_mode=None, groups=[], enabled=True,
+             pre_virtualized=None, name=None)
+    if p["config"] != 0x06:
+        p["md_compat"] = b.u(3)
+        if b.u(1):
+            p["presentation_id"] = b.u(5)
+        b.u(2)                                       # frame rate multiply
+        b.u(2)                                       # frame rate fraction
+        b.u(5)                                       # emdf version
+        b.u(10)                                      # key id
+        if b.u(1):                                   # channel coded
+            cm = b.u(5)
+            p["channel_mode"] = cm
+            if cm in (11, 12, 13, 14):
+                b.u(1)
+                b.u(2)
+            b.u(6)
+            b.u(18)
+        if b.u(1):                                   # core differs
+            if b.u(1):
+                b.u(2)
+        if b.u(1):                                   # b_presentation_filter
+            p["enabled"] = bool(b.u(1))
+            for _ in range(b.u(8)):
+                b.u(8)
+        if p["config"] == 0x1F:
+            p["groups"].append(_substream_group_dsi(b))
+        else:
+            b.u(1)                                   # b_multi_pid
+            n = {0: 2, 1: 2, 2: 2, 3: 3, 4: 3}.get(p["config"])
+            if p["config"] == 5:
+                n = b.u(3) + 2
+            if n is not None:
+                for _ in range(n):
+                    p["groups"].append(_substream_group_dsi(b))
+            elif p["config"] > 5:
+                for _ in range(b.u(7)):
+                    b.u(8)
+        p["pre_virtualized"] = b.u(1)
+        add = b.u(1)
+    else:
+        add = 1
+    if add:
+        for _ in range(b.u(7)):
+            b.u(15)
+    if b.u(1):                                       # bitrate info
+        b.u(66)
+    if b.u(1):                                       # b_alternative
+        b.p = start + (((b.p - start) + 7) & ~7)
+        n = b.u(16)
+        p["name"] = bytes(b.u(8) for _ in range(n)).decode("utf-8",
+                                                          "replace")
+        for _ in range(b.u(5)):
+            b.u(11)
+    return p
+
+
+def parse_dac4(raw):
+    """ac4_dsi_v1 (TS 103 190-2 E.6) -> dict: dsi_version,
+    bitstream_version, fs_index, frame_rate_index, and "presentations" (per
+    ac4_presentation_v1_dsi: config, md_compat, presentation_id,
+    channel_mode (dsi_presentation_ch_mode), enabled, its substream groups'
+    content_classifier and language, and the name of an alternative
+    presentation). Presentations of another presentation_version are kept
+    as {"version": v}."""
+    b = _B(raw)
+    out = dict(dsi_version=b.u(3), bitstream_version=b.u(7),
+               fs_index=b.u(1), frame_rate_index=b.u(4),
+               n_presentations=b.u(9), presentations=[])
+    if out["bitstream_version"] > 1 and b.u(1):      # b_program_id
+        out["short_program_id"] = b.u(16)
+        if b.u(1):
+            b.u(128)
+    b.u(66)                                          # ac4_bitrate_dsi
+    b.align()
+    for _ in range(out["n_presentations"]):
+        ver = b.u(8)
+        n = b.u(8)
+        if n == 255:
+            n += b.u(16)
+        start = b.p
+        if ver == 1:
+            p = _presentation_v1_dsi(b, start, n)
+            p["version"] = 1
+        else:
+            p = dict(version=ver)
+        out["presentations"].append(p)
+        b.p = start + 8 * n                          # skip_area
+    return out

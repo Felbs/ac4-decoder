@@ -369,6 +369,19 @@ ac4dec_element ac4dec_probe(const uint8_t *data, size_t len)
     return element_of_toc(&c, &t);
 }
 
+ac4dec_element ac4dec_probe_config(const ac4dec_config *cfg,
+                                   const uint8_t *data, size_t len)
+{
+    ac4_toc t;
+    ac4dec_config c;
+    memset(&c, 0, sizeof(c));
+    if (cfg)
+        c = *cfg;
+    if (len > MAX_FRAME_BYTES || toc_try(data, len, &t) != 0)
+        return AC4DEC_ELEMENT_AUTO;
+    return element_of_toc(&c, &t);
+}
+
 static const char *const CONTENT[8] = {
     "complete main", "music and effects", "visually impaired",
     "hearing impaired", "dialogue", "commentary", "emergency", "voice over"

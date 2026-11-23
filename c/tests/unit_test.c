@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "ac4dec.h"
+#include "ac4dec_input.h"
 #include "ac4_internal.h"
 
 static int fails;
@@ -832,8 +833,107 @@ static void test_stereo_data(void)
         ac4_huff_free(&huff[i]);
 }
 
+static size_t put_sync(uint8_t *o, const uint8_t *raw, size_t n, int crc,
+                       int escape)
+{
+    size_t k = 0;
+    o[k++] = 0xAC;
+    o[k++] = crc ? 0x41 : 0x40;
+    if (escape) {
+        o[k++] = 0xFF; o[k++] = 0xFF;
+        o[k++] = (uint8_t)(n >> 16); o[k++] = (uint8_t)(n >> 8);
+        o[k++] = (uint8_t)n;
+    } else {
+        o[k++] = (uint8_t)(n >> 8); o[k++] = (uint8_t)n;
+    }
+    memcpy(o + k, raw, n);
+    k += n;
+    if (crc) {
+        unsigned c = ac4in_crc16(o + 2, k - 2, 0);
+        o[k++] = (uint8_t)(c >> 8);
+        o[k++] = (uint8_t)c;
+    }
+    return k;
+}
+
+static void test_inputs(void)
+{
+    uint8_t raw[4][64], buf[512];
+    size_t n = 0, i;
+    ac4in_frame *fr;
+    ac4in_info info;
+    long m;
+    CHECK(ac4in_crc16((const uint8_t *)"123456789", 9, 0) == 0xFEE8,
+          "CRC-16 check value");
+    for (i = 0; i < 4; i++)
+        memset(raw[i], 0x80 + (int)i, sizeof(raw[i]));
+    n += put_sync(buf + n, raw[0], 20, 0, 0);
+    n += put_sync(buf + n, raw[1], 23, 1, 1);
+    memcpy(buf + n, "\x12\xac\x41garbage", 10);   /* lost sync */
+    n += 10;
+    i = n;
+    n += put_sync(buf + n, raw[2], 26, 1, 0);
+    buf[i + 6] ^= 0x10;                             /* bad CRC */
+    n += put_sync(buf + n, raw[3], 29, 1, 0);
+    CHECK(ac4in_detect(buf, n) == AC4IN_SYNC, "detect sync");
+    m = ac4in_read(buf, n, &fr, &info);
+    CHECK(m == 4 && info.n_crc == 3 && info.n_crc_bad == 1
+          && info.n_skipped == 10, "sync frames: %ld frames, %ld crc, "
+          "%ld bad, %ld skipped", m, info.n_crc, info.n_crc_bad,
+          info.n_skipped);
+    if (m == 4) {
+        CHECK(fr[0].len == 20 && !memcmp(fr[0].p, raw[0], 20)
+              && fr[1].len == 23 && !memcmp(fr[1].p, raw[1], 23)
+              && fr[2].len == 0 && fr[3].len == 29
+              && !memcmp(fr[3].p, raw[3], 29), "sync frame contents");
+    }
+    free(fr);
+    ac4in_free(&info);
+}
+
+/* --dump-input FILE: kind, frame count, then per frame its length and
+   FNV-1a hash (c/tests/check_inputs.py compares with ac4/container.py) */
+static int dump_input(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t *d = NULL;
+    size_t n = 0, cap = 0, r;
+    ac4in_frame *fr;
+    ac4in_info info;
+    long k, m;
+    if (!f)
+        return 1;
+    for (;;) {
+        if (n == cap) {
+            cap = cap ? cap * 2 : 1 << 20;
+            d = (uint8_t *)realloc(d, cap);
+        }
+        r = fread(d + n, 1, cap - n, f);
+        if (!r)
+            break;
+        n += r;
+    }
+    fclose(f);
+    m = ac4in_read(d, n, &fr, &info);
+    printf("%d %ld %ld %ld %ld\n", (int)info.kind, m, info.n_crc_bad,
+           info.n_skipped, info.ts_cc_errors);
+    for (k = 0; k < m; k++) {
+        uint32_t h = 2166136261u;
+        size_t i;
+        for (i = 0; i < fr[k].len; i++)
+            h = (h ^ fr[k].p[i]) * 16777619u;
+        printf("%zu %08x\n", fr[k].len, (unsigned)h);
+    }
+    free(fr);
+    ac4in_free(&info);
+    free(d);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 2 && !strcmp(argv[1], "--dump-input"))
+        return dump_input(argv[2]);
     if (argc > 1 && !strcmp(argv[1], "--dump-aspx")) {
         dump_aspx();
         return 0;
@@ -855,6 +955,7 @@ int main(int argc, char **argv)
     test_aspx_tables();
     test_toc_presentations();
     test_stereo_data();
+    test_inputs();
     if (fails) {
         printf("UNIT TESTS FAILED (%d)\n", fails);
         return 1;

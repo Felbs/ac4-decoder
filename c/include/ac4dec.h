@@ -175,6 +175,10 @@ int ac4dec_flush(ac4dec *d, ac4dec_frame *out);
 /* The element of a stream from one frame's TOC: AC4DEC_ELEMENT_5X,
    AC4DEC_ELEMENT_PAIR, or AC4DEC_ELEMENT_AUTO when unknown. */
 ac4dec_element ac4dec_probe(const uint8_t *data, size_t len);
+/* The same for the presentation cfg chooses (cfg->presentation,
+   presentation_id, language; NULL = automatic). */
+ac4dec_element ac4dec_probe_config(const ac4dec_config *cfg,
+                                   const uint8_t *data, size_t len);
 
 /* The decoder's fixed per-element output reference (decoder units; the
    Python CLI writes it at 0.9 of full scale): 9e5 for 5_X, 2e5 for a pair. */

@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "ac4dec.h"
+#include "ac4dec_input.h"
 #include "ac4dec_mp4.h"
 
 static unsigned long long rng_s = 88172645463325252ull;
@@ -393,6 +394,59 @@ static void capture(const char *path, int seeds)
     free(data);
 }
 
+/* the input readers (sync frames, TS, MP4) on random and mutated buffers:
+   no crash, every frame inside the input or the reader's own buffer */
+static void inputs(void)
+{
+    static const uint8_t seeds[][12] = {
+        { 0xAC, 0x41, 0x00, 0x08 }, { 0xAC, 0x40, 0xFF, 0xFF, 0, 0, 9 },
+        { 'I', 'D', '3', 4, 0, 0, 0, 0, 0, 3 },
+        { 0x47, 0x40, 0x00, 0x10 }, { 0x47, 0x41, 0x01, 0x10, 0, 0, 1, 0xBD },
+        { 0, 0, 0, 24, 'f', 't', 'y', 'p' }, { 0, 0, 0, 40, 'm', 'o', 'o', 'v' },
+        { 0, 0, 0, 20, 's', 't', 's', 'z' }, { 0, 0, 0, 16, 's', 't', 's', 'c' },
+        { 0, 0, 0, 28, 'd', 'a', 'c', '4' },
+    };
+    int it;
+    for (it = 0; it < 3000; it++) {
+        size_t n = 1 + rnd() % 4000, i, k;
+        uint8_t *d = (uint8_t *)malloc(n);
+        ac4in_frame *fr;
+        ac4in_info info;
+        long m;
+        int pk = (int)(rnd() % 5);
+        for (i = 0; i < n; i++)
+            d[i] = (uint8_t)rnd();
+        /* sprinkle structure: sync words, TS packets 188 apart, boxes */
+        for (k = 0; k < 40; k++) {
+            const uint8_t *sd = seeds[rnd() % (sizeof(seeds) / sizeof(seeds[0]))];
+            size_t at = pk == 0 ? (rnd() % (n / 188 + 1)) * 188 : rnd() % n;
+            for (i = 0; i < 12 && at + i < n; i++)
+                d[at + i] = sd[i];
+        }
+        if (pk == 1 && n > 4) {
+            d[0] = 0xAC;
+            d[1] = 0x41;
+        }
+        m = ac4in_read(d, n, &fr, &info);
+        CHECK(m >= 0, "ac4in_read failed on %zu bytes", n);
+        for (i = 0; m > 0 && i < (size_t)m; i++) {
+            const uint8_t *lo = d, *hi = d + n;
+            if (!fr[i].len)
+                continue;
+            if (info.buf && fr[i].p >= info.buf
+                && fr[i].p < info.buf + (size_t)1e9) {
+                continue;               /* inside the reader's buffer */
+            }
+            CHECK(fr[i].p >= lo && fr[i].p + fr[i].len <= hi,
+                  "frame %zu outside the input", i);
+        }
+        free(fr);
+        ac4in_free(&info);
+        free(d);
+    }
+    printf("input readers: done\n");
+}
+
 int main(int argc, char **argv)
 {
     int i, seeds = 3;
@@ -401,6 +455,7 @@ int main(int argc, char **argv)
     if (getenv("AC4_FUZZ_SEEDS"))
         seeds = atoi(getenv("AC4_FUZZ_SEEDS"));
     synthetic();
+    inputs();
     for (i = 1; i < argc; i++)
         capture(argv[i], seeds);
     if (argc < 2 && env && *env) {

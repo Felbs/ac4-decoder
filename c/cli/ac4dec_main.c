@@ -1,12 +1,17 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /*
- * ac4dec-c -- decode the AC-4 audio track of a fragmented MP4 file to WAV.
+ * ac4dec-c -- decode AC-4 audio to WAV.
  * The C port of `ac4dec` (ac4/cli.py): A-SPX rendered, output guard on,
  * as the Python CLI (see include/ac4dec.h).
  *
- *   ac4dec-c IN.m4s OUT.wav [--element auto|5_X|pair] [--channels 2|6]
+ *   ac4dec-c IN OUT.wav [--element auto|5_X|pair] [--channels 2|6]
+ *            [--presentation N|id:N] [--language xx]
  *            [--seconds S] [--max-pass N] [--ref-peak X] [--no-guard]
  *            [--lookahead N] [--f64 RAW] [--internal] [--status FILE] [-q]
+ *   ac4dec-c IN --list
+ *
+ * IN is detected from its content (include/ac4dec_input.h): MP4
+ * (fragmented or not), AC-4 sync frames, or an MPEG-2 transport stream.
  *
  * OUT is 16-bit PCM at 48 kHz, written with the Python CLI's level rule:
  * samples times 0.9 / ref_peak, ref_peak starting at the element's fixed
@@ -30,19 +35,68 @@
 #include <time.h>
 
 #include "ac4dec.h"
-#include "ac4dec_mp4.h"
+#include "ac4dec_input.h"
 
 #define FPS (30000.0 / 1001.0)
 
 static void usage(void)
 {
     fprintf(stderr,
-            "usage: ac4dec-c IN.m4s OUT.wav [--element auto|5_X|pair] "
+            "usage: ac4dec-c IN OUT.wav [--element auto|5_X|pair] "
             "[--channels 2|6]\n"
+            "                [--presentation N|id:N] [--language xx]\n"
             "                [--seconds S] [--max-pass N] [--ref-peak X] "
             "[--no-guard]\n"
             "                [--lookahead N] [--f64 RAW] [--internal] "
-            "[--status FILE] [-q]\n");
+            "[--status FILE] [-q]\n"
+            "       ac4dec-c IN --list\n");
+}
+
+static const char *const KIND[4] = { "unknown", "mp4", "sync", "ts" };
+static const char *const CMODE[11] = {
+    "Mono", "Stereo", "3.0", "5.0", "5.1", "7.0 (3/4/0)", "7.1 (3/4/0.1)",
+    "7.0 (5/2/0)", "7.1 (5/2/0.1)", "7.0 (3/2/2)", "7.1 (3/2/2.1)"
+};
+
+static int list_presentations(const ac4in_frame *fr, long n,
+                              const ac4in_info *info)
+{
+    long f;
+    printf("input: %s, %ld frames\n", KIND[info->kind], n);
+    for (f = 0; f < n && f < 64; f++) {
+        ac4dec_presentation p[16];
+        int k, m;
+        if (!fr[f].len)
+            continue;
+        m = ac4dec_presentations(fr[f].p, fr[f].len, p, 16);
+        if (m < 0)
+            continue;
+        for (k = 0; k < m && k < 16; k++) {
+            char cm[32];
+            if (p[k].channel_mode >= 0 && p[k].channel_mode <= 10)
+                snprintf(cm, sizeof(cm), "%s", CMODE[p[k].channel_mode]);
+            else if (p[k].channel_mode >= 0)
+                snprintf(cm, sizeof(cm), "ch_mode %d", p[k].channel_mode);
+            else
+                snprintf(cm, sizeof(cm), "objects");
+            printf("  [%d]%s id %ld, config %d, language %s, content %s, "
+                   "%s%s%s\n", p[k].index, p[k].is_default ? " *" : "  ",
+                   p[k].presentation_id, p[k].config,
+                   p[k].language[0] ? p[k].language : "-",
+                   p[k].content[0] ? p[k].content : "-", cm,
+                   p[k].enabled ? "" : ", DISABLED",
+                   p[k].decodable ? "" : ", not decodable here");
+        }
+        if (info->has_dsi)
+            printf("dac4: bitstream_version %d, fs_index %d, "
+                   "frame_rate_index %d, %d presentations\n",
+                   info->dsi_bitstream_version, info->dsi_fs_index,
+                   info->dsi_frame_rate_index, info->dsi_n_presentations);
+        printf("(* = decoded by default)\n");
+        return 0;
+    }
+    printf("no frame with a table of contents found\n");
+    return 1;
 }
 
 static double now(void)
@@ -246,13 +300,14 @@ static void sink_frame(sink_t *k, const ac4dec_frame *fo, FILE *st)
 int main(int argc, char **argv)
 {
     const char *src = NULL, *dst = NULL, *f64 = NULL, *status = NULL;
-    const char *el_arg = "auto";
-    int channels = 0, quiet = 0, internal = 0, no_guard = 0, i, c;
+    const char *el_arg = "auto", *pres = NULL, *lang = NULL;
+    int channels = 0, quiet = 0, internal = 0, no_guard = 0, i, c, list = 0;
     long max_pass = 1800, lookahead = 0;
     double seconds = -1.0, ref_peak = 0.0, t0, dt;
     unsigned char *data;
     size_t len;
-    ac4mp4_sample *smp = NULL;
+    ac4in_frame *smp = NULL;
+    ac4in_info info;
     long n_frames, f0;
     ac4dec_element element = AC4DEC_ELEMENT_AUTO;
     ac4dec_config cfg;
@@ -281,6 +336,12 @@ int main(int argc, char **argv)
             f64 = argv[++i];
         else if (!strcmp(a, "--status") && i + 1 < argc)
             status = argv[++i];
+        else if (!strcmp(a, "--presentation") && i + 1 < argc)
+            pres = argv[++i];
+        else if (!strcmp(a, "--language") && i + 1 < argc)
+            lang = argv[++i];
+        else if (!strcmp(a, "--list"))
+            list = 1;
         else if (!strcmp(a, "--internal"))
             internal = 1;
         else if (!strcmp(a, "--no-guard"))
@@ -299,7 +360,8 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    if (!src || !dst || (channels != 0 && channels != 2 && channels != 6)) {
+    if (!src || (!dst && !list)
+        || (channels != 0 && channels != 2 && channels != 6)) {
         usage();
         return 2;
     }
@@ -317,10 +379,27 @@ int main(int argc, char **argv)
         fprintf(stderr, "cannot read %s\n", src);
         return 1;
     }
-    n_frames = ac4mp4_samples(data, len, &smp);
+    n_frames = ac4in_read(data, len, &smp, &info);
     if (n_frames < 0) {
         fprintf(stderr, "out of memory\n");
         return 1;
+    }
+    if (list)
+        return list_presentations(smp, n_frames, &info);
+    if (!quiet && (info.n_crc_bad || info.n_skipped))
+        printf("  %s: %ld frames failed their CRC, %ld bytes skipped to "
+               "regain sync\n", KIND[info.kind], info.n_crc_bad,
+               info.n_skipped);
+    memset(&cfg, 0, sizeof(cfg));
+    if (pres) {
+        if (!strncmp(pres, "id:", 3))
+            cfg.presentation_id = atol(pres + 3) + 1;
+        else
+            cfg.presentation = atoi(pres) + 1;
+    }
+    if (lang) {
+        strncpy(cfg.language, lang, sizeof(cfg.language) - 1);
+        cfg.language[sizeof(cfg.language) - 1] = 0;
     }
     if (seconds >= 0.0) {
         long lim = (long)floor(seconds * FPS + 0.5);
@@ -335,10 +414,9 @@ int main(int argc, char **argv)
     if (element == AC4DEC_ELEMENT_AUTO) {
         /* as the Python probe_element: the first TOC that parses decides */
         for (f0 = 0; f0 < n_frames && f0 < 64; f0++) {
-            const uint8_t *p = data + smp[f0].off;
             if (!smp[f0].len)
                 continue;
-            element = ac4dec_probe(p, smp[f0].len);
+            element = ac4dec_probe_config(&cfg, smp[f0].p, smp[f0].len);
             if (element != AC4DEC_ELEMENT_AUTO)
                 break;
         }
@@ -353,7 +431,6 @@ int main(int argc, char **argv)
         max_pass = 8;
 
     t0 = now();
-    memset(&cfg, 0, sizeof(cfg));
     cfg.element = element;
     cfg.channels = channels;
     cfg.internal_rate = 1;          /* the level rule runs before resampling */
@@ -417,9 +494,8 @@ int main(int argc, char **argv)
 
     for (f0 = 0; f0 < n_frames; f0++) {
         ac4dec_frame fo;
-        const ac4mp4_sample *sm = &smp[f0];
-        if (ac4dec_decode_frame(dec, sm->len ? data + sm->off : NULL,
-                                sm->len, &fo))
+        const ac4in_frame *sm = &smp[f0];
+        if (ac4dec_decode_frame(dec, sm->len ? sm->p : NULL, sm->len, &fo))
             sink_frame(&k, &fo, fst);
     }
     {
@@ -470,6 +546,7 @@ int main(int argc, char **argv)
     for (c = 0; c < n_ch; c++)
         free(k.rout[c]);
     free(smp);
+    ac4in_free(&info);
     free(data);
     return 0;
 }

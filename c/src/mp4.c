@@ -82,8 +82,14 @@ static int child(rd_t *r, size_t o, size_t sz, const char *typ, size_t skip,
     return 0;
 }
 
-/* -> track id of the first 'ac-4' track, or -1 */
-static long ac4_track_id(rd_t *r)
+typedef struct {
+    long tid;
+    size_t stbl_o, stbl_sz;     /* the trak's stbl */
+    size_t ent_o, ent_sz;       /* its 'ac-4' sample entry */
+} trak_t;
+
+/* the first 'ac-4' trak: -> its track id, or -1 */
+static long ac4_trak(rd_t *r, trak_t *out)
 {
     box_t *top = (box_t *)malloc(sizeof(box_t) * MAX_BOXES);
     box_t tr[256];
@@ -99,6 +105,7 @@ static long ac4_track_id(rd_t *r)
         ntr = boxes(r, top[i].o + 8, top[i].o + top[i].sz, tr, 256);
         for (j = 0; j < ntr && found < 0; j++) {
             size_t to = tr[j].o, tsz = tr[j].sz, po, psz, ko, ksz;
+            size_t so = 0, ssz = 0;
             long tid;
             int ver, ok = 1, q;
             static const char *path[4] = { "mdia", "minf", "stbl", "stsd" };
@@ -119,13 +126,23 @@ static long ac4_track_id(rd_t *r)
                 }
                 po = no;
                 psz = nsz;
+                if (q == 2) {
+                    so = no;
+                    ssz = nsz;
+                }
             }
             if (!ok || r->bad)
                 continue;
             /* stsd: full box header + entry_count, then entries */
             if (boxes(r, po + 16, po + psz, e, 1) >= 1
-                && !memcmp(e[0].t, "ac-4", 4))
+                && !memcmp(e[0].t, "ac-4", 4)) {
                 found = tid;
+                out->tid = tid;
+                out->stbl_o = so;
+                out->stbl_sz = ssz;
+                out->ent_o = e[0].o;
+                out->ent_sz = e[0].sz;
+            }
         }
     }
     free(top);
@@ -281,6 +298,140 @@ static int fragment_samples(rd_t *r, size_t moof_o, size_t moof_sz,
     return 0;
 }
 
+static int push(ac4mp4_sample **v, long *nv, long *cap, size_t off,
+                size_t len)
+{
+    if (*nv >= *cap) {
+        long nc = *cap ? *cap * 2 : 1024;
+        ac4mp4_sample *n = (ac4mp4_sample *)realloc(
+            *v, sizeof(ac4mp4_sample) * (size_t)nc);
+        if (!n)
+            return -1;
+        *v = n;
+        *cap = nc;
+    }
+    (*v)[*nv].off = off;
+    (*v)[*nv].len = len;
+    (*nv)++;
+    return 0;
+}
+
+/* the samples of a stbl's sample table (stsz/stz2, stsc, stco/co64;
+   ISO/IEC 14496-12 8.7), as mp4.py table_samples: appended to *v (a
+   sample outside the file empty); a malformed table gives none.
+   -> 0, or -1 when out of memory */
+static int table_samples(rd_t *r, size_t so, size_t ssz,
+                         ac4mp4_sample **v, long *nv, long *cap)
+{
+    size_t zo, zsz, z2o, z2sz, co, csz, c6o, c6sz, sco, scsz;
+    int has_z = child(r, so, ssz, "stsz", 8, &zo, &zsz);
+    int has_z2 = child(r, so, ssz, "stz2", 8, &z2o, &z2sz);
+    int has_c = child(r, so, ssz, "stco", 8, &co, &csz);
+    int has_c6 = child(r, so, ssz, "co64", 8, &c6o, &c6sz);
+    int has_sc = child(r, so, ssz, "stsc", 8, &sco, &scsz);
+    uint64_t n, nc, ne, fixed = 0, ri, k = 0;
+    int fs = 0, w = 8;
+    size_t sz_at, ch_at, sc_at;
+    long start = *nv;
+    if (!has_sc || !(has_c || has_c6) || !(has_z || has_z2) || r->bad)
+        return 0;
+    if (has_z) {
+        fixed = be(r, zo + 12, 4);
+        n = be(r, zo + 16, 4);
+        if (n > (uint64_t)MAX_SAMPLES * 64
+            || (!fixed && zo + 20 + 4 * n > zo + zsz))
+            return 0;
+        sz_at = zo + 20;
+    } else {
+        fs = (int)be(r, z2o + 15, 1);
+        n = be(r, z2o + 16, 4);
+        if ((fs != 4 && fs != 8 && fs != 16)
+            || z2o + 20 + (n * (uint64_t)fs + 7) / 8 > z2o + z2sz)
+            return 0;
+        sz_at = z2o + 20;
+    }
+    if (has_c) {
+        nc = be(r, co + 12, 4);
+        if (co + 16 + 4 * nc > co + csz)
+            return 0;
+        ch_at = co + 16;
+        w = 4;
+    } else {
+        nc = be(r, c6o + 12, 4);
+        if (c6o + 16 + 8 * nc > c6o + c6sz)
+            return 0;
+        ch_at = c6o + 16;
+        w = 8;
+    }
+    ne = be(r, sco + 12, 4);
+    if (sco + 16 + 12 * ne > sco + scsz)
+        return 0;
+    sc_at = sco + 16;
+    if (r->bad)
+        return 0;
+    for (ri = 0; ri < ne && k < n; ri++) {
+        uint64_t first = be(r, sc_at + 12 * ri, 4);
+        uint64_t per = be(r, sc_at + 12 * ri + 4, 4);
+        uint64_t last = ri + 1 < ne ? be(r, sc_at + 12 * (ri + 1), 4) - 1
+                                    : nc;
+        uint64_t c;
+        if (last > nc)
+            last = nc;
+        for (c = first ? first - 1 : 0; c < last && k < n; c++) {
+            uint64_t pos = be(r, ch_at + (size_t)(w * c), w), q;
+            for (q = 0; q < per && k < n; q++) {
+                uint64_t sz;
+                if (has_z) {
+                    sz = fixed ? fixed : be(r, sz_at + 4 * k, 4);
+                } else if (fs == 4) {
+                    sz = (be(r, sz_at + k / 2, 1) >> (k % 2 == 0 ? 4 : 0))
+                         & 15;
+                } else {
+                    sz = be(r, sz_at + (size_t)(fs / 8) * k, fs / 8);
+                }
+                if (r->bad) {
+                    *nv = start;
+                    return 0;
+                }
+                if (pos + sz <= r->n && pos + sz >= pos) {
+                    if (push(v, nv, cap, (size_t)pos, (size_t)sz) < 0)
+                        return -1;
+                } else if (push(v, nv, cap, 0, 0) < 0) {
+                    return -1;
+                }
+                pos += sz;
+                k++;
+            }
+        }
+    }
+    return 0;
+}
+
+int ac4mp4_dac4(const uint8_t *data, size_t len, const uint8_t **dsi,
+                size_t *dsi_len)
+{
+    rd_t r;
+    trak_t t;
+    box_t b[64];
+    int n, i;
+    r.d = data;
+    r.n = len;
+    r.bad = 0;
+    *dsi = NULL;
+    *dsi_len = 0;
+    if (ac4_trak(&r, &t) < 0)
+        return 0;
+    n = boxes(&r, t.ent_o + 36, t.ent_o + t.ent_sz, b, 64);
+    for (i = 0; i < n; i++) {
+        if (!memcmp(b[i].t, "dac4", 4) && b[i].o + b[i].sz <= len) {
+            *dsi = data + b[i].o + 8;
+            *dsi_len = b[i].sz - 8;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 long ac4mp4_samples(const uint8_t *data, size_t len, ac4mp4_sample **out)
 {
     rd_t r;
@@ -292,8 +443,18 @@ long ac4mp4_samples(const uint8_t *data, size_t len, ac4mp4_sample **out)
     r.d = data;
     r.n = len;
     r.bad = 0;
-    track_id = ac4_track_id(&r);
-    r.bad = 0;
+    {
+        trak_t t;
+        track_id = ac4_trak(&r, &t);
+        r.bad = 0;
+        /* a non-fragmented file (or the moov part of one) */
+        if (track_id >= 0 && table_samples(&r, t.stbl_o, t.stbl_sz, &v, &nv,
+                                           &cap) < 0) {
+            free(v);
+            return -1;
+        }
+        r.bad = 0;
+    }
     {
         int max = MAX_BOXES;
         for (;;) {
