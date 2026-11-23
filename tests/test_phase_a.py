@@ -372,3 +372,43 @@ def test_aspx_grid_is_one_frame_after_pseudocode_75(monkeypatch):
     hf = np.abs(seen[0][sbx:sbx + n_sb]).sum(axis=0)
     assert R37.TS_OFFSET == 24 - R37.TS_HFGEN == 18
     assert list(np.flatnonzero(hf)) == list(range(42, 66))
+
+
+def test_centre_goes_through_the_aspx_renderer(monkeypatch):
+    """A 5_X element in codec mode 1: the centre's aspx_data_1ch is
+    rendered (as the same channel twice) like the pairs'; before, the
+    centre bypassed A-SPX and kept its core band only."""
+    from ac4 import aspx_render as R37
+    from ac4 import decoder as D
+    calls = []
+
+    def fake_render(pa, pb, gg, cfg, **kw):
+        calls.append((pa is pb or np.array_equal(pa, pb), len(gg)))
+        if kw.get("state_log") is not None:
+            kw["state_log"].extend([None] * (len(gg) + 1))
+        n = len(pa) + 577
+        return {"L": np.zeros(n), "R": np.zeros(n)}, 0
+
+    monkeypatch.setattr(R37, "apply_hf_pair", fake_render)
+    dec = D.Decoder("5_X")
+    dat = [{"fr": {"borders": [0, 12]}, "balance": 0}] * 2
+    rng = np.random.default_rng(3)
+
+    def fake_frames(frames, chans):
+        n = len(frames)
+        wins = {k: [rng.standard_normal(1536) for _ in range(n)]
+                for k in chans}
+        lens = {k: [1536] * n for k in chans}
+        cnts = {k: [1] * n for k in chans}
+        dec.stream.status = [None] * n
+        dec.stream.mode = ("5_X", 1)
+        dec.stream.cfg = {"x": 1}
+        grp = {"lr": [dat] * n, "sr": [dat] * n, "c": [dat] * n,
+               "acpl": [None] * n}
+        return wins, lens, grp, cnts
+
+    monkeypatch.setattr(dec.stream, "decode_frames", fake_frames)
+    dec.decode_pass([b""] * 3)
+    # L/R, Ls/Rs and the centre: three renderer calls, the last with the
+    # centre's core as both channels
+    assert len(calls) == 3 and calls[2][0]
