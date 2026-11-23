@@ -44,11 +44,14 @@ import numpy as np
 
 from . import aspx_render as R37
 from . import filterbank as FB
+from . import rates as RT
 from . import robust as RB
 from . import stream as SC
 from .stream import Ac4Stream
 
-FRAME = 1536                # internal samples per frame (29.97 fps, 48 kHz)
+FRAME = 1536                # internal samples per frame at 29.97 fps, 48 kHz
+#                             (the default until a stream's rate is known;
+#                             a Decoder's own is Decoder.frame)
 LEAD = 4                    # frames of A-SPX/QMF lead-in carried per pair
 HF_DELAY = 577              # samples the A-SPX path delays a channel
 HF_TAIL = 2                 # frames after a burst frame that also play core
@@ -60,7 +63,8 @@ REF_PEAK = {"5_X": 9.0e5, "pair": 2.0e5}
 
 
 def core_for_bursts(hf_a, hf_b, core_a, core_b, lead, limit, owed,
-                    hf_ratio=None, flagged=None, hf_floor=0.0, bad_out=None):
+                    hf_ratio=None, flagged=None, hf_floor=0.0, bad_out=None,
+                    FRAME=FRAME):
     """One pair's A-SPX output with the core put back wherever A-SPX ran
     away. -> (a, b, frames replaced, frames still owed to the next pass).
 
@@ -131,6 +135,10 @@ class Decoder:
 
     def __init__(self, element="5_X", channels=None, burst_limit=None,
                  guard=True, presentation=None, language=None):
+        """The frame length follows the stream (TS 103 190-1 Table 83):
+        `frame` is FRAME (1536) until the first frame whose rate the
+        decoder takes (see Ac4Stream), then that frame_len_base; out_rate
+        and ratio give the output rate and the resampler ratio."""
         if element not in ("5_X", "pair"):
             raise ValueError(f"element {element!r}: '5_X' or 'pair'")
         if channels is None:
@@ -152,6 +160,9 @@ class Decoder:
         # of the channels that do not go through the QMF bank
         self.core_tail = {k: np.zeros(HF_DELAY) for k in self.chans}
         self.hf_state = {"lr": [None], "sr": [None], "c": [None]}
+        # the A-SPX tables in force before the lead-in of the next pass
+        # (aspx_render.apply_hf_pair t_start)
+        self.t_hold = {"lr": None, "sr": None, "c": None}
         self.hf_hot = {"lr": 0, "sr": 0, "c": 0}
         self.n_burst = 0
         self.n_hf_fail = 0
@@ -173,6 +184,40 @@ class Decoder:
         self.hf_floor = RB.HF_MIN_FRAC * REF_PEAK[element]
         self._aspx_flag = np.zeros(0, dtype=bool)
         self.n_frames = 0
+        self.frame = FRAME
+
+    @property
+    def rate(self):
+        """(fs_index, frame_rate_index) of the stream, None until known."""
+        return self.stream.rate
+
+    @property
+    def ratio(self):
+        """The decoder resampling ratio (up, down) of Table 83 / 84."""
+        r = self.stream.rate
+        return RT.ratio(*r) if r else RT.ratio(1, 3)
+
+    @property
+    def out_rate(self):
+        r = self.stream.rate
+        return RT.out_rate(r[0]) if r else 48000
+
+    def _adopt_frame(self):
+        """The stream's frame length became known (or changed): the
+        filterbank, QMF and delay-line state is reset to it."""
+        fl = self.stream.frame_len
+        if fl is None or fl == self.frame:
+            return
+        self.frame = fl
+        self.fb_state = {k: None for k in self.chans}
+        self.lead_pcm = {k: np.zeros(0) for k in self.lead_pcm}
+        self.lead_groups = {k: [] for k in self.lead_groups}
+        self.lead_acpl = []
+        self.hf_state = {k: [None] for k in self.hf_state}
+        self.t_hold = {k: None for k in self.t_hold}
+        self.acpl_state = [None]
+        if self.guard is not None:
+            self.guard.frame = fl
 
     @property
     def n_ok(self):
@@ -215,18 +260,20 @@ class Decoder:
         output still rises far above the running level is muted by the
         output guard (reason "guard.level")."""
         frames = list(frames)
-        n_out = len(frames) * FRAME
         n_bad0 = self.stream.n_bad
         self._aspx_flag = np.zeros(len(frames), dtype=bool)
         try:
             y = self._decode_pass(frames)
+            n_out = len(frames) * self.frame
             status = list(self.stream.status)
             self.log.extend(self.stream.log)
             self.stream.log.clear()
         except Exception as e:                                 # noqa: BLE001
             # last resort: nothing escapes, and the timeline holds
+            self._adopt_frame()
             self.log.append(f"decode pass failed ({type(e).__name__}: "
                             f"{str(e)[:90]}) -- {len(frames)} frames muted")
+            n_out = len(frames) * self.frame
             y = np.zeros((n_out, len(self.chans)))
             status = ["decoder.internal"] * len(frames)
             self.stream.n_bad = n_bad0 + len(frames)
@@ -267,6 +314,8 @@ class Decoder:
         chans = self.chans
         dec = self.stream
         wins, lens, grp, cnts = dec.decode_frames(frames, chans)
+        self._adopt_frame()
+        FRAME = self.frame
         pcm, self.fb_state = FB.synthesise_frames(
             wins, lens, cnts, FRAME, states=self.fb_state, return_state=True)
         if len(pcm) < len(chans):
@@ -328,7 +377,8 @@ class Decoder:
                         acpl_groups=gacpl if up else None,
                         acpl_state0=(acs[max(0, len(acs) - 1 - n_lead)]
                                      if up else None),
-                        acpl_log=alog if up else None)
+                        acpl_log=alog if up else None,
+                        frame_len=FRAME, t_start=self.t_hold[gkey])
                     bad = np.zeros(len(gl) + 1, dtype=bool)
                     pcm[ka], pcm[kb], nb_, self.hf_hot[gkey] = \
                         core_for_bursts(hf["L"][lead:], hf["R"][lead:],
@@ -339,7 +389,7 @@ class Decoder:
                                                   else None),
                                         flagged=self._aspx_flag,
                                         hf_floor=self.hf_floor,
-                                        bad_out=bad)
+                                        bad_out=bad, FRAME=FRAME)
                     via_qmf |= {ka, kb}
                     if up:
                         # the five channels of the upmix; a frame whose
@@ -364,6 +414,10 @@ class Decoder:
                             f"A-SPX burst on {ka}/{kb}: {nb_} frame(s) "
                             f"above {self.burst_limit:.3g} play core-band")
                     self.hf_state[gkey] = slog[-(LEAD + 1):]
+                    nl = len((self.lead_groups[gkey] + gl)[-LEAD:])
+                    tb = hf.get("t_before")
+                    if tb:
+                        self.t_hold[gkey] = tb[len(gg) - nl]
                 except Exception as e:                         # noqa: BLE001
                     self.hf_state[gkey] = (
                         hs + [hs[-1]] * len(gl))[-(LEAD + 1):]
@@ -392,6 +446,18 @@ class Decoder:
         return np.column_stack([pcm[k] for k in chans])
 
 
+def probe_rate(frames, limit=64):
+    """(fs_index, frame_rate_index) of the first frame whose TOC parses and
+    whose next frame agrees, or None."""
+    prev = None
+    for f in frames[:limit]:
+        r = RB.peek_rate(f)
+        if r is not None and r == prev:
+            return r
+        prev = r
+    return prev
+
+
 def probe_element(frames, limit=64, presentation=None, language=None):
     """Guess the element from the channel_mode of the audio substream of
     the presentation that would be decoded (toc.choose).
@@ -416,18 +482,23 @@ def probe_element(frames, limit=64, presentation=None, language=None):
 
 def decode(frames, element=None, channels=None, max_pass=1800,
            presentation=None, language=None):
-    """Batch convenience: -> (pcm float64 (n, ch) at 48 kHz, decoder scale,
-    Decoder). Decodes in passes of `max_pass` frames, exactly as a
+    """Batch convenience: -> (pcm float64 (n, ch) at the external rate,
+    Decoder.out_rate (48 kHz, or 44,1 kHz for fs_index 0), decoder scale,
+    Decoder). The resampler ratio is the stream's (Table 83: 1001/960,
+    25/24, 15/16 or 1; with ratio 1 it passes the samples through). Decodes in passes of `max_pass` frames, exactly as a
     streaming caller would. presentation / language: see toc.choose."""
     from .resample import StreamResampler
     element = element or probe_element(frames, presentation=presentation,
                                        language=language)
+    rate = probe_rate(frames)
+    up, down = (RT.ratio(*rate) if rate and RT.ratio(*rate)
+                else RT.ratio(1, 3))
     if element is None:
         raise ValueError("cannot tell the element from the stream; pass "
                          "element='5_X' or 'pair'")
     dec = Decoder(element, channels, presentation=presentation,
                   language=language)
-    rs = StreamResampler()
+    rs = StreamResampler(up, down)
     out = []
     for i in range(0, len(frames), max(1, max_pass)):
         y = dec.decode_pass(frames[i:i + max_pass])

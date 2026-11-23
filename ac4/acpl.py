@@ -209,7 +209,7 @@ def quantities(dq):
     return out
 
 
-def interpolate(prev, sets, interp_type, timeslots, ts):
+def interpolate(prev, sets, interp_type, timeslots, ts, nts=NTS):
     """Pseudocode 109 for every subband at once. prev (64,), sets
     (num_pset, 64) (already mapped to subbands), ts: the frame's time
     slots (ints). -> (len(ts), 64)."""
@@ -218,10 +218,10 @@ def interpolate(prev, sets, interp_type, timeslots, ts):
     if interp_type == 0:                                # smooth
         if n_pset == 1:
             delta = sets[0] - prev
-            return prev + (t + 1) * delta / NTS
-        ts2 = NTS // 2
+            return prev + (t + 1) * delta / nts
+        ts2 = nts // 2
         first = prev + (t + 1) * (sets[0] - prev) / ts2
-        second = sets[0] + (t - ts2 + 1) * (sets[1] - sets[0]) / (NTS - ts2)
+        second = sets[0] + (t - ts2 + 1) * (sets[1] - sets[0]) / (nts - ts2)
         return np.where(t < ts2, first, second)
     if n_pset == 1:                                     # steep
         return np.where(t < timeslots[0], prev, sets[0])
@@ -296,7 +296,7 @@ def duck(u, s):
     return u * gain[:, :, SB_TO_PB15]
 
 
-def upmix_frame(x0, x1, frame, s):
+def upmix_frame(x0, x1, frame, s, nts=NTS):
     """One frame of Pseudocode 118. x0, x1: (n, 64) complex, the QMF slots
     of the frame (n <= 24: the end of a decode pass can cut a frame).
     frame: dict(cfg, interp, timeslots, q) -- or None to hold the previous
@@ -316,7 +316,7 @@ def upmix_frame(x0, x1, frame, s):
         sets = {k: s["prev"][k][None, :] for k in QUANTITIES}
         it, tsl = 0, ()
     s["warm"] = True
-    ip = {k: interpolate(s["prev"][k], sets[k], it, tsl, ts)
+    ip = {k: interpolate(s["prev"][k], sets[k], it, tsl, ts, nts)
           for k in QUANTITIES}
     if frame is not None:                               # Pseudocode 110
         s["prev"] = {k: v[-1].copy() for k, v in sets.items()}
@@ -347,12 +347,13 @@ def upmix_frame(x0, x1, frame, s):
     return dict(L=z0, R=z2, C=z4 * SQRT2, Ls=z1 * SQRT2, Rs=z3 * SQRT2)
 
 
-def render(QL, QR, groups, state0=None, state_log=None, ts_offset=4):
+def render(QL, QR, groups, state0=None, state_log=None, ts_offset=4,
+           nts=NTS):
     """The A-CPL upmix of a decode pass. QL, QR: (64, n_slots) complex,
     the A-SPX output of the core pair; groups: per frame None (no A-CPL
     data: the core passes through), CONCEALED (hold) or the frame's
     parameters (dict cfg, interp, timeslots, q). Frame f acts on slots
-    24 f + ts_offset .. + 23. `state_log` (a list) receives a copy of the
+    nts f + ts_offset .. + nts - 1 (nts = num_qmf_timeslots). `state_log` (a list) receives a copy of the
     state at the start of every frame, plus one after the last; `state0`
     starts from a logged state. -> dict L, R, C, Ls, Rs of (64, n_slots)."""
     n_slots = QL.shape[1]
@@ -363,17 +364,18 @@ def render(QL, QR, groups, state0=None, state_log=None, ts_offset=4):
     for f, g in enumerate(groups):
         if state_log is not None:
             state_log.append(copy_state(s))
-        a = 24 * f + ts_offset
-        z = min(a + NTS, n_slots)
+        a = nts * f + ts_offset
+        z = min(a + nts, n_slots)
         if g is None or (g is CONCEALED and not s["warm"]):
             s = new_state()                 # passthrough, state cleared
             continue
         if z <= a:
             continue
         res = upmix_frame(QL[:, a:z].T, QR[:, a:z].T,
-                          None if g is CONCEALED else g, s)
+                          None if g is CONCEALED else g, s, nts)
         for k, val in res.items():
             out[k][:, a:z] = val.T
     if state_log is not None:
         state_log.append(copy_state(s))
     return out
+

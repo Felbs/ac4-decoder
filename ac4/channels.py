@@ -80,7 +80,9 @@ from .robust import Damaged, MAX_EXT_N, MAX_QUANT, SF_MAX, SF_MIN  # noqa: E402
 # gated against Table B.1's independent band count (M27).  Short frames split
 # the 1536-sample frame into partial blocks of 96/192/384/768 (Table 99), so
 # every one of these is reachable.
-SFB_TABLE = {L: B.offsets_for(L) for L in (1536, 768, 384, 192, 96)}
+SFB_TABLE = {L: B.offsets_for(L) for L in (2048, 1920, 1536, 1024, 960, 768,
+                                           512, 480, 384, 256, 240, 192,
+                                           128, 120, 96)}
 
 N_MSFB_BITS = 6              # Table 105, 1536
 N_MSFBL_BITS = 3             # Table 105, 1536 (the LFE)
@@ -404,12 +406,15 @@ def _snf_group(b, sfb_cb, lines, offsets, snf_table, max_sfb):
     return out
 
 
-# Table 99: transf_length index -> actual transform length, frame_length 1536
-# at 48 kHz.  Table 108: n_grp_bits, indexed by (transf_length[0],
-# transf_length[1]).  Both transcribed from the spec rather than derived --
-# though the derivation does reproduce Table 108 exactly: with block counts
-# n_i = 768 / length_i, n_grp_bits is n0 + n1 - 1 when the halves share a
-# length and (n0 - 1) + (n1 - 1) when they differ.
+# Transform lengths (TS 103 190-1 4.3.6.1, Tables 99-105, 44,1/48 kHz).
+# frame_len_base >= 1536: b_long_frame, then transf_length[0..1] index the
+# partial blocks of each half of the frame (Table 100). frame_len_base <
+# 1536: one 2-bit transf_length for the whole frame (Table 103; a length
+# equal to the frame length is one block). Table 109 / 110: n_grp_bits.
+# Both transcribed from the spec. For frame_len_base >= 1536 the
+# derivation reproduces Table 109 exactly: with block counts
+# n_i = (frame/2) / length_i, n_grp_bits is n0 + n1 - 1 when the halves
+# share a length and (n0 - 1) + (n1 - 1) when they differ.
 # Short frames are ON, and the history of this flag is the point.
 #
 # When the branch was first written it made more frames CLOSE (76.1 % vs 64.6 %)
@@ -427,23 +432,42 @@ def _snf_group(b, sfb_cb, lines, offsets, snf_table, max_sfb):
 # so it is on by default now, and --no-short backs it out.
 SHORT_FRAMES = True
 
-SHORT_LEN = {0: 96, 1: 192, 2: 384, 3: 768}
+FRAME_LENGTHS = (2048, 1920, 1536, 1024, 960, 768, 512, 384)
+# Table 100 (frame_len_base >= 1536): transf_length[i] -> partial block
+TRANSF_LEN_LONG = {2048: (128, 256, 512, 1024), 1920: (120, 240, 480, 960),
+                   1536: (96, 192, 384, 768)}
+# Table 103 (frame_len_base < 1536): transf_length -> block (None: x)
+TRANSF_LEN_SHORT = {1024: (128, 256, 512, 1024), 960: (120, 240, 480, 960),
+                    768: (96, 192, 384, 768), 512: (128, 256, 512, None),
+                    384: (96, 192, 384, None)}
+SHORT_LEN = dict(enumerate(TRANSF_LEN_LONG[1536]))      # frame 1536
 
-# Table 105: n_msfb_bits by transform length at 44,1 / 48 kHz.
+# Table 106: n_msfb_bits and n_side_bits by transform length at 44,1 / 48
+# kHz; n_msfbl_bits (the LFE's max_sfb) by frame length.
 N_MSFB_BY_LEN = {2048: 6, 1920: 6, 1536: 6, 1024: 6, 960: 6, 768: 6,
                  512: 6, 480: 6, 384: 6, 256: 5, 240: 5, 192: 5,
                  128: 4, 120: 4, 96: 4}
+N_SIDE_BY_LEN = {2048: 5, 1920: 5, 1536: 5, 1024: 5, 960: 5, 768: 5,
+                 512: 5, 480: 5, 384: 4, 256: 4, 240: 4, 192: 3,
+                 128: 3, 120: 3, 96: 3}
+N_MSFBL_BY_LEN = {2048: 3, 1920: 3, 1536: 3, 1024: 2, 960: 2, 768: 2,
+                  512: 2, 384: 2}
 
 
 def n_msfb_bits(length):
     return N_MSFB_BY_LEN[length]
 
+
+# Table 109 (frame_len_base >= 1536, b_long_frame 0)
 N_GRP_BITS = {
     (0, 0): 15, (0, 1): 10, (0, 2): 8, (0, 3): 7,
     (1, 0): 10, (1, 1): 7, (1, 2): 4, (1, 3): 3,
     (2, 0): 8, (2, 1): 4, (2, 2): 3, (2, 3): 1,
     (3, 0): 7, (3, 1): 3, (3, 2): 1, (3, 3): 1,
 }
+# Table 110 (frame_len_base < 1536), by transf_length
+N_GRP_BITS_SHORT = {1024: (7, 3, 1, 0), 960: (7, 3, 1, 0), 768: (7, 3, 1, 0),
+                    512: (3, 1, 0, None), 384: (3, 1, 0, None)}
 
 
 class Framing:
@@ -452,39 +476,71 @@ class Framing:
     Holds everything the rest of sf_data needs to be window-agnostic: how many
     groups there are, each group's max_sfb and transform length, and the
     per-group sect_sfb_offset that packs grouped short blocks contiguously.
+
+    fl: frame_len_base (Table 83). b_dual_maxsfb / b_side_limited
+    (asf_psy_info, Table 38): the max_sfb_side fields of ASPX_ACPL_1;
+    `side` selects which of max_sfb / max_sfb_side the groups use
+    (Pseudocode 5: b_side_limited, or b_dual_maxsfb with b_side_channel).
     """
 
-    def __init__(self, b):
-        self.long = bool(b.u(1))                     # b_long_frame
-        self.tl = None
-        if not self.long:
-            if not SHORT_FRAMES:
-                raise ValueError("short frame")
-            self.tl = [b.u(2), b.u(2)]               # transf_length[0..1]
-        self.different = (not self.long and self.tl[0] != self.tl[1])
-        # Table 105 indexes n_msfb_bits by TRANSFORM LENGTH, not by frame: the
+    def __init__(self, b, fl=1536, b_dual_maxsfb=0, b_side_limited=0):
+        self.fl = fl
+        self.side = False
+        if fl >= 1536:
+            self.long = bool(b.u(1))                 # b_long_frame
+            self.tl = None
+            if not self.long:
+                if not SHORT_FRAMES:
+                    raise ValueError("short frame")
+                self.tl = [b.u(2), b.u(2)]           # transf_length[0..1]
+            self.different = (not self.long and self.tl[0] != self.tl[1])
+            self.lens = ([fl] if self.long else
+                         [TRANSF_LEN_LONG[fl][t] for t in self.tl])
+        else:
+            t = b.u(2)                               # transf_length
+            n = TRANSF_LEN_SHORT[fl][t]
+            if n is None:                            # "x": not defined
+                raise Damaged("asf.transf_length", f"{t} at {fl}")
+            self.tl = [t]
+            self.long = n == fl
+            self.different = False
+            self.lens = [n]
+        # Table 106 indexes n_msfb_bits by TRANSFORM LENGTH, not by frame: the
         # short blocks at 192 and 96 samples carry 5- and 4-bit max_sfb fields.
         # Using 6 everywhere parses the long frames and the 384/768 short
         # frames correctly and desynchronises exactly the rest -- which is what
         # the first short-frame run showed (70 % closing, and the failures
         # confined to the framings involving 96 or 192).
-        self.max_sfb = [b.u(n_msfb_bits(self.length_idx(0)))]
-        if self.different:
-            self.max_sfb.append(b.u(n_msfb_bits(self.length_idx(1))))
-        for i, m in enumerate(self.max_sfb):
-            if m > len(SFB_TABLE[self.length_idx(i)]) - 1 and RB.CHECKS:
-                raise Damaged("asf.max_sfb", f"{m}")
-        n_grp = 0 if self.long else N_GRP_BITS[tuple(self.tl)]
+        self.max_sfb, self.max_sfb_side = [], []
+        for i in range(2 if self.different else 1):
+            n = self.length_idx(i)
+            if b_side_limited:
+                self.max_sfb_side.append(b.u(N_SIDE_BY_LEN[n]))
+                self.max_sfb.append(self.max_sfb_side[-1])
+            else:
+                self.max_sfb.append(b.u(n_msfb_bits(n)))
+                if b_dual_maxsfb:
+                    self.max_sfb_side.append(b.u(n_msfb_bits(n)))
+        for lst in (self.max_sfb, self.max_sfb_side):
+            for i, m in enumerate(lst):
+                if m > len(SFB_TABLE[self.length_idx(i)]) - 1 and RB.CHECKS:
+                    raise Damaged("asf.max_sfb", f"{m}")
+        if fl >= 1536:
+            n_grp = 0 if self.long else N_GRP_BITS[tuple(self.tl)]
+        else:
+            n_grp = N_GRP_BITS_SHORT[fl][self.tl[0]]
         sfg = [b.u(1) for _ in range(n_grp)]
 
         # --- Pseudocode 3 -------------------------------------------------
+        # (frame_len_base < 1536: no b_long_frame; num_windows is
+        # n_grp_bits + 1, one window when the block is the whole frame)
         self.num_windows = 1
         self.num_groups = 1
         self.w2g = [0]
         if not self.long:
             self.num_windows = n_grp + 1
             if self.different:
-                nw0 = 1 << (3 - self.tl[0])          # windows in first half
+                nw0 = self._nw0()                    # windows in first half
                 sfg = sfg + [0]
                 for i in range(n_grp, nw0 - 1, -1):
                     sfg[i] = sfg[i - 1]
@@ -498,29 +554,39 @@ class Framing:
         self.nwin = [sum(1 for w in self.w2g if w == g)
                      for g in range(self.num_groups)]
 
+    def _nw0(self):
+        """num_windows_0 = 1 << (3 - transf_length[0]) (Pseudocodes 2, 3)."""
+        return 1 << (3 - self.tl[0])
+
     def length_idx(self, i):
         """Transform length of half i, before the grouping is known."""
-        return 1536 if self.long else SHORT_LEN[self.tl[i]]
+        return self.lens[min(i, len(self.lens) - 1)]
 
     def _idx(self, g):
         """Pseudocode 5: which half of the frame group g belongs to."""
         if not self.different:
             return 0
-        nw0 = 1 << (3 - self.tl[0])
-        return 1 if g >= self.w2g[nw0] else 0
+        return 1 if g >= self.w2g[self._nw0()] else 0
 
     def max_sfb_g(self, g):
         i = self._idx(g)
-        return self.max_sfb[min(i, len(self.max_sfb) - 1)]
+        src = self.max_sfb_side if (self.side and self.max_sfb_side) \
+            else self.max_sfb
+        return src[min(i, len(src) - 1)]
 
     def length_g(self, g):
-        return 1536 if self.long else SHORT_LEN[self.tl[self._idx(g)]]
+        return self.lens[self._idx(g)]
+
+    def transf_length_g(self, g):
+        """get_transf_length(g) (Pseudocode 2): 4 for a long frame of
+        frame_len_base >= 1536."""
+        if self.fl >= 1536:
+            return 4 if self.long else self.tl[self._idx(g)]
+        return self.tl[0]
 
     def n_sect_bits(self, g):
-        """Clause 4.2.8.3: 3 bits for the short transform lengths."""
-        if self.long:
-            return 5
-        return 3 if self.tl[self._idx(g)] <= 2 else 5
+        """Pseudocode 6: 3 bits when transf_length_g <= 2, else 5."""
+        return 3 if self.transf_length_g(g) <= 2 else 5
 
     def sect_sfb_offset(self, g):
         """Pseudocode 4 -- grouped short blocks pack contiguously."""
@@ -532,10 +598,36 @@ class Framing:
         n = self.nwin[g]
         return [base + v * n for v in tbl]
 
+    def for_side(self):
+        """The same framing, read for the side channel (Pseudocode 5,
+        b_side_channel = 1): its groups use max_sfb_side."""
+        import copy
+        f = copy.copy(self)
+        f.side = True
+        return f
 
-def sf_info(b):
+
+def lfe_framing(b, fl=1536):
+    """sf_info_lfe() (Table 35): one long block, max_sfb in n_msfbl_bits."""
+    fr = Framing.__new__(Framing)
+    fr.fl, fr.side = fl, False
+    fr.long, fr.different = True, False
+    fr.tl = None if fl >= 1536 else [3]
+    fr.lens = [fl]
+    fr.max_sfb, fr.max_sfb_side = [b.u(N_MSFBL_BY_LEN[fl])], []
+    fr.num_windows, fr.num_groups, fr.w2g, fr.nwin = 1, 1, [0], [1]
+    return fr
+
+
+def sf_info(b, fl=1536):
     """-> Framing.  Both the long and the short branch."""
-    return Framing(b)
+    return Framing(b, fl)
+
+
+def frame_len(T):
+    """The frame length the element is parsed for (frame_len_base, Table
+    83): the stream puts it in its copy of the tables as "fl"."""
+    return T.get("fl", 1536)
 
 
 def chparam_info(b, fr, sf_table):
@@ -618,12 +710,13 @@ def two_channel_data(b, T):
     two blocks are mid and side, not left and right.
     """
     sap, ms_used, sap_d = None, None, None
+    fl = frame_len(T)
     if b.u(1):                                      # b_enable_mdct_stereo_proc
-        fr = Framing(b)
+        fr = Framing(b, fl)
         sap, ms_used, sap_d = chparam_info(b, fr, T["sf"])
         frs = [fr, fr]
     else:
-        frs = [Framing(b), Framing(b)]
+        frs = [Framing(b, fl), Framing(b, fl)]
     chans = [sf_data(b, frs[i], T) for i in range(2)]
     return chans[0], chans[1], dict(sap_mode=sap, ms_used=ms_used,
                                     sap=sap_d,
@@ -638,8 +731,9 @@ def stereo_data(b, T):
     preceded by its own spec_frontend bit (0 = ASF, 1 = SSF). Reading this
     block as two_channel_data dropped those two bits: every such frame
     misparsed from the first channel's b_long_frame on."""
+    fl = frame_len(T)
     if b.u(1):                                      # b_enable_mdct_stereo_proc
-        fr = Framing(b)
+        fr = Framing(b, fl)
         sap, ms_used, sap_d = chparam_info(b, fr, T["sf"])
         frs = [fr, fr]
     else:
@@ -648,7 +742,7 @@ def stereo_data(b, T):
         for _ in range(2):
             if b.u(1) != 0:                         # spec_frontend_l / _r
                 raise ValueError("SSF (speech frontend) not implemented")
-            frs.append(Framing(b))
+            frs.append(Framing(b, fl))
     chans = [sf_data(b, frs[i], T) for i in range(2)]
     return chans[0], chans[1], dict(sap_mode=sap, ms_used=ms_used,
                                     sap=sap_d,
@@ -659,14 +753,11 @@ def stereo_data(b, T):
 def mono_data(b, T, b_lfe):
     """Clause 4.2.6.2."""
     if b_lfe:
-        fr = Framing.__new__(Framing)               # sf_info_lfe: always long
-        fr.long, fr.tl, fr.different = True, None, False
-        fr.max_sfb = [b.u(N_MSFBL_BITS)]
-        fr.num_windows, fr.num_groups, fr.w2g, fr.nwin = 1, 1, [0], [1]
+        fr = lfe_framing(b, frame_len(T))           # sf_info_lfe: always long
     else:
         if b.u(1) != 0:                             # spec_frontend
             raise ValueError("SSF (speech frontend) not implemented")
-        fr = Framing(b)
+        fr = Framing(b, frame_len(T))
     return sf_data(b, fr, T)
 
 

@@ -116,7 +116,7 @@ def compand_levels(Q, sb0, sb1):
     return 0.9105 * e.mean(axis=0) / COMPAND_SCALE
 
 
-def compand(Qs, groups, sbx, ts_offset=None):
+def compand(Qs, groups, sbx, ts_offset=None, geo=None):
     """The companding tool (5.7.5.2) on the analysed core of the channels
     of one A-SPX group, in place, before HF generation (6.2.9). Qs: the
     channels' QMF matrices (list); groups: per frame the A-SPX data (one
@@ -124,22 +124,26 @@ def compand(Qs, groups, sbx, ts_offset=None):
     frame acts on subbands 0 .. sbx - 1 and on the slots of its A-SPX
     interval, atsg_sig[0] .. atsg_sig[num_atsg_sig] (x num_ts_in_ats),
     placed like the envelopes."""
-    off = TS_OFFSET if ts_offset is None else ts_offset
+    geo = geo or A.geometry(1536)
+    off = geo["ts_offset"] if ts_offset is None else ts_offset
+    nts, tia, nats = geo["nts"], geo["tia"], geo["nats"]
+    sbxs = sbx if isinstance(sbx, (list, tuple)) else [sbx] * len(groups)
     a = COMPAND_ALPHA
     G = 2.0 ** (1.0 / a)
     expo = (1.0 - a) / a
     for f, got in enumerate(groups):
         if not isinstance(got, list):
             continue
+        sbx = sbxs[f]
         flags = [c.get("compand") for c in got]
         if any(fl is None for fl in flags):
             continue
         sync = flags[0]["sync"]
         spans, Ls = [], []
         for c, Q in zip(got, Qs):
-            bd = c["fr"].get("borders") or [0, 12]
-            ta = max(f * 24 + int(bd[0]) * 2 + off, 0)
-            tz = min(f * 24 + int(bd[-1]) * 2 + off, Q.shape[1])
+            bd = c["fr"].get("borders") or [0, nats]
+            ta = max(f * nts + int(bd[0]) * tia + off, 0)
+            tz = min(f * nts + int(bd[-1]) * tia + off, Q.shape[1])
             spans.append((ta, tz))
             Ls.append(compand_levels(Q[:, ta:tz], 0, sbx) if tz > ta
                       else np.zeros(0))
@@ -169,19 +173,14 @@ def compand(Qs, groups, sbx, ts_offset=None):
             Q[:sbx, ta:tz] *= g * G
 
 
-_T_CACHE = {}
-
-
-def t_for(cfg):
-    key = (cfg["start_freq"], cfg["stop_freq"], cfg["master_freq_scale"],
-           cfg["noise_sbg"])
-    if key not in _T_CACHE:
-        _T_CACHE[key] = A.sbg_tables(cfg, 0)
-    return _T_CACHE[key]
+def t_for(cfg, xover=0):
+    """The A-SPX tables of a configuration (aspx_bands.tables_for)."""
+    return A.tables_for(cfg, xover)
 
 
 def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
-                  acpl_groups=None, acpl_state0=None, acpl_log=None):
+                  acpl_groups=None, acpl_state0=None, acpl_log=None,
+                  frame_len=1536, t_start=None):
     """Steps 2-5 for the L/R pair, JOINTLY.
 
     Three things run on from one frame to the next: the noise-table index
@@ -208,7 +207,17 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
     C, Ls, Rs); out["L"], out["R"] stay the A-SPX output before the upmix
     (for the decoder's level checks). acpl_state0 / acpl_log as state0 /
     state_log, for the A-CPL state.
+
+    frame_len: the stream's frame length; the time grid (num_qmf_timeslots
+    per frame, num_ts_in_ats, TS_OFFSET) follows it (aspx_bands.geometry).
+
+    t_start: the A-SPX tables in force before the first group (those of
+    the last frame with data before it); out["t_before"][i] are those in
+    force before group i (and one more after the last), for the caller to
+    carry into its next call.
     """
+    geo = A.geometry(frame_len)
+    NT, TIA, TSO, NATS = geo["nts"], geo["tia"], geo["ts_offset"], geo["nats"]
     if cfg is None:
         # no A-SPX configuration yet: the pair only goes through the QMF
         # bank (analysis, synthesis), which is the delay every channel of
@@ -224,14 +233,29 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
             out[k] = Q.synthesise(Qa[k], w, Q.synthesis_matrix(255))
         if acpl_groups is not None:
             out["up"] = _upmix(Qa["L"], Qa["R"], acpl_groups, acpl_state0,
-                               acpl_log, w)
+                               acpl_log, w, geo)
         return out, 0
-    t = t_for(cfg)
-    lim = E.sbg_lim(t)
+    # the tables of each frame: those its A-SPX blocks were sent with
+    # (aspx_xover_subband_offset of the last I-frame, Pseudocode 68), held
+    # through frames without data; cfg's at offset 0 before the first
+    tf, cur, before = [], t_start, []
+    for got in groups:
+        before.append(cur)
+        if isinstance(got, list) and got and got[0].get("t") is not None:
+            cur = got[0]["t"]
+        tf.append(cur if cur is not None else t_for(cfg))
+    before.append(cur)
+    t = tf[0] if tf else t_for(cfg)
+    derived = {}
+
+    def tabs_of(tt):
+        d = derived.get(id(tt))
+        if d is None:
+            d = derived[id(tt)] = (E.sbg_lim(tt), V.sbg_maps(tt))
+        return d
+
     nt = E.noise_table()
     w = Q.qwin()
-    maps = V.sbg_maps(t)
-    n_sb, sbx = t["num_sb_aspx"], t["sbx"]
 
     out = {}
     Qh = {}
@@ -240,10 +264,24 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
         xx = x[:(len(x) // Q.NSB) * Q.NSB]
         Qan[k] = Q.analyse(xx, w, Q.analysis_matrix())
     if COMPANDING:
-        compand([Qan["L"], Qan["R"]], groups, sbx)
+        compand([Qan["L"], Qan["R"]], groups, [tt["sbx"] for tt in tf],
+                geo=geo)
+    keys = []
+    for tt in tf:
+        if all(tt is not x for x in keys):
+            keys.append(tt)
     for k in ("L", "R"):
         Qa = Qan[k]
-        Qh[k] = G.hf_generate(Qa, t)
+        f = (np.arange(Qa.shape[1]) - TSO) // NT
+        fc = np.clip(f, 0, max(len(groups) - 1, 0))
+        Qh[k] = G.hf_generate(Qa, keys[0] if keys else t)
+        # a stream whose tables change (a new aspx_xover_subband_offset or
+        # configuration): each QMF slot is generated with the tables of the
+        # frame it carries
+        for tt in keys[1:]:
+            own = np.array([tf[i] is tt for i in fc], bool)
+            if own.any():
+                Qh[k][:, own] = G.hf_generate(Qa, tt)[:, own]
         # HF generation only on the QMF slots of frames that have A-SPX
         # data (or are concealed, whose high band is muted below): slot ts
         # carries frame (ts - TS_OFFSET) // 24. The others -- frames from
@@ -251,7 +289,6 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
         # before the first frame -- keep the analysed core and nothing
         # above it; patched there, they would play the copied low band
         # unadjusted (up to 0.88 of full scale was measured).
-        f = (np.arange(Qh[k].shape[1]) - TS_OFFSET) // 24
         has = np.array([g is not None for g in groups] + [False], bool)
         keep = ~has[np.where((f >= 0) & (f < len(groups)), f, len(groups))]
         if keep.any():
@@ -264,7 +301,10 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
         idx_noise, (prev[0], prev[1]), (nprev[0], nprev[1]) = state0
     slot = 0
     applied = 0
-    for got in groups:
+    for fi, got in enumerate(groups):
+        t = tf[fi]
+        lim, maps = tabs_of(t)
+        n_sb, sbx = t["num_sb_aspx"], t["sbx"]
         if state_log is not None:
             state_log.append((idx_noise, (prev[0], prev[1]),
                               (nprev[0], nprev[1])))
@@ -272,18 +312,18 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
             # a concealed frame: no high band for its slots (its core is
             # the faded overlap tail); the envelope state is held as it was
             for k in ("L", "R"):
-                ta = max(slot + TS_OFFSET, 0)
-                tz = min(slot + 24 + TS_OFFSET, Qh[k].shape[1])
+                ta = max(slot + TSO, 0)
+                tz = min(slot + NT + TSO, Qh[k].shape[1])
                 if tz > ta:
                     Qh[k][sbx:sbx + n_sb, ta:tz] = 0.0
             # the noise table runs on as if the frame had been decoded
-            # (one frame = 24 QMF slots), so the frames after it pick up
-            # the noise sequence where a clean decode would be
-            idx_noise = (idx_noise + n_sb * 24) % 512
-            slot += 24
+            # (one frame = num_qmf_timeslots slots), so the frames after it
+            # pick up the noise sequence where a clean decode would be
+            idx_noise = (idx_noise + n_sb * NT) % 512
+            slot += NT
             continue
         if got is None or len(got) < 2:
-            slot += 24
+            slot += NT
             continue
         try:
             qa, prev[0] = V.reconstruct(got[0], t, maps, prev[0])
@@ -291,7 +331,7 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
             na, nprev[0] = E.noise_qscf(got[0], t, nprev[0])
             nb, nprev[1] = E.noise_qscf(got[1], t, nprev[1])
             fr0 = got[0]["fr"]
-            borders = fr0.get("borders") or [0, 12]
+            borders = fr0.get("borders") or [0, NATS]
             # Pseudocodes 82, 84: 1.5 dB steps (aspx_qmode_env 0) -> a = 2
             a0 = E.env_a(got[0].get("qmode", 1))
             a1 = E.env_a(got[1].get("qmode", 1))
@@ -308,7 +348,7 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
                 nsA = E.map_noise(dqa, t, n_sb, sigA.shape[1])
                 nsB = E.map_noise(dqb, t, n_sb, sigB.shape[1])
         except Exception:                                      # noqa: BLE001
-            slot += 24
+            slot += NT
             continue
         # WITH balance = 0 THE TWO CHANNELS HAVE INDEPENDENT FRAMINGS, so each
         # gets its OWN borders.  Using channel 0's for both silently skipped
@@ -321,7 +361,7 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
         ok = True
         for k, sig, ns, bd, frk in (("L", sigA, nsA, b0, got[0]["fr"]),
                                     ("R", sigB, nsB, b1, got[1]["fr"])):
-            est = E.estimate(Qh[k], t, bd, slot, 2, ts_off=TS_OFFSET)
+            est = E.estimate(Qh[k], t, bd, slot, TIA, ts_off=TSO)
             if est.shape != sig.shape:
                 ok = False
                 break
@@ -329,10 +369,10 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
             # p_sine_at_end) takes no noise factor in its gain or boost
             g, nl = E.adjust(Qh[k], t, sig, est, lim, ns[:, :est.shape[1]],
                              E.transient_envelopes(frk, est.shape[1]))
-            t0 = slot + int(bd[0]) * 2 + TS_OFFSET     # atsg_sig[0], slots
+            t0 = slot + int(bd[0]) * TIA + TSO         # atsg_sig[0], slots
             for e in range(est.shape[1]):
-                ta = slot + int(bd[e]) * 2 + TS_OFFSET
-                tz = slot + int(bd[e + 1]) * 2 + TS_OFFSET
+                ta = slot + int(bd[e]) * TIA + TSO
+                tz = slot + int(bd[e + 1]) * TIA + TSO
                 ta, tz = max(ta, 0), min(tz, Qh[k].shape[1])
                 if tz <= ta:
                     continue
@@ -347,12 +387,12 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
                     Qh[k][sbx:sbx + n_sb, ts] += nl[:, e] * nt[kk]
         if ok:
             applied += 1
-            span = sum(max(0, min(slot + int(borders[e + 1]) * 2 + TS_OFFSET,
+            span = sum(max(0, min(slot + int(borders[e + 1]) * TIA + TSO,
                                   Qh["L"].shape[1])
-                           - max(slot + int(borders[e]) * 2 + TS_OFFSET, 0))
+                           - max(slot + int(borders[e]) * TIA + TSO, 0))
                        for e in range(len(borders) - 1))
             idx_noise = (idx_noise + n_sb * span) % 512
-        slot += 24
+        slot += NT
 
     if state_log is not None:
         state_log.append((idx_noise, (prev[0], prev[1]),
@@ -361,16 +401,17 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
         out[k] = Q.synthesise(Qh[k], w, Q.synthesis_matrix(255))
     if acpl_groups is not None:
         out["up"] = _upmix(Qh["L"], Qh["R"], acpl_groups, acpl_state0,
-                           acpl_log, w)
+                           acpl_log, w, geo)
+    out["t_before"] = before
     return out, applied
 
 
-def _upmix(QL, QR, acpl_groups, state0, log, w):
+def _upmix(QL, QR, acpl_groups, state0, log, w, geo):
     """A-CPL (acpl.render) on the pair's QMF matrices, then synthesis of
     the five channels."""
     from . import acpl as ACPL
     up = ACPL.render(QL, QR, acpl_groups, state0=state0, state_log=log,
-                     ts_offset=TS_OFFSET)
+                     ts_offset=geo["ts_offset"], nts=geo["nts"])
     return {k: Q.synthesise(v, w, Q.synthesis_matrix(255))
             for k, v in up.items()}
 

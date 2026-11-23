@@ -67,6 +67,20 @@ TS_OFFSET_HFGEN = {2048: 6, 1920: 6, 1536: 6, 1024: 3, 960: 3, 768: 3,
                    512: 3, 384: 3}
 
 
+def geometry(frame_length=1536):
+    """The QMF tools' time grid for a frame length (Table 192, Pseudocode
+    75a): nts = num_qmf_timeslots, tia = num_ts_in_ats, nats =
+    num_aspx_timeslots, hfgen = ts_offset_hfgen, and ts_offset, the QMF
+    analysis slot (from the frame's first) that A-SPX interval slot 0 acts
+    on: nts - ts_offset_hfgen (the interpretation of phase A, 18 at frame
+    length 1536; see README, Interpretations)."""
+    nts = frame_length // 64
+    tia = NUM_TS_IN_ATS[frame_length]
+    hf = TS_OFFSET_HFGEN[frame_length]
+    return dict(fl=frame_length, nts=nts, tia=tia, nats=nts // tia,
+                hfgen=hf, ts_offset=nts - hf)
+
+
 def num_aspx_timeslots(frame_length=1536, qmf_bands=64):
     """Pseudocode 75a.  Decides the 2-vs-1 bit widths in aspx_framing.
 
@@ -102,8 +116,10 @@ def sbg_tables(cfg, xover):
     for s in range(1, n_lo + 1):
         lo.append(hi[2 * s] if n_hi % 2 == 0 else hi[2 * s - 1])
 
-    sba, sbz = master[0], master[n_master]               # Pseudocode 70
-    n_noise = max(1, math.floor(cfg["noise_sbg"] * math.log2(sbz / sba) + 0.5))
+    # Pseudocode 70: log2(sbz / sbx), the A-SPX range from the crossover
+    # (sbx = sba only when aspx_xover_subband_offset is 0)
+    sba, sbz = master[0], master[n_master]
+    n_noise = max(1, math.floor(cfg["noise_sbg"] * math.log2(sbz / sbx) + 0.5))
     idx = [0]
     noise = [lo[0]]
     for s in range(1, n_noise + 1):
@@ -117,6 +133,25 @@ def sbg_tables(cfg, xover):
              sbx=sbx, num_sb_aspx=num_sb_aspx)
     t.update(patches(t, cfg))
     return t
+
+
+_TABLES = {}
+
+
+def tables_for(cfg, xover=0):
+    """sbg_tables(cfg, xover), cached. xover: aspx_xover_subband_offset
+    (Pseudocode 68), sent in each A-SPX block of an I-frame."""
+    key = (cfg["start_freq"], cfg["stop_freq"], cfg["master_freq_scale"],
+           cfg["noise_sbg"], xover)
+    t = _TABLES.get(key)
+    if t is None:
+        t = _TABLES[key] = sbg_tables(cfg, xover)
+    return t
+
+
+def tables_ok(t):
+    """The tables can carry A-SPX: at least one subband group."""
+    return t["n_hi"] >= 1 and t["n_lo"] >= 1 and t["num_sb_aspx"] >= 1
 
 
 def patches(t, cfg, base_samp_freq=48):

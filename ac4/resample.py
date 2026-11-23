@@ -99,6 +99,12 @@ class StreamResampler:
     KEEP = 32       # input samples of history kept ahead of the next output
 
     def __init__(self, up=UP, down=DOWN):
+        # Table 83 / 84: 1001/960, 25/24 or 15/16; ratio 1 (frame_rate_index
+        # 13) is no resampling at all: push() passes the samples through,
+        # without the filter's delay
+        from math import gcd
+        g = gcd(up, down)
+        up, down = up // g, down // g
         self.up, self.down = up, down
         self.buf = None         # delayed input from index `base` onwards
         self.base = 0           # always a multiple of `down` (phase 0)
@@ -107,6 +113,10 @@ class StreamResampler:
 
     def push(self, x):
         x = np.asarray(x, dtype=np.float64)
+        if self.up == self.down:
+            self.n_in += len(x)
+            self.n_out += len(x)
+            return x.copy()
         if self.buf is None:
             self.buf = np.zeros((self.DELAY,) + x.shape[1:])
         self.buf = np.concatenate([self.buf, x])
@@ -168,9 +178,10 @@ def stream_gate():
     return ok
 
 
-def expected_length(n_frames):
-    """Exact output sample count for a whole number of AC-4 frames."""
+def expected_length(n_frames, frame=INTERNAL_FRAME, up=UP, down=DOWN):
+    """Exact output sample count for a whole number of AC-4 frames (the
+    stream resampler gives ceil(n * up / down))."""
     # 1536 * 1001/960 = 1601.6 -- integral only over groups of 5 frames,
     # so compute on the total rather than per frame.
-    total = n_frames * INTERNAL_FRAME
-    return total * UP // DOWN
+    total = n_frames * frame
+    return -(-total * up // down)

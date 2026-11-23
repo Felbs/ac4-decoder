@@ -23,7 +23,8 @@ DAMAGED INPUT. Frames that break a rule of the bitstream are concealed
 (faded to silence, exact length kept); the summary line counts them as
 "concealed", with the reasons above it.
 
-OUT is 16-bit PCM at 48 kHz: 6 channels in WAV 5.1 order (L R C LFE Ls Rs)
+OUT is 16-bit PCM at 48 kHz (44,1 kHz for a 44,1 kHz stream), every
+frame rate of TS 103 190-1 Table 83 resampled as the table says: 6 channels in WAV 5.1 order (L R C LFE Ls Rs)
 for a 5.1 element, 2 for stereo.
 
 OUTPUT LEVEL. The decoder's true full scale is not established, so the
@@ -127,7 +128,8 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
                 max_pass=1800, ref_peak=0.0, quiet=False, guard=True,
                 presentation=None, language=None):
     from . import container
-    from .decoder import Decoder, probe_element
+    from . import rates as RT
+    from .decoder import Decoder, probe_element, probe_rate
     from .resample import StreamResampler
 
     def say(*a):
@@ -142,8 +144,13 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
             say(f"  {source.kind}: {sy.get('n_crc_bad', 0)} frames failed "
                 f"their CRC, {sy.get('n_skipped', 0)} bytes skipped to "
                 "regain sync")
+    rate = probe_rate(frames)
+    if rate is None or RT.ratio(*rate) is None:
+        rate = (1, 3)
+    fps = RT.FPS[rate[1]]
+    out_fs = RT.out_rate(rate[0])
     if seconds is not None:
-        frames = frames[:max(0, int(round(seconds * FPS)))]
+        frames = frames[:max(0, int(round(seconds * fps)))]
     if not frames:
         say(f"no AC-4 frames found in {src}")
         return 1
@@ -158,14 +165,14 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
     dec = Decoder(element, channels, guard=guard,
                   presentation=presentation, language=language)
     lvl = LevelPolicy(element, ref_peak)
-    rs = StreamResampler()
+    rs = StreamResampler(*RT.ratio(*rate))
     n_ch = len(dec.chans)
     n_out = 0
     w = wave.open(dst, "wb")
     try:
         w.setnchannels(n_ch)
         w.setsampwidth(2)
-        w.setframerate(OUT_FS)
+        w.setframerate(out_fs)
         step = max(8, int(max_pass))
         for i in range(0, len(frames), step):
             y = dec.decode_pass(frames[i:i + step])
@@ -178,15 +185,15 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
     dt = time.time() - t0
     for line in dec.log + lvl.notes:
         say("  " + line)
-    secs = n_out / OUT_FS
+    secs = n_out / out_fs
     if dec.n_concealed:
         why = ", ".join(f"{k} {v}" for k, v in
                         sorted(dec.concealed.reasons.items()))
         say(f"  concealed frames by reason: {why}")
         if dec.concealed.reasons.get("toc.unsupported_rate"):
-            say("  this decoder renders 48 kHz-family streams at 29.97 fps "
-                "only (TS 103 190-1 frame_rate_index 3); the frames at "
-                "other rates are silent")
+            say("  frames with frame_rate_factor or frame_rate_fraction "
+                "above 1, 96/192 kHz substreams or reserved rates are not "
+                "decoded; they are silent")
     say(f"{len(frames)} frames ({dec.n_bad} bad, {dec.n_concealed} "
         f"concealed, {dec.n_seq_jumps} sequence jumps), element {element}, "
         f"{n_ch} ch, {secs:.3f} s -> {dst}  "

@@ -12,6 +12,11 @@ TABLE OF CONTENTS (TS 103 190-1 4.2.3, -2 6.2.1)
   toc.version     bitstream_version differs from the stream's
   toc.seq_range   sequence_counter > 1020 (4.3.3.2.2: never written)
   toc.rate        fs_index / frame_rate_index differ from the stream's
+                  (never re-learnt: the stream's rate is that of its first
+                  decodable frame whose next frame agrees)
+  toc.unsupported_rate  a rate this decoder does not decode (rates.py:
+                  reserved indices, frame_rate_factor or
+                  frame_rate_fraction > 1, 96/192 kHz substreams)
   toc.shape       presentation/substream layout (channel modes, number of
                   substreams) differs from the stream's
   toc.sizes       the substream size list does not match n_substreams, or
@@ -32,7 +37,7 @@ AUDIO SUBSTREAM (4.2.4.2, 4.3.4.1)
                        the same decode pass brings it (Ac4Stream.
                        _late_closure; only when >= 90 % of such frames close)
   element.mode         the element's codec mode differs from the stream's
-  (toc.version, toc.rate, toc.shape and element.mode are re-learnt: see
+  (toc.version, toc.shape and element.mode are re-learnt: see
   RELEARN below)
   element.parse        the element does not parse (ran out of bits, a
                        mode this decoder does not implement)
@@ -213,6 +218,17 @@ def peek_counter(frame):
 
 
 # ------------------------------------------------------------ TOC
+def peek_rate(frame):
+    """(fs_index, frame_rate_index) of a frame, or None when its TOC does
+    not parse."""
+    from . import toc as M
+    try:
+        st = M.parse(frame)
+    except Exception:                                          # noqa: BLE001
+        return None
+    return (st.get("fs_index"), st.get("frame_rate_index"))
+
+
 def toc_shape(st):
     """What must stay the same from frame to frame of one stream."""
     return (st.get("bitstream_version"), st.get("fs_index"),
@@ -248,7 +264,7 @@ def check_toc(st, frame, ref_shape):
 # TOC agrees), or RELEARN frames in a row show the same new layout and mode.
 # Without this, one damaged TOC field in the first frame, or a splice to a
 # stream in another codec mode, muted everything after it.
-RELEARNABLE = ("toc.version", "toc.rate", "toc.shape", "element.mode")
+RELEARNABLE = ("toc.version", "toc.shape", "element.mode")
 RELEARN = 3
 
 

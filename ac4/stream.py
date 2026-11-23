@@ -33,6 +33,7 @@ from . import aspx_bands as A                                       # noqa: E402
 from . import aspx_render as R37                                      # noqa: E402
 from . import robust as RB                                          # noqa: E402
 from . import acpl_parse as AP                                      # noqa: E402
+from . import rates as RT                                           # noqa: E402
 
 # Marks a CONCEALED frame in the A-SPX group lists (where None means "no
 # A-SPX data for this frame"). The renderer mutes the high band for it and
@@ -72,6 +73,13 @@ class Ac4Stream:
         for nm in self.tabs:
             P.CENTRE[nm] = 0 if nm.endswith("_F0") else \
                 (len(arrays[nm + "_LEN"]) - 1) // 2
+        # the stream's rate (TS 103 190-1 Table 83): (fs_index,
+        # frame_rate_index) and frame_len_base, learnt from the first frame
+        # whose rate this decoder decodes and whose next frame agrees
+        self.rate = None
+        self.frame_len = None
+        self.Tf = self.T
+        self.xover0 = {}
         self.nats = A.num_aspx_timeslots()
         self.cfg = None
         self.fstate = {}
@@ -138,6 +146,7 @@ class Ac4Stream:
         self.status = []
         self.seq_break = []
         pending = []            # frames decoded before any aspx_config
+        early = []              # concealed before the rate was known
         for fi, f in enumerate(frames):
             wpos = {k: len(v) for k, v in wins.items()}
             fstate0 = dict(self.fstate)
@@ -153,14 +162,30 @@ class Ac4Stream:
                     st = M.parse(f)
                 except Exception as e:                         # noqa: BLE001
                     raise RB.Damaged("toc.parse", str(e)[:60])
-                # the only rate this decoder renders: 48 kHz family,
-                # 29.97 fps (frame length 1536; TS 103 190-1 Table 83).
-                # Another frame length decoded as 1536 would be noise.
-                if (st["fs_index"], st["frame_rate_index"]) != (1, 3):
-                    raise RB.Damaged("toc.unsupported_rate",
-                                     f"fs_index {st['fs_index']} "
-                                     f"frame_rate_index "
-                                     f"{st['frame_rate_index']}")
+                # the rate (TS 103 190-1 Tables 83, 84): every
+                # frame_rate_index of 48 kHz and index 13 of 44,1 kHz;
+                # not frame_rate_factor / frame_rate_fraction > 1 (rates.py)
+                why = RT.unsupported(st) if on else None
+                if why is None and not on and RT.frame_len_base(
+                        *RT.of_toc(st)) is None:
+                    why = "no frame length"
+                if why:
+                    raise RB.Damaged("toc.unsupported_rate", why)
+                rate = RT.of_toc(st)
+                if self.rate is None:
+                    # the stream's rate is the first decodable frame's,
+                    # when the next frame (if any) agrees: one damaged
+                    # rate field in the first frame cannot fix the
+                    # stream's frame length
+                    if on and fi + 1 < len(frames) and \
+                            RB.peek_rate(frames[fi + 1]) != rate:
+                        raise RB.Damaged("toc.rate", f"{rate} not confirmed")
+                    self._set_rate(rate)
+                elif rate != self.rate:
+                    # a change of rate is not followed (the frame length,
+                    # the QMF time grid and the resampler are the stream's)
+                    raise RB.Damaged("toc.rate", f"{rate} in a "
+                                     f"{self.rate} stream")
                 # a TOC or codec mode that differs from the stream's is
                 # judged only after the frame has passed every other check
                 # (RB.Relearn): a real change is accepted at an I-frame, or
@@ -216,11 +241,14 @@ class Ac4Stream:
                 self.last_toc = st
                 sub = M.substream_bytes(f, st, sel["index"])
                 ifr = bool(sel["ndot"][0])
+                why = RT.unsupported(st, sel) if on else None
+                if why:
+                    raise RB.Damaged("toc.unsupported_rate", why)
                 if self.element == "pair":
                     from . import pair as PAIR
-                    r = PAIR.decode_pair(sub, self.T, b_iframe=ifr)
+                    r = PAIR.decode_pair(sub, self.Tf, b_iframe=ifr)
                 else:
-                    r = C.decode_element(sub, self.T, b_iframe=ifr)
+                    r = C.decode_element(sub, self.Tf, b_iframe=ifr)
                 if r["bits"] > r["nbits"]:
                     raise RB.Damaged("element.parse",
                                      "element overran its substream")
@@ -371,6 +399,12 @@ class Ac4Stream:
                     self.relearn.reset()
                 # ---- the frame is accepted: commit its state
                 if r.get("aspx"):
+                    if self.cfg is None:
+                        # the aspx_xover_subband_offsets of the stream's
+                        # first configuration: the late check parses the
+                        # frames from before it with them
+                        self.xover0 = {g: dict.get(self.fstate, ("xover", g),
+                                                   0) for g in range(3)}
                     self.cfg = r["aspx"]
                 if r.get("acpl"):
                     self.acpl_cfg = r["acpl"]
@@ -424,8 +458,11 @@ class Ac4Stream:
                 self.fstate = fstate0
                 self.acpl_q = acpl_q0
                 reason = RB.reason_of(e)
-                u = {k: [np.zeros(1536)] for k in chans}
-                seq_l = {k: [1536] for k in chans}
+                fl = self.frame_len or RT.DEFAULT_FRAME
+                if self.frame_len is None:
+                    early.append((fi, wpos))
+                u = {k: [np.zeros(fl)] for k in chans}
+                seq_l = {k: [fl] for k in chans}
                 got_lr = got_sr = got_c = got_acpl = CONCEALED
                 self.n_bad += 1
                 self.damage.add(reason)
@@ -453,9 +490,27 @@ class Ac4Stream:
             groups["sr"].append(got_sr)
             groups["c"].append(got_c)
             groups["acpl"].append(got_acpl)
+        if early and self.frame_len not in (None, RT.DEFAULT_FRAME):
+            # frames concealed before the rate was learnt in this pass take
+            # the stream's frame length (one window each)
+            fl = self.frame_len
+            for fi, wpos in early:
+                for k in wins:
+                    p0 = wpos.get(k)
+                    if p0 is not None:
+                        wins[k][p0] = np.zeros(fl)
+                        lengths[k][p0] = fl
         if pending and self.cfg and RB.CHECKS:
             self._late_closure(pending, wins, lengths, counts, groups)
         return wins, lengths, groups, counts
+
+    def _set_rate(self, rate):
+        """Adopt the stream's rate: its frame length (Table 83), the
+        tables the element parse reads it from, and num_aspx_timeslots."""
+        self.rate = rate
+        self.frame_len = RT.frame_len_base(*rate)
+        self.Tf = dict(self.T, fl=self.frame_len)
+        self.nats = A.num_aspx_timeslots(self.frame_len)
 
     def _late_closure(self, pending, wins, lengths, counts, groups):
         """Frames decoded before the stream's first aspx_config could only
@@ -471,7 +526,14 @@ class Ac4Stream:
         from .toc import Bits
         cfg, acfg = self.cfg, self.acpl_cfg
         t = R37.t_for(cfg)
-        state = RB.TrackingState()
+
+        def fresh():
+            st = RB.TrackingState()
+            for g, x in self.xover0.items():
+                dict.__setitem__(st, ("xover", g), x)
+            return st
+
+        state = fresh()
         verdicts = []
         for pd in pending:
             if self.status[pd["fi"]] is not None:
@@ -503,7 +565,7 @@ class Ac4Stream:
                 verdicts.append((pd, ok))
             if not ok:
                 # a frame that did not parse leaves no state to trust
-                state = RB.TrackingState()
+                state = fresh()
         if not verdicts:
             return
         if sum(ok for _, ok in verdicts) < RB.LATE_MAJORITY * len(verdicts):
@@ -516,8 +578,9 @@ class Ac4Stream:
                 p0, c = pd["wpos"].get(k), counts[k][fi]
                 if p0 is None:
                     continue
-                wins[k][p0:p0 + c] = [np.zeros(1536)]
-                lengths[k][p0:p0 + c] = [1536]
+                fl = self.frame_len or RT.DEFAULT_FRAME
+                wins[k][p0:p0 + c] = [np.zeros(fl)]
+                lengths[k][p0:p0 + c] = [fl]
                 counts[k][fi] = 1
             for key in ("lr", "sr", "c", "acpl"):
                 if key in groups:

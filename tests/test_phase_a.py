@@ -108,8 +108,26 @@ def emdf_info(w):
     w.u(2, 0).u(3, 0).u(1, 0).u(2, 1).u(8, 0).u(2, 0)
 
 
+def rate_info(w, fri, frf=1, fraction=1):
+    """frame_rate_multiply_info (TS 103 190-1 Table 87) and
+    frame_rate_fractions_info (TS 103 190-2 6.2.1.4) for fri."""
+    if fri in (2, 3, 4):
+        w.u(1, int(frf > 1))
+        if frf > 1:
+            w.u(1, int(frf == 4))
+    elif fri in (0, 1, 7, 8, 9):
+        w.u(1, int(frf > 1))
+    if fri in (5, 6, 7, 8, 9):
+        if frf == 1:
+            w.u(1, int(fraction > 1))
+    elif fri in (10, 11, 12):
+        w.u(1, int(fraction > 1))
+        if fraction > 1:
+            w.u(1, int(fraction == 4))
+
+
 def presentation(w, groups, pres_sub, md_compat=0, pres_id=None,
-                 enabled=None):
+                 enabled=None, fri=3, frf=1, fraction=1):
     """ac4_presentation_v1_info, bitstream_version 2."""
     if len(groups) == 1:
         w.u(1, 1)                            # b_single_substream_group
@@ -121,7 +139,7 @@ def presentation(w, groups, pres_sub, md_compat=0, pres_id=None,
         w.u(1, 0)
     else:
         w.u(1, 1).vb(2, pres_id)
-    w.u(1, 0)                                # frame_rate_multiply_info (fri 3)
+    rate_info(w, fri, frf, fraction)
     emdf_info(w)
     if enabled is None:
         w.u(1, 0)
@@ -138,14 +156,20 @@ def presentation(w, groups, pres_sub, md_compat=0, pres_id=None,
     w.u(1, 0).u(1, 1).u(2, pres_sub)         # presentation_substream_info
 
 
-def group(w, ch_mode_code, index, ndot=1, cc=None, lang=None):
+def group(w, ch_mode_code, index, ndot=1, cc=None, lang=None, fs=1, frf=1,
+          sf_mult=None):
     """ac4_substream_group_info with one channel-coded substream."""
     w.u(1, 1).u(1, 0).u(1, 1)                # present, no hsf, single
     w.u(1, 1)                                # b_channel_coded
     w.u(len(ch_mode_code), int(ch_mode_code, 2))
-    w.u(1, 0)                                # b_sf_multiplier (fs_index 1)
+    if fs == 1:
+        if sf_mult is None:
+            w.u(1, 0)                        # b_sf_multiplier
+        else:
+            w.u(1, 1).u(1, sf_mult)
     w.u(1, 0)                                # b_bitrate_info
-    w.u(1, ndot)                             # b_audio_ndot
+    for _ in range(frf):
+        w.u(1, ndot)                         # b_audio_ndot
     w.u(2, index)
     if cc is None:
         w.u(1, 0)
@@ -159,8 +183,11 @@ def group(w, ch_mode_code, index, ndot=1, cc=None, lang=None):
                 w.u(8, c)
 
 
-def build_toc(pres, groups, sizes, iframe=1, seq=5):
-    w = BW().u(2, 2).u(10, seq).u(1, 0).u(1, 1).u(4, 3).u(1, iframe)
+def build_toc(pres, groups, sizes, iframe=1, seq=5, fs=1, fri=3, frf=1,
+              fraction=1):
+    w = BW().u(2, 2).u(10, seq).u(1, 0).u(1, fs).u(4, fri).u(1, iframe)
+    pres = [dict(p, fri=fri, frf=frf, fraction=fraction) for p in pres]
+    groups = [dict(g, fs=fs, frf=frf) for g in groups]
     if len(pres) == 1:
         w.u(1, 1)
     else:
@@ -335,7 +362,9 @@ def test_fixfix_single_envelope_reports_qmode_0(monkeypatch):
     monkeypatch.setattr(P, "ec_data",
                         lambda b, tabs, t, kind, n, fres, q, sm, d:
                         calls.setdefault(kind, []).append(q) or [[0]])
-    out = P.aspx_data(Bits(bytes(4)), {}, {}, dict(quant_mode_env=1), 12,
+    from test_units import _aspx_cfg
+    out = P.aspx_data(Bits(bytes(4)), {}, {},
+                      dict(_aspx_cfg()[0], quant_mode_env=1), 12,
                       False, False, {}, 0)
     assert out[0]["qmode"] == 0 and calls["SIGNAL"] == [0]
 
@@ -414,21 +443,3 @@ def test_centre_goes_through_the_aspx_renderer(monkeypatch):
     assert len(calls) == 3 and calls[2][0]
 
 
-@pytest.mark.parametrize("fri", [2, 4])
-def test_frames_at_other_rates_are_concealed(fri):
-    """Only frame_rate_index 3 (29.97 fps, 1536 samples) is rendered; a
-    frame at another rate is concealed with its own reason instead of being
-    decoded as 1536 samples (noise)."""
-    from ac4 import stream as ST
-    t = dict(pres=[dict(groups=[0], pres_sub=0)],
-             groups=[dict(ch_mode_code="10", index=1)], sizes=[2, 4])
-    f = bytearray(build_toc(**t) + bytes(6))
-    # rewrite frame_rate_index (4 bits after fs_index, bit 14 of the TOC;
-    # 2, 3 and 4 share the TOC layout)
-    bits = list(format(int.from_bytes(f[:3], "big"), "024b"))
-    bits[14:18] = format(fri, "04b")
-    f[:3] = int("".join(bits), 2).to_bytes(3, "big")
-    assert M.parse(bytes(f))["frame_rate_index"] == fri
-    s = ST.Ac4Stream("pair")
-    s.decode_frames([bytes(f)])
-    assert s.status == ["toc.unsupported_rate"]

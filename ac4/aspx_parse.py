@@ -179,9 +179,25 @@ def sine_at_end(state, key, tsg_ptr, num_env):
     return 0 if prev is not None and prev[0] == prev[1] else -1
 
 
+# Table 194: tab_border[num_aspx_timeslots][aspx_num_env | aspx_num_noise],
+# the borders of a FIXFIX interval. (An even split rounded to nearest does
+# not give them all: 15 slots in 4 envelopes are {0, 4, 8, 12, 15}.)
+TAB_BORDER = {
+    6: {1: (0, 6), 2: (0, 3, 6), 4: (0, 2, 3, 4, 6)},
+    8: {1: (0, 8), 2: (0, 4, 8), 4: (0, 2, 4, 6, 8)},
+    12: {1: (0, 12), 2: (0, 6, 12), 4: (0, 3, 6, 9, 12)},
+    15: {1: (0, 15), 2: (0, 8, 15), 4: (0, 4, 8, 12, 15)},
+    16: {1: (0, 16), 2: (0, 8, 16), 4: (0, 4, 8, 12, 16)},
+}
+
+
 def tab_border(nats, n):
-    """The FIXFIX uniform border table -- evenly spaced, last one exact."""
-    return [round(i * nats / n) for i in range(n)] + [nats]
+    """The FIXFIX border table (Table 194). n = 8 (num_env_bits_fixfix 1,
+    tmp_num_env 3) is not in the table: such a frame is damaged."""
+    try:
+        return list(TAB_BORDER[nats][n])
+    except KeyError:
+        raise Damaged("aspx.num_env", f"FIXFIX {n} at {nats}") from None
 
 
 def var_borders(ic, n, nats, b_iframe, var_l, var_r, rel_l, rel_r,
@@ -339,9 +355,27 @@ def ec_data(b, tabs, t, data_type, num_env, freq_res, qmode, smode, dirs):
 
 
 def aspx_data(b, tabs, t, cfg, nats, b_iframe, two_ch, state, grp):
-    """Tables 51 and 52."""
+    """Tables 51 and 52.
+
+    aspx_xover_subband_offset (I-frames) selects the A-SPX tables of this
+    block (Pseudocode 68: num_sbg_sig_highres = num_sbg_master - offset,
+    so it changes how many values every envelope carries). It is kept in
+    `state` per block (grp) for the frames up to the next I-frame; `t` is
+    ignored (the tables are cfg's at that offset). Each channel's dict
+    carries its tables ("t") and offset ("xover")."""
+    from . import aspx_bands as A
     if b_iframe:
-        b.u(3)                                    # aspx_xover_subband_offset
+        xover = b.u(3)                            # aspx_xover_subband_offset
+        dict.__setitem__(state, ("xover", grp), xover)
+    else:
+        xover = dict.get(state, ("xover", grp), 0)
+    try:
+        t = A.tables_for(cfg, xover)
+        ok = A.tables_ok(t)
+    except Exception:                                          # noqa: BLE001
+        ok = False
+    if not ok:
+        raise Damaged("aspx.config", f"xover {xover}")
     f0 = aspx_framing(b, cfg, nats, b_iframe, state, (grp, 0))
     q0 = cfg["quant_mode_env"]
     if f0["int_class"] == FIXFIX and f0["num_env"] == 1:
@@ -355,7 +389,7 @@ def aspx_data(b, tabs, t, cfg, nats, b_iframe, two_ch, state, grp):
                       d_noise)
         return [dict(fr=f0, sig=sig, noise=noi, dir_sig=d_sig,
                      dir_noise=d_noise, balance=0, ch=0, ah=ah[0],
-                     qmode=q0)]
+                     qmode=q0, t=t, xover=xover)]
     balance = b.u(1)
     f1, q1 = f0, q0
     if balance == 1:
@@ -384,7 +418,7 @@ def aspx_data(b, tabs, t, cfg, nats, b_iframe, two_ch, state, grp):
     n1 = ec_data(b, tabs, t, "NOISE", f1["num_noise"], None, 0, sm1, d1_noise)
     return [dict(fr=f0, sig=s0, noise=n0, dir_sig=d0_sig,
                  dir_noise=d0_noise, balance=balance, ch=0, ah=ah[0],
-                 qmode=q0),
+                 qmode=q0, t=t, xover=xover),
             dict(fr=f1, sig=s1, noise=n1, dir_sig=d1_sig,
                  dir_noise=d1_noise, balance=balance, ch=1, ah=ah[1],
-                 qmode=q1)]
+                 qmode=q1, t=t, xover=xover)]
