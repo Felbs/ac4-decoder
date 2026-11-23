@@ -121,6 +121,7 @@ typedef struct {
     int wlen[6][AC4_MAX_WIN];
     double *win;                /* 6 x FRAME */
     ac4_aspx_frame af[NPAIR];   /* L/R, Ls/Rs, C (as C/C) */
+    ac4_meta meta;              /* presentation substream (valid 0: none) */
 } rec_t;
 
 /* a frame from before the first aspx_config (audio_size.late) */
@@ -142,6 +143,7 @@ typedef struct {
     double pk;                  /* peak over all output channels */
     int ok;
     int n;                      /* samples (the frame length) */
+    ac4_meta meta;
     double pcm[6][FRAME];
 } outf_t;
 
@@ -167,6 +169,9 @@ struct ac4dec {
     int rate_known, fs, fri, fl, nats;
     int rs_fixed, rs_up, rs_down, out_rate;
     ac4_huff huff[AC4T_N_BOOKS];
+    ac4_huff drc_hcb;           /* DRC_HCB */
+    ac4_drc_config drc_state;   /* from the last I-frame */
+    ac4_leveler *lev;           /* cfg.loudness: made at the first emit */
     ac4_books books;
     ac4_aspx_books abk;
     ac4_fb_tables *fbt;
@@ -683,6 +688,10 @@ ac4dec *ac4dec_open(const ac4dec_config *cfg)
             return NULL;
         }
     }
+    if (ac4_huff_build(&d->drc_hcb, &AC4T_MISC_BOOKS[0]) != 0) {
+        ac4dec_close(d);
+        return NULL;
+    }
     for (i = 1; i <= 11; i++)
         d->books.cb[i] = &d->huff[i - 1];
     d->books.sf = &d->huff[AC4T_BOOK_SF];
@@ -725,6 +734,8 @@ void ac4dec_close(ac4dec *d)
         return;
     for (i = 0; i < AC4T_N_BOOKS; i++)
         ac4_huff_free(&d->huff[i]);
+    ac4_huff_free(&d->drc_hcb);
+    free(d->lev);
     ac4_aspx_books_free(&d->abk);
     ac4_fb_tables_free(d->fbt);
     ac4_rs_filter_free(d->rsf);
@@ -1310,6 +1321,33 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         r->af[1].kind = AC4_GRP_NONE;
     if (!(r->mask & (1 << CH_C)))
         r->af[2].kind = AC4_GRP_NONE;
+    /* loudness / DRC metadata of the presentation substream (stream.py
+       _pres_metadata) */
+    if (d->cfg.loudness) {
+        int pi = choose_pres(&d->cfg, &t);
+        const ac4_toc_sub *s = ac4_toc_audio_substream(&t, pi);
+        const ac4_toc_pres *pp = pi >= 0 && pi < t.n_pres ? &t.pres[pi]
+                                                          : NULL;
+        r->meta.valid = 0;
+        if (pp && s && pp->pres_substream >= 0
+            && pp->pres_substream < t.n_substreams
+            && pp->pres_substream < t.n_sizes) {
+            size_t po = t.toc_bytes + (size_t)t.payload_base, pl;
+            long i;
+            for (i = 0; i < pp->pres_substream; i++)
+                po += (size_t)t.sizes[i];
+            if (po > len)
+                po = len;
+            pl = (size_t)t.sizes[pp->pres_substream];
+            if (pl > len - po)
+                pl = len - po;
+            if (ac4_pres_metadata(data + po, pl, pp->b_alternative,
+                                  pp->b_pres_ndot, t.n_substreams,
+                                  &d->drc_state, &d->drc_hcb,
+                                  (int)s->channel_mode, d->fl, &r->meta) != 0)
+                r->meta.valid = 0;
+        }
+    }
     r->code = AC4E_NONE;
     r->seq_jump = brk;
     if (brk)
@@ -1483,6 +1521,7 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
     o->seq = ri->seq;
     o->iframe = ri->iframe;
     o->seq_jump = ri->seq_jump;
+    o->meta = ri->meta;
     o->forced = ri->code != AC4E_NONE;
     o->aspx_flag = 0;
     /* every channel 577 samples late: the delay line, unless its pair
@@ -1824,6 +1863,23 @@ static void emit(ac4dec *d, ac4dec_frame *out)
         d->rs_up = up;
         d->rs_down = dn;
         d->rs_fixed = 1;
+    }
+    if (d->cfg.loudness) {
+        double *pp[6];
+        if (!d->lev) {
+            int drc = d->cfg.drc == 0 ? AC4_DRC_AUTO
+                      : d->cfg.drc < 0 ? AC4_DRC_OFF : d->cfg.drc - 1;
+            d->lev = (ac4_leveler *)malloc(sizeof(ac4_leveler));
+            if (d->lev)
+                ac4_leveler_init(d->lev, d->n_ch, d->n_ch == 6,
+                                 d->cfg.target_level, drc,
+                                 (double)d->out_rate * d->rs_down / d->rs_up);
+        }
+        for (k = 0; k < d->n_ch; k++)
+            pp[k] = o->pcm[k];
+        if (d->lev)
+            ac4_leveler_frame(d->lev, o->meta.valid ? &o->meta : NULL, pp,
+                              o->n);
     }
     if (d->cfg.internal_rate) {
         for (k = 0; k < d->n_ch; k++)

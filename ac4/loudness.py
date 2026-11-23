@@ -195,6 +195,7 @@ class Leveler:
         in units of full scale."""
         y = np.asarray(y, float) / FULL_SCALE
         n_fr = len(y) // frame_len
+        n_slot = -(-frame_len // SLOT)  # a last short slot at 480, 960
         kw = self._kweight(y) if self.drc != "off" else None
         out = y.copy()
         for f in range(n_fr):
@@ -207,19 +208,19 @@ class Leveler:
             if drc is not None:
                 self._drc_frame = drc
             dfr = getattr(self, "_drc_frame", None)
-            gains = np.ones((frame_len // SLOT, len(self.chans)))
+            gains = np.ones((n_slot, len(self.chans)))
             if self.drc != "off" and dfr is not None:
                 gains = self._drc_gains(dfr, kw, f, frame_len, lin,
                                         md is not None and drc is not None)
             a, z = f * frame_len, (f + 1) * frame_len
             seg = out[a:z]
-            for s in range(frame_len // SLOT):
+            for s in range(n_slot):
                 seg[s * SLOT:(s + 1) * SLOT] *= norm * gains[s][None, :]
         return out
 
     def _drc_gains(self, dfr, kw, f, frame_len, lin, fresh):
         cfg = dfr["config"]
-        n_slot = frame_len // SLOT
+        n_slot = -(-frame_len // SLOT)
         g = np.ones((n_slot, len(self.chans)))
         if self.drc == "auto":
             m = select_mode(cfg, self.target)
@@ -244,11 +245,12 @@ class Leveler:
         att, rel, attf, relf, ath, rth = tc
         a0 = f * frame_len
         for s in range(n_slot):
-            seg = kw[a0 + s * SLOT:a0 + (s + 1) * SLOT]
+            seg = kw[a0 + s * SLOT:min(a0 + (s + 1) * SLOT,
+                                       a0 + frame_len)]
             ms = 0.0
             for c in range(len(self.chans)):
                 acc = float(np.sum(np.ascontiguousarray(seg[:, c]) ** 2))
-                ms += self.w[c] * (acc / SLOT)
+                ms += self.w[c] * (acc / len(seg))
             lvl = ms                                    # linear power
             x = -0.691 + 10.0 * math.log10(lvl + 1e-30) - lin
             gl = 10.0 ** (curve_gain(x, pts) / 20.0)
@@ -262,7 +264,7 @@ class Leveler:
                         tau = attf
                     elif -r > rth:
                         tau = relf
-                al = 2.0 ** (-T / tau)
+                al = 2.0 ** (-T / tau) if tau > 0 else 0.0
                 self.g_s = al * self.g_s + (1.0 - al) * gl
                 self.l_s = al * self.l_s + (1.0 - al) * lvl
             g[s, :] = self.g_s

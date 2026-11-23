@@ -173,6 +173,7 @@ typedef struct {
     int n_groups;          /* kept references */
     long groups[AC4_MAX_PGROUPS];
     long pres_substream;   /* -1 when none */
+    int b_alternative, b_pres_ndot;
 } ac4_toc_pres;
 
 typedef struct {
@@ -690,5 +691,72 @@ void ac4_rs_init(ac4_rs_state *s);
 /* Push n input samples; writes the outputs to out, returns their count. */
 int ac4_rs_push(const ac4_rs_filter *f, ac4_rs_state *s, const double *x,
                 int n, double *out);
+
+/* ------------------------------------------------------------ loudness
+ * loudness.c: dialnorm and drc_frame of the presentation substream, and
+ * the output stage of ac4/loudness.py */
+#define AC4_FULL_SCALE (sqrt(2.0 * 1536.0) * pow(2.0, 14.5))
+                           /* IMDCT_K * 2^14.5 (needs math.h) */
+#define AC4_DRC_AUTO (-1)
+#define AC4_DRC_OFF (-2)
+#define AC4_LEV_CH 6
+
+typedef struct {
+    int id;
+    double lo, hi;              /* output level range */
+    int curve_flag, default_profile, gains_config, has_curve;
+    int nb_low, nb_high, g_max_boost, l_max_boost, n_boost, g_sec_boost,
+        l_sec_boost, g_max_cut, l_max_cut, n_cut, g_sec_cut, l_sec_cut;
+    int tc_default, tc[4], adaptive, th[2];
+} ac4_drc_mode;
+
+typedef struct {
+    int valid, n_modes, eac3_profile;
+    ac4_drc_mode m[8];
+} ac4_drc_config;
+
+typedef struct {
+    int present, n_ch, n_sf, n_band;
+    int g[3][8][4];             /* dB2 */
+} ac4_drc_gains;
+
+typedef struct {
+    int valid;                  /* dialnorm parsed */
+    double dialnorm;            /* dBFS */
+    int has_drc;
+    ac4_drc_config cfg;         /* in force for this frame */
+    int reset;                  /* drc_reset_flag, -1 when not sent */
+    ac4_drc_gains gains[8];     /* by mode id */
+} ac4_meta;
+
+/* -> 0 (out->valid tells whether dialnorm parsed), -1 when nothing did.
+   state: the DRC configuration, updated on an I-frame. hcb: DRC_HCB. */
+int ac4_pres_metadata(const uint8_t *sub, size_t len, int b_alternative,
+                      int b_pres_ndot, long n_substreams,
+                      ac4_drc_config *state, const ac4_huff *hcb,
+                      int ch_mode, int fl, ac4_meta *out);
+double ac4_curve_gain(double x, const double *pv);
+
+typedef struct {
+    int n_ch, drc, mode_id;
+    double target, rate;
+    double w[AC4_LEV_CH];
+    int grp[AC4_LEV_CH];
+    double z1[2][AC4_LEV_CH], z2[2][AC4_LEV_CH];
+    double lin;
+    int has_lin;
+    ac4_meta dfr;
+    int has_dfr;
+    double g_s, l_s;
+    int has_s;
+    double kw[AC4_LEV_CH][2048];
+} ac4_leveler;
+
+void ac4_leveler_init(ac4_leveler *lv, int n_ch, int five, double target,
+                      int drc, double rate);
+/* one output frame, planar, decoder units in, units of full scale out;
+   md NULL (concealed) keeps the last */
+void ac4_leveler_frame(ac4_leveler *lv, const ac4_meta *md, double **pcm,
+                       int n);
 
 #endif

@@ -55,6 +55,10 @@ CHANS6 = ("L", "R", "C", "LFE", "Ls", "Rs")
 # pass boundaries differ from one pass in the last frame of each pass
 # (README, Known issues): set AC4_MAX_PASS=1000000 for longer inputs.
 MAX_PASS = int(os.environ.get("AC4_MAX_PASS", "1800"))
+# AC4_LOUDNESS=1: compare the loudness-normalised output (both CLIs'
+# default) in units of full scale; otherwise decoder scale, the old
+# fixed-reference level rule for the WAVs
+LOUDNESS = os.environ.get("AC4_LOUDNESS") == "1"
 FRAME = 1536
 
 def python_reference(path, max_pass=MAX_PASS):
@@ -62,7 +66,7 @@ def python_reference(path, max_pass=MAX_PASS):
     per-frame status list)."""
     frames = container.read_frames(path)
     element = probe_element(frames)
-    dec = Decoder(element)
+    dec = Decoder(element, target_level=-24.0 if LOUDNESS else None)
     rate = probe_rate(frames)
     rs = StreamResampler(*(RT.ratio(*rate) if rate and RT.ratio(*rate)
                            else RT.ratio(1, 3)))
@@ -109,8 +113,10 @@ def compare(path, tag):
     c_raw = os.path.join(OUT, tag + ".c.f64")
     c_st = os.path.join(OUT, tag + ".c.status")
     t0 = time.time()
-    r = subprocess.run([C_CLI, path, c_wav, "--f64", c_raw, "--status", c_st,
-                        "-q"], capture_output=True, text=True)
+    lvl = [] if LOUDNESS else ["--legacy-level"]
+    r = subprocess.run([C_CLI, path, c_wav] + lvl + ["--f64", c_raw,
+                        "--status", c_st, "-q"], capture_output=True,
+                       text=True)
     if r.returncode != 0:
         print(f"{tag}: ac4dec-c failed rc={r.returncode}: {r.stderr}")
         return None
@@ -118,10 +124,11 @@ def compare(path, tag):
     n_frames = len(py_status)
     got = np.fromfile(c_raw, "<f8").reshape(-1, ref.shape[1])
     c_status = read_status(c_st)
-    fs = REF_PEAK[element] / 0.9
+    fs = 1.0 if LOUDNESS else REF_PEAK[element] / 0.9
     names = CHANS6 if ref.shape[1] == 6 else CHANS6[:2]
     py_wav = os.path.join(OUT, tag + ".py.wav")
-    PYCLI.decode_file(path, py_wav, quiet=True, max_pass=MAX_PASS)
+    PYCLI.decode_file(path, py_wav, quiet=True, max_pass=MAX_PASS,
+                      ref_peak=0.0 if LOUDNESS else REF_PEAK[element])
     w_py, w_c = read_wav16(py_wav), read_wav16(c_wav)
     print(f"\n{tag}  ({os.path.basename(path)}, element {element}"
           f"{', ASPX_ACPL_3 core' if dec.acpl3 else ''}, {n_frames} frames, "

@@ -205,8 +205,8 @@ static void presentation_v1_info(ac4_bits *b, int fri, int *frf_out,
         }
         ac4_bit(b);                     /* b_pre_virtualized */
         add_emdf = (int)ac4_bit(b);
-        ac4_bit(b);                     /* b_alternative */
-        ac4_bit(b);                     /* b_pres_ndot */
+        p->b_alternative = (int)ac4_bit(b);
+        p->b_pres_ndot = (int)ac4_bit(b);
         p->pres_substream = substream_index(b);
     }
     if (add_emdf) {

@@ -120,6 +120,14 @@ typedef struct {
                               is 0) */
     char language[16];     /* the automatic choice prefers this language
                               (BCP 47, e.g. "fr"; "" = none) */
+    int loudness;          /* 1 = loudness normalisation and DRC (TS 103
+                              190-1 5.7.9; ac4/loudness.py): pcm[] is then
+                              in units of full scale (1.0), dialnorm
+                              normalised to target_level; 0 = decoder
+                              scale, untouched */
+    double target_level;   /* dB, e.g. -24 */
+    int drc;               /* 0 = the stream's DRC mode for target_level,
+                              -1 = off, n > 0 = DRC mode ID n - 1 */
 } ac4dec_config;
 
 /* PRESENTATIONS (TS 103 190-2 4.8.2). The automatic choice is, per frame,

@@ -58,7 +58,10 @@ class Cfg(ctypes.Structure):
                 ("internal_rate", ctypes.c_int), ("lookahead", ctypes.c_int),
                 ("no_guard", ctypes.c_int), ("presentation", ctypes.c_int),
                 ("presentation_id", ctypes.c_long),
-                ("language", ctypes.c_char * 16)]
+                ("language", ctypes.c_char * 16),
+                ("loudness", ctypes.c_int),
+                ("target_level", ctypes.c_double),
+                ("drc", ctypes.c_int)]
 
 
 class Frame(ctypes.Structure):

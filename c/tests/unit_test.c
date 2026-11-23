@@ -996,6 +996,33 @@ static int dump_input(const char *path)
     return 0;
 }
 
+/* loudness.c: the film standard curve of Table 162 and the stage's
+   normalisation gain 2^((Lout - Lin) / 6) */
+static void test_loudness(void)
+{
+    /* l0l l0h gmb lmb gsb lsb gmc lmc gsc lsc */
+    static const double fs[10] = { 0, 5, 6, -12, 0, 0, -24, 35, -5, 15 };
+    static ac4_leveler lv;
+    ac4_meta md;
+    double buf[2][1536], *pp[2] = { buf[0], buf[1] };
+    int i;
+    CHECK(ac4_curve_gain(2.0, fs) == 0.0, "null band");
+    CHECK(ac4_curve_gain(-30.0, fs) == 6.0, "max boost");
+    CHECK(fabs(ac4_curve_gain(-6.0, fs) - 3.0) < 1e-12, "boost slope");
+    CHECK(fabs(ac4_curve_gain(10.0, fs) + 2.5) < 1e-12, "cut section");
+    CHECK(fabs(ac4_curve_gain(25.0, fs) + 14.5) < 1e-12, "cut slope");
+    CHECK(ac4_curve_gain(60.0, fs) == -24.0, "max cut");
+    memset(&md, 0, sizeof(md));
+    md.valid = 1;
+    md.dialnorm = -18.0;
+    ac4_leveler_init(&lv, 2, 0, -24.0, AC4_DRC_OFF, 48000.0);
+    for (i = 0; i < 1536; i++)
+        buf[0][i] = buf[1][i] = 0.25 * AC4_FULL_SCALE;
+    ac4_leveler_frame(&lv, &md, pp, 1536);
+    CHECK(fabs(buf[0][100] - 0.125) < 1e-12 && fabs(buf[1][1535] - 0.125)
+          < 1e-12, "normalisation -18 -> -24 dB: %g", buf[0][100]);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 2 && !strcmp(argv[1], "--dump-input"))
@@ -1022,6 +1049,7 @@ int main(int argc, char **argv)
     test_toc_presentations();
     test_stereo_data();
     test_inputs();
+    test_loudness();
     if (fails) {
         printf("UNIT TESTS FAILED (%d)\n", fails);
         return 1;

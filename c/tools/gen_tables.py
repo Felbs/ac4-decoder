@@ -29,6 +29,8 @@ ASPX = ["ASPX_HCB_%s_%s" % (k, h)
         for k in ("ENV_LEVEL_15", "ENV_LEVEL_30", "ENV_BALANCE_15",
                   "ENV_BALANCE_30", "NOISE_LEVEL", "NOISE_BALANCE")
         for h in ("F0", "DF", "DT")]
+# metadata books: the DRC gains (DE books are not used by the C decoder)
+MISC = ["DRC_HCB"]
 # A-CPL books: [ALPHA, BETA, BETA3, GAMMA] x [FINE, COARSE] x [F0, DF, DT]
 ACPL = ["ACPL_HCB_%s_%s_%s" % (k, q, h)
         for k in ("ALPHA", "BETA", "BETA3", "GAMMA")
@@ -59,7 +61,7 @@ def main():
             [c & ((1 << L) - 1) if L > 0 else 0 for L, c in zip(lens, cws)],
             out)
         out.append("")
-    for b in ASPX + ACPL:
+    for b in ASPX + ACPL + MISC:
         lens, cws = huff[b + "_LEN"], huff[b + "_CW"]
         if len(lens) != len(cws):
             sys.exit("length mismatch in " + b)
@@ -70,7 +72,8 @@ def main():
         out.append("")
     for name, books in (("AC4T_BOOKS[AC4T_N_BOOKS]", BOOKS),
                         ("AC4T_ASPX_BOOKS[AC4T_N_ASPX_BOOKS]", ASPX),
-                        ("AC4T_ACPL_BOOKS[AC4T_N_ACPL_BOOKS]", ACPL)):
+                        ("AC4T_ACPL_BOOKS[AC4T_N_ACPL_BOOKS]", ACPL),
+                        ("AC4T_MISC_BOOKS[AC4T_N_MISC_BOOKS]", MISC)):
         out.append("const ac4t_book %s = {" % name)
         for b in books:
             out.append("    { AC4T_%s_LEN, AC4T_%s_CW, %d }," % (

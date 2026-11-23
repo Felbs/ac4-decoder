@@ -377,14 +377,16 @@ def test_c_decoder_at_every_frame_length(tmp_path, fri):
     src = tmp_path / "s.ac4"
     src.write_bytes(b"".join(syncframe(f) for f in frames))
     raw = tmp_path / "s.f64"
-    subprocess.run([C_CLI, str(src), str(tmp_path / "s.wav"), "--f64",
+    subprocess.run([C_CLI, str(src), str(tmp_path / "s.wav"), "--legacy-level",
+                    "--f64",
                     str(raw), "--internal", "-q"], check=True)
     got = np.fromfile(raw, "<f8").reshape(-1, 2)
     ref = Decoder("pair").decode_pass(frames)
     assert got.shape == ref.shape == (5 * fl, 2)
     assert np.abs(got - ref).max() <= 1e-9 * np.abs(ref).max()
     raw2 = tmp_path / "e.f64"
-    subprocess.run([C_CLI, str(src), str(tmp_path / "e.wav"), "--f64",
+    subprocess.run([C_CLI, str(src), str(tmp_path / "e.wav"), "--legacy-level",
+                    "--f64",
                     str(raw2), "-q"], check=True)
     up, down = TABLE_83[fri][1]
     n_ext = -(-5 * fl * up // down)
@@ -663,7 +665,8 @@ def test_pair_aspx_acpl_stream(tmp_path, mode):
         src = tmp_path / "p.ac4"
         src.write_bytes(b"".join(syncframe(f) for f in frames))
         raw = tmp_path / "p.f64"
-        subprocess.run([C_CLI, str(src), str(tmp_path / "p.wav"), "--f64",
+        subprocess.run([C_CLI, str(src), str(tmp_path / "p.wav"), "--legacy-level",
+                    "--f64",
                         str(raw), "--internal", "--no-guard", "-q"],
                        check=True)
         got = np.fromfile(raw, "<f8").reshape(-1, 2)

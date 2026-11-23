@@ -32,16 +32,17 @@ this repository.
 
 | | |
 |---|---|
-| Bitstream | version 2, 48 kHz, 29.97 fps, channel-coded. Frames at other rates are concealed (`toc.unsupported_rate`), not misdecoded |
+| Bitstream | version 2, channel-coded; every frame rate of TS 103 190-1 Table 83 at 48 kHz (frame lengths 2048 .. 384, internal rate resampled by the table's ratio) and 44,1 kHz (Table 84, index 13). frame_rate_factor / frame_rate_fraction above 1 and 96/192 kHz substreams are concealed (`toc.unsupported_rate`), not misdecoded. Checked on air at 29.97 fps and on public test streams at 25 and 29.97 fps; the other rates on synthetic streams only (unverified on real streams) |
 | Input | detected from the content: MP4 (fragmented: init segment + `moof`/`mdat` fragments, or bare fragments; or non-fragmented, from the sample table), AC-4 sync frames (TS 103 190-1 Annex G, CRC checked, ID3 tags skipped), MPEG-2 TS (ETSI TS 101 154). The `dac4` box is parsed (`--list`) |
 | Presentations | the table of contents is parsed in full (presentations, substream groups, substream indices, content type and language, object/A-JOC substream info); the decoded presentation is chosen per TS 103 190-2 4.8.2 (see Interpretations), or with `--presentation N`, `id:N`, `--language`; its audio substream is located by its `substream_index`, and is an I-frame when its own `b_audio_ndot` says so |
-| 5.1 (`5_X` channel element, coding_config 0) | codec mode 1 (A-SPX): all six channels. Codec mode 4 (ASPX_ACPL_3): all six channels, L/R/C/Ls/Rs from the A-CPL upmix of the two-channel core, the LFE from its own data (see A-CPL below) |
-| Stereo (`channel_pair_element`) | stereo_codec_mode 0 (SIMPLE) and 1 (A-SPX) |
+| 5.1 (`5_X` channel element, coding_config 0) | codec mode 1 (A-SPX): all six channels. Codec mode 3 (ASPX_ACPL_2): all six channels, Ls/Rs from the one-channel A-CPL of L/R (the public 5.1 test streams). Codec mode 4 (ASPX_ACPL_3): all six channels, L/R/C/Ls/Rs from the A-CPL upmix of the two-channel core, the LFE from its own data (see A-CPL below). Codec mode 2 (ASPX_ACPL_1) is concealed (`element.parse`) |
+| Stereo (`channel_pair_element`) | stereo_codec_mode 0 (SIMPLE), 1 (A-SPX), 2 (ASPX_ACPL_1) and 3 (ASPX_ACPL_2); modes 2 and 3 on synthetic streams only (unverified on real streams) |
 | Core (ASF/MDCT) | Huffman spectral data, scale factors, long and short frames with block switching, KBD windows, stereo processing (sap_mode 1 and 2: M/S; sap_mode 3: full SAP with prediction coefficients, see below), spectral noise fill (clause 5.1.4, the standard's own noise generator; no capture here signals it), LFE |
-| A-SPX | parsed and rendered on the L/R and Ls/Rs pairs and the centre: 64-band complex QMF, envelope decoding (1.5 and 3 dB steps), HF generation, envelope adjustment with the limiter, noise, joint-balance rendering. Additional harmonics (sinusoids), FIC/TIC (interleaved waveform coding) and companding are parsed and not applied (see What it does not do yet) |
-| A-CPL | ASPX_ACPL_3 (clause 5.7.7.6.2): parameter decoding and dequantisation, interpolation, the three decorrelators with the transient ducker, the 5-channel upmix in the QMF domain. ASPX_ACPL_1/2 (in 5_X or a channel pair) do not occur on the captures and are not built |
-| Output | 48 kHz via the 1001/960 resampler (TS 103 190-1 Table 83); without it audio runs 4.27 % fast. Every channel is 577 samples (12 ms) after the MDCT core: the A-SPX channels through the QMF bank, the others (LFE, a pair without A-SPX) through a delay line of the same length, so all channels are time-aligned. Channel order checked on a public 2.0 channel-identification signal against its AAC version (envelope correlation L-L 0.947, R-R 0.949; crossed 0.90, 0.89) |
-| Metadata | parsed, not applied: dialnorm, further loudness information, DRC modes (`ac4/metadata.py`); dialogue enhancement config and parameters; EMDF payload ids (`tools/survey.py` reports them) |
+| A-SPX | parsed and rendered on the L/R and Ls/Rs pairs and the centre: 64-band complex QMF, envelope decoding (1.5 and 3 dB steps), HF generation with TNA and pre-flattening, envelope adjustment with the limiter, noise, additional harmonics (sinusoids), FIC/TIC (interleaved waveform coding), joint-balance rendering; companding (5.7.5) of the core |
+| A-CPL | ASPX_ACPL_3 (clause 5.7.7.6.2): parameter decoding and dequantisation, interpolation, the three decorrelators with the transient ducker, the 5-channel upmix in the QMF domain. ASPX_ACPL_1/2 (5.7.7.6.1, one-channel A-CPL): in a channel pair, and ASPX_ACPL_2 in 5_X |
+| Output | 48 kHz (44,1 kHz) via the resampler of TS 103 190-1 Table 83 for the stream's frame rate (1001/960 at 29.97 fps; without it audio runs 4.27 % fast). Every channel is 577 samples (12 ms) after the MDCT core: the A-SPX channels through the QMF bank, the others (LFE, a pair without A-SPX) through a delay line of the same length, so all channels are time-aligned. Channel order checked on a public 2.0 channel-identification signal against its AAC version (envelope correlation L-L 0.947, R-R 0.949; crossed 0.90, 0.89) |
+| Loudness, DRC | applied (`ac4/loudness.py`, C `src/loudness.c`): dialnorm normalised to a target level (default -24 dB, `--target-level`), the stream's DRC decoder mode for that level (5.7.9.2): E-AC-3 profiles, transmitted curves, transmitted gains (`--drc auto|off|N`). The CLIs write this; `--legacy-level` / `--ref-peak` keep the old fixed-reference rule |
+| Metadata | parsed: further loudness information; dialogue enhancement config and parameters (DE is at its default user level 0: no change); EMDF payload ids (`tools/survey.py` reports them) |
 | I-frames | decoding can start mid-stream; A-SPX starts at the first I-frame |
 | Damaged input | never raises, never changes the output length; damaged frames are concealed (see below) |
 
@@ -324,21 +325,41 @@ Where TS 103 190-1 leaves room, these are the readings both decoders take
   five streams (BS.1770 integrated loudness of the decode against
   `loudrelgat`), full scale is 122.1 dB re 1 decoder unit (spread
   +-1.8 dB), close to `IMDCT_K` * 2^14.5 (122.2 dB): the standard's own
-  arithmetic (dequantisation, IMDCT) puts full scale near 2^14.5. The CLI's
-  level rule is unchanged.
-* **Companding (5.7.5) is not applied** (`aspx_render.COMPANDING = False`;
-  the implementation is in the Python renderer). Its gain,
-  L^((1 - alpha) / alpha) * 2^(1 / alpha), depends on the absolute scale
-  of the levels L, which the standard does not give; its fixed point
-  L = 0.138 implies a full scale of about 1. On air the companded streams
-  (broadcaster B's stereo: 99 % of frames; the public stereo test streams:
-  all) already decode at their metadata loudness without expansion, the
-  core's dynamics already follow the absolute A-SPX envelopes (slope of
-  log E_ref on log E_est 0.89 on a public stereo stream, 0.96 on
-  broadcaster A's uncompanded 5.1, not the 1/alpha = 1.54 a compressed core
-  would give), and expansion at any scale tried (full scale x 1/4 to x 16)
-  made both fits worse. The g_avg formula's exponent prints as "1alpha /
-  alpha"; it is read as (1 - alpha) / alpha.
+  arithmetic (dequantisation, IMDCT) puts full scale near 2^14.5. The
+  loudness stage (`loudness.FULL_SCALE`) uses `IMDCT_K` * 2^14.5.
+* **Companding scale (5.7.5).** The gain L^((1 - alpha) / alpha) *
+  2^(1 / alpha) depends on the absolute scale of the levels L, which the
+  standard does not give. Levels are taken relative to `IMDCT_K` * 2^16.5
+  decoder units (4 x the full scale above): against the public stereo
+  test signal's AAC version (same programme, decoded by FFmpeg, aligned)
+  this gives the best SNR (13.2 / 14.5 dB at 29.97 / 25 fps, against 10.9 /
+  11.5 off) and per-frame level deviation (p95 0.37 / 0.31 dB, against
+  3.0 off); scales x1 to x64 were swept. The tool runs frame by frame in
+  the A-SPX loop (each frame's interval before its HF generation). The
+  g_avg formula's exponent prints as "1alpha / alpha"; it is read as
+  (1 - alpha) / alpha.
+* **Loudness and DRC** (5.7.9). The level detector (left to the
+  implementation by 5.7.9.3.1.1) is the BS.1770 K-weighted mean square of
+  one QMF slot (64 samples at the internal rate; the 48 kHz filter at every
+  rate) summed over channels with BS.1770 weights (LFE 0, surrounds 1.41),
+  -0.691 + 10 log10, minus dialnorm. Curve gains are 10^(G/20) dB, the
+  normalisation and transmitted gains 2^(G/6) (dB2). DRC acts as one
+  wideband gain per QMF slot on the output samples (the standard: on QMF
+  samples before synthesis); multi-band transmitted gains are applied as
+  the mean of their bands in dB2. The time constants of Table 162 apply to
+  the default profiles, with their fast-attack/release thresholds.
+  Frames concealed keep the last dialnorm and DRC frame. Mode selection:
+  the largest mode ID whose (Lout,min, Lout,max) holds the target.
+* **Rates.** The stream's rate is learnt from the first decodable frame
+  whose successor agrees; frames before that are taken as 1536 samples.
+  A later change of rate is concealed (`toc.rate`). The A-SPX/A-CPL time
+  grid generalises the 29.97 fps reading below: `TS_OFFSET` = nts -
+  `ts_offset_hfgen` (18 at 1536, 26 at 2048).
+* **A-SPX additional readings (phase B).** The QMF slots of an envelope
+  estimate are averaged per QMF slot (the standard writes per A-SPX slot;
+  the same at num_ts_in_ats 1, measured the better fit at 2). The sine
+  index of a frame is read per envelope as Pseudocode 92 builds it, the
+  areas of Pseudocodes 93-95 then follow it.
 * **QMF synthesis phase.** 5.7.4.2 prints exp(j pi (k + 1/2)(2n - 257)
   / 128); both decoders use 2n - 255, which reconstructs the analysis bank
   to 78 dB (delay 577) where 257 gives 43 dB (delay 578).
@@ -360,8 +381,10 @@ Where TS 103 190-1 leaves room, these are the readings both decoders take
   decoder sees a sequence-counter jump).
 * **Metadata of 7_X and above** (`basic_metadata`): ch_mode 5-6 and 11-15
   are read as 3/4/0 (`pre_upmixtyp_3_4`), 9-10 as 3/2/2, 7-8 as 5/2/0.
-  This parse fails on the public immersive streams, which phase C will
-  look at.
+  On the public immersive-stereo stream (signalled 7.1, sus_ver 1) this
+  reading gives tools_metadata_size 144 bits whose first bit
+  (b_de_data_present) is 0: the block does not close, so its dialogue
+  enhancement data is not read. Phase C (immersive) will look at it.
 
 **A-CPL (clause 5.7.7, ASPX_ACPL_3)**
 
@@ -483,30 +506,22 @@ are unchanged within the spread between runs.
 
 ## What it does not do yet
 
-* **A-CPL modes 1 and 2.** ASPX_ACPL_1/2 (5_X codec modes 2 and 3,
-  stereo_codec_mode 2 and 3) are concealed as damaged frames
-  (`element.parse`); no capture carries them, but every 5.1 stream of the
-  public test signals is ASPX_ACPL_2 (coding_config 0). ASPX_ACPL_3 is
-  decoded (above); codec mode 1 has no A-CPL (Table 214).
-* **Frame rates other than 29.97 fps and sample rates other than 48 kHz**
-  (frame lengths other than 1536): concealed as `toc.unsupported_rate`.
-  The public test signals come in 25 fps (2048-sample frames, resampling
-  15/16) as well; every band table is banked, the rest (A-SPX framing at
-  16 slots, A-CPL, the resampler ratio, the C decoder's fixed frame size)
-  is not built.
-* **Companding** (parsed; in the Python renderer but off, see
-  Interpretations); **A-SPX additional harmonics** (sinusoid insertion:
-  parsed, not rendered; frequent on the public stereo streams, under 2 %
-  of channel blocks on air); **FIC/TIC** interleaved waveform coding
-  (parsed; only the public 25 fps stereo uses it).
-* **Metadata is parsed, not applied**: no DRC (every stream measured uses
-  compression curves or E-AC-3 default profiles, none transmits gains; the
-  broadcasters signal profile "none"), no dialnorm / target level, no
-  dialogue enhancement.
+* **ASPX_ACPL_1 in 5_X** (codec mode 2: residual coding in the 5_X
+  element) and **coding_config 1-3** of 5_X: concealed (`element.parse`).
+* **frame_rate_factor / frame_rate_fraction above 1** (high frame rates,
+  efficient HFR) and 96/192 kHz substreams: concealed as
+  `toc.unsupported_rate`.
+* **Dialogue enhancement** is parsed, not applied (its default user level
+  0 leaves the signal unchanged); DRC gains act on the output samples per
+  QMF slot, not on QMF samples (see Interpretations).
+* **Metadata of the public 5.1.4 and immersive-stereo streams**: their
+  audio is an immersive_channel_element (phase C), so the substream
+  metadata after it is not reached; on the immersive-stereo stream, which
+  signals 7.1, `basic_metadata` reads but its tools block does not close
+  (see Interpretations).
 * Mixing the substream groups of one presentation (M&E + dialogue, main +
   associated): only its first channel-coded substream is decoded.
-* The SSF speech frontend; coding_config other than 0; mono, 3.0, 5.0 and
-  7.x elements; immersive and object audio (A-JOC, IFM, OAMD); bitstream
+* The SSF speech frontend; mono, 3.0, 5.0 and 7.x elements; immersive and object audio (A-JOC, IFM, OAMD); bitstream
   versions 0 and 1.
 
 ## Survey

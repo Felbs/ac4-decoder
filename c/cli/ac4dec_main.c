@@ -6,7 +6,8 @@
  *
  *   ac4dec-c IN OUT.wav [--element auto|5_X|pair] [--channels 2|6]
  *            [--presentation N|id:N] [--language xx]
- *            [--seconds S] [--max-pass N] [--ref-peak X] [--no-guard]
+ *            [--seconds S] [--max-pass N] [--target-level L]
+ *            [--drc auto|off|N] [--legacy-level] [--ref-peak X] [--no-guard]
  *            [--lookahead N] [--f64 RAW] [--internal] [--status FILE] [-q]
  *   ac4dec-c IN --list
  *
@@ -15,18 +16,23 @@
  *
  * OUT is 16-bit PCM at the stream's external rate (48 kHz, or 44,1 kHz for
  * fs_index 0) through the resampler of TS 103 190-1 Table 83 for its frame
- * rate, written with the Python CLI's level rule:
- * samples times 0.9 / ref_peak, ref_peak starting at the element's fixed
- * reference (9e5 for 5.1, 2e5 stereo), rising to the loudest sample of a
- * pass, capped at twice the start (anything above it is clipped), applied
- * per pass of --max-pass output frames before resampling, as there. The
- * decoder itself is one stream (no pass boundaries); --lookahead sets its
- * delay (default AC4DEC_DEFAULT_LOOKAHEAD).
+ * rate, loudness-normalised as the Python CLI: dialnorm brought to
+ * --target-level (default -24 dB) and the stream's DRC mode for that
+ * level applied (--drc auto, off, or a mode ID), in the decoder
+ * (ac4dec_config.loudness); samples beyond full scale are clipped and
+ * counted. --legacy-level (or --ref-peak X) writes with the old level rule
+ * instead: samples times 0.9 / ref_peak, ref_peak starting at the
+ * element's fixed reference (9e5 for 5.1, 2e5 stereo, or X), rising to
+ * the loudest sample of a pass, capped at twice the start, applied per
+ * pass of --max-pass output frames before resampling. The decoder itself
+ * is one stream (no pass boundaries); --lookahead sets its delay (default
+ * AC4DEC_DEFAULT_LOOKAHEAD).
  *
  * --status FILE writes one line per frame: index, status (0 OK,
  * 1 concealed, 2 bad) and the reason.
  *
- * --f64 RAW also writes the decoder-scale samples (before the level rule)
+ * --f64 RAW also writes the decoder's samples (before the legacy level
+ * rule; normalised unless --legacy-level)
  * as interleaved little-endian float64 at the external rate (or the
  * internal rate with --internal): the comparison output.
  */
@@ -46,7 +52,8 @@ static void usage(void)
             "usage: ac4dec-c IN OUT.wav [--element auto|5_X|pair] "
             "[--channels 2|6]\n"
             "                [--presentation N|id:N] [--language xx]\n"
-            "                [--seconds S] [--max-pass N] [--ref-peak X] "
+            "                [--seconds S] [--max-pass N] [--target-level L]\n"
+            "                [--drc auto|off|N] [--legacy-level] [--ref-peak X] "
             "[--no-guard]\n"
             "                [--lookahead N] [--f64 RAW] [--internal] "
             "[--status FILE] [-q]\n"
@@ -224,6 +231,8 @@ typedef struct {
     short *pcm16;
     ac4dec_resampler *rs_wav, *rs_raw;
     level_t lv;
+    int legacy;
+    unsigned long long n_clip;
     FILE *fw, *fr;
     unsigned long long n_out;
 } sink_t;
@@ -257,12 +266,15 @@ static void sink_flush(sink_t *k)
         }
     }
     /* the level rule sees the whole pass (all channels) at once */
-    level_apply(&k->lv, planar, k->n_ch, ns, k->quiet);
+    if (k->legacy)
+        level_apply(&k->lv, planar, k->n_ch, ns, k->quiet);
     no = ac4dec_resampler_push(k->rs_wav, (const double *const *)planar,
                                (int)ns, k->rout);
     for (s = 0; s < no; s++) {
         for (c = 0; c < k->n_ch; c++) {
             double v = k->rout[c][s];
+            if (fabs(v) > 1.0)
+                k->n_clip++;
             if (v > 1.0)
                 v = 1.0;
             else if (v < -1.0)
@@ -310,7 +322,8 @@ int main(int argc, char **argv)
     const char *el_arg = "auto", *pres = NULL, *lang = NULL;
     int channels = 0, quiet = 0, internal = 0, no_guard = 0, i, c, list = 0;
     long max_pass = 1800, lookahead = 0;
-    double seconds = -1.0, ref_peak = 0.0, t0, dt;
+    double seconds = -1.0, ref_peak = 0.0, t0, dt, target = -24.0;
+    int legacy = 0, drc = 0;
     unsigned char *data;
     size_t len;
     ac4in_frame *smp = NULL;
@@ -337,8 +350,18 @@ int main(int argc, char **argv)
             seconds = atof(argv[++i]);
         else if (!strcmp(a, "--max-pass") && i + 1 < argc)
             max_pass = atol(argv[++i]);
-        else if (!strcmp(a, "--ref-peak") && i + 1 < argc)
+        else if (!strcmp(a, "--ref-peak") && i + 1 < argc) {
             ref_peak = atof(argv[++i]);
+            legacy = 1;
+        } else if (!strcmp(a, "--legacy-level"))
+            legacy = 1;
+        else if (!strcmp(a, "--target-level") && i + 1 < argc)
+            target = atof(argv[++i]);
+        else if (!strcmp(a, "--drc") && i + 1 < argc) {
+            const char *v = argv[++i];
+            drc = !strcmp(v, "auto") ? 0 : !strcmp(v, "off") ? -1
+                  : atoi(v) + 1;
+        }
         else if (!strcmp(a, "--lookahead") && i + 1 < argc)
             lookahead = atol(argv[++i]);
         else if (!strcmp(a, "--f64") && i + 1 < argc)
@@ -471,6 +494,9 @@ int main(int argc, char **argv)
     cfg.internal_rate = 1;          /* the level rule runs before resampling */
     cfg.lookahead = (int)lookahead;
     cfg.no_guard = no_guard;
+    cfg.loudness = !legacy;
+    cfg.target_level = target;
+    cfg.drc = drc;
     dec = ac4dec_open(&cfg);
     if (!dec) {
         fprintf(stderr, "cannot open the decoder (bad --lookahead?)\n");
@@ -481,6 +507,7 @@ int main(int argc, char **argv)
     k.internal = internal;
     k.quiet = quiet;
     k.max_pass = max_pass;
+    k.legacy = legacy;
     k.lv.ref_peak = ref_peak > 0.0 ? ref_peak : ac4dec_ref_peak(element);
     k.lv.burst = 2.0 * k.lv.ref_peak;
     if (k.lv.ref_peak > k.lv.burst)
@@ -575,6 +602,11 @@ int main(int argc, char **argv)
             printf("  stream is ASPX_ACPL_3 (2-ch core + A-CPL): %s\n",
                    n_ch == 6 ? "5.1 from the A-CPL upmix"
                                          : "its stereo core");
+        if (!legacy)
+            printf("  loudness: dialnorm -> %g dB, DRC %s%s%llu samples "
+                   "clipped\n", target,
+                   drc == 0 ? "auto" : drc < 0 ? "off" : "mode",
+                   ", ", k.n_clip);
         printf("%ld frames (%ld bad, %ld concealed, %ld sequence jumps), "
                "element %s, %d ch, %.3f s -> %s  [%.2f s, %.2fx real time; "
                "A-SPX bursts %ld]\n",
