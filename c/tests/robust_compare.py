@@ -61,14 +61,14 @@ class Cfg(ctypes.Structure):
                 ("language", ctypes.c_char * 16),
                 ("loudness", ctypes.c_int),
                 ("target_level", ctypes.c_double),
-                ("drc", ctypes.c_int)]
+                ("drc", ctypes.c_int), ("ch_mode", ctypes.c_int)]
 
 
 class Frame(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int), ("reason", ctypes.c_char_p),
                 ("index", ctypes.c_longlong), ("n_channels", ctypes.c_int),
                 ("n_samples", ctypes.c_int),
-                ("pcm", ctypes.POINTER(ctypes.c_double) * 6),
+                ("pcm", ctypes.POINTER(ctypes.c_double) * 8),
                 ("sequence_counter", ctypes.c_int), ("iframe", ctypes.c_int),
                 ("seq_jump", ctypes.c_int), ("sample_rate", ctypes.c_int)]
 

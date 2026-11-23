@@ -47,6 +47,7 @@ enum {
     AC4E_TOC_UNSUPPORTED,  /* toc.unsupported_rate (rates.py) */
     AC4E_TRANSF_LEN,       /* asf.transf_length (Table 103: not defined) */
     AC4E_CHEL_MATSEL,      /* asf.chel_matsel (reserved value) */
+    AC4E_ADD_CH,           /* asf.add_ch (7_X: framings differ) */
     AC4E_COUNT
 };
 const char *ac4_reason_name(int code);
@@ -309,7 +310,8 @@ typedef struct {                /* acpl_config_1ch(), Table 59 */
     int num_param_bands, param_band, qmf_band, quant_mode;
 } ac4_acpl1_cfg;
 
-#define AC4_NCH 6               /* L R C LFE Ls Rs */
+#define AC4_NCH 8               /* L R C LFE Ls Rs X1 X2 (7_X: Lb Rb,
+                                   Lw Rw or Tfl Tfr) */
 #define AC4_MAX_ST 9            /* chparam_info blocks of one element */
 
 /* The parsed element. */
@@ -327,10 +329,12 @@ typedef struct {
     /* the A-SPX blocks after the channel data, in bitstream order: block
        group (0 L/R, 1 Ls/Rs, 2 C) and two-channel flag; then n_acpl1
        acpl_data_1ch() (acpl1) or one acpl_data_2ch() (acpl3) */
-    int n_blocks, blk_grp[3], blk_two[3], n_acpl1;
+    int n_blocks, blk_grp[4], blk_two[4], n_acpl1;
     /* companding_control: present, sync_flag, b_compand_on[], avg */
     int comp_present, comp_sync, comp_n, comp_on[5], comp_avg;
     int r_silent;               /* the pair's R not coded (ASPX_ACPL_2) */
+    int comp_c;                 /* companding_control index of the centre
+                                   block (2; 0 for mono) */
     size_t audio_size, audio_start;
     size_t bits_end;            /* where the core parse ended */
     /* the tracks, by output channel (decoder.c CH_*: L R C LFE Ls Rs;
@@ -348,7 +352,7 @@ typedef struct {
        track to channel mapping of Table 180 / 181), with the chparam_info
        blocks st0 .. st0 + n - 1; on packed spectra (one framing) */
     int n_steps;
-    struct { int kind, nk, matsel, st0, key[5]; } steps[2];
+    struct { int kind, nk, matsel, st0, key[5]; } steps[4];
     /* ASPX_ACPL_1 in 5_X (5.3.4.3.2): (A, side track) pairs, per window */
     int n_side;
     struct { int ka, kb, st; } side[2];
@@ -363,6 +367,16 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
                   ac4_element *e);
 void ac4_parse_pair(ac4_bits *b, const ac4_books *bk, int b_iframe,
                     ac4_element *e);
+/* 5_X without LFE (5.0), single_channel_element, 3_0_channel_element,
+   7_X_channel_element (ch_mode 5 - 10 of Table 88; SIMPLE and ASPX) */
+void ac4_parse_5x_lfe(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                      int has_lfe, ac4_element *e);
+void ac4_parse_mono(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                    ac4_element *e);
+void ac4_parse_3_0(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                   ac4_element *e);
+void ac4_parse_7x(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                  int ch_mode, ac4_element *e);
 
 /* ------------------------------------------------------------ A-SPX
  * Port of ac4/aspx_bands.py, aspx_parse.py, aspx_env.py, aspx_envadj.py,
@@ -730,7 +744,7 @@ int ac4_rs_push(const ac4_rs_filter *f, ac4_rs_state *s, const double *x,
                            /* IMDCT_K * 2^14.5 (needs math.h) */
 #define AC4_DRC_AUTO (-1)
 #define AC4_DRC_OFF (-2)
-#define AC4_LEV_CH 6
+#define AC4_LEV_CH 8
 
 typedef struct {
     int id;
@@ -783,8 +797,8 @@ typedef struct {
     double kw[AC4_LEV_CH][2048];
 } ac4_leveler;
 
-void ac4_leveler_init(ac4_leveler *lv, int n_ch, int five, double target,
-                      int drc, double rate);
+void ac4_leveler_init(ac4_leveler *lv, int n_ch, const int *slot,
+                      int backs, double target, int drc, double rate);
 /* one output frame, planar, decoder units in, units of full scale out;
    md NULL (concealed) keeps the last */
 void ac4_leveler_frame(ac4_leveler *lv, const ac4_meta *md, double **pcm,

@@ -79,7 +79,7 @@ extern "C" {
 /* Most samples one frame can give at the external rate (2048 at index 13;
    1536 * 1001 / 960 = 1601.6 at 29.97 fps). */
 #define AC4DEC_MAX_OUT 2050
-#define AC4DEC_MAX_CHANNELS 6
+#define AC4DEC_MAX_CHANNELS 8
 
 #define AC4DEC_MIN_LOOKAHEAD 8
 #define AC4DEC_DEFAULT_LOOKAHEAD 180
@@ -87,7 +87,11 @@ extern "C" {
 typedef enum {
     AC4DEC_ELEMENT_AUTO = 0,   /* from the first frame whose TOC parses */
     AC4DEC_ELEMENT_5X = 1,     /* 5_X channel element (5.1) */
-    AC4DEC_ELEMENT_PAIR = 2    /* channel_pair_element (stereo) */
+    AC4DEC_ELEMENT_PAIR = 2,   /* channel_pair_element (stereo) */
+    AC4DEC_ELEMENT_MONO = 3,   /* single_channel_element (C) */
+    AC4DEC_ELEMENT_3_0 = 4,    /* 3_0_channel_element (L R C) */
+    AC4DEC_ELEMENT_5_0 = 5,    /* 5_X without LFE (L R C Ls Rs) */
+    AC4DEC_ELEMENT_7X = 6      /* 7_X_channel_element (config ch_mode) */
 } ac4dec_element;
 
 typedef enum {
@@ -103,8 +107,10 @@ typedef enum {
 
 typedef struct {
     ac4dec_element element;
-    int channels;          /* 0 = default (6 for 5_X, 2 for a pair); 2 or 6.
-                              A pair element always gives 2. */
+    int channels;          /* 0 = default: every channel of the element
+                              (6 for 5_X, 2 for a pair, 1 mono, 3 for 3.0,
+                              5 for 5.0, 7 / 8 for 7.0 / 7.1); 2 = L, R
+                              only (elements with L and R) */
     int internal_rate;     /* 0 (default) = the external rate (48 kHz, or
                               44,1 kHz for fs_index 0) through the stream's
                               resampler (Table 83); 1 = the internal rate,
@@ -128,6 +134,9 @@ typedef struct {
     double target_level;   /* dB, e.g. -24 */
     int drc;               /* 0 = the stream's DRC mode for target_level,
                               -1 = off, n > 0 = DRC mode ID n - 1 */
+    int ch_mode;           /* 7_X: the channel mode (Table 88 ch_mode 5 -
+                              10); 0 = from the stream (AUTO) or 6 (7.1
+                              3/4/0) */
 } ac4dec_config;
 
 /* PRESENTATIONS (TS 103 190-2 4.8.2). The automatic choice is, per frame,
@@ -175,14 +184,24 @@ typedef struct {
 
 typedef struct ac4dec ac4dec;
 
-/* Channel order: 6 channels = L R C LFE Ls Rs (WAV 5.1 order); 2 = L R.
-   As in the Python, the A-SPX pairs (L R, Ls Rs) are delayed 577 samples
-   by the QMF bank and C and LFE are not. */
+/* Channel order: 6 channels = L R C LFE Ls Rs (WAV 5.1 order); 2 = L R;
+   mono C; 3.0 L R C; 5.0 L R C Ls Rs; 7.x L R C [LFE] Ls Rs and the
+   layout's pair (Lb Rb, Lw Rw or Tfl Tfr). Every channel is 577 samples
+   late (the QMF bank, or a delay line of the same length). */
 
 /* -> a decoder, or NULL (out of memory or a bad config). cfg NULL = auto
    element, default channels, 48 kHz output, default lookahead, guard on. */
 ac4dec *ac4dec_open(const ac4dec_config *cfg);
 void ac4dec_close(ac4dec *d);
+
+/* The channels the decoder gives out (0 while the element is not known:
+   AUTO before the first frame whose TOC parses). */
+int ac4dec_channels(const ac4dec *d);
+
+/* The 7_X channel mode (Table 88 ch_mode 5 - 10) of a frame's chosen
+   audio substream, or 0. */
+int ac4dec_probe_ch_mode(const ac4dec_config *cfg, const uint8_t *data,
+                         size_t len);
 
 /* The decoder's delay in frames (the lookahead). */
 int ac4dec_delay(const ac4dec *d);

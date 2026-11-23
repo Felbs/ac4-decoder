@@ -1015,7 +1015,10 @@ static void test_loudness(void)
     memset(&md, 0, sizeof(md));
     md.valid = 1;
     md.dialnorm = -18.0;
-    ac4_leveler_init(&lv, 2, 0, -24.0, AC4_DRC_OFF, 48000.0);
+    {
+        static const int LR[2] = { 0, 1 };
+        ac4_leveler_init(&lv, 2, LR, 0, -24.0, AC4_DRC_OFF, 48000.0);
+    }
     for (i = 0; i < 1536; i++)
         buf[0][i] = buf[1][i] = 0.25 * AC4_FULL_SCALE;
     ac4_leveler_frame(&lv, &md, pp, 1536);

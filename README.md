@@ -37,6 +37,8 @@ this repository.
 | Presentations | the table of contents is parsed in full (presentations, substream groups, substream indices, content type and language, object/A-JOC substream info); the decoded presentation is chosen per TS 103 190-2 4.8.2 (see Interpretations), or with `--presentation N`, `id:N`, `--language`; its audio substream is located by its `substream_index`, and is an I-frame when its own `b_audio_ndot` says so |
 | 5.1 (`5_X` channel element) | codec mode 1 (A-SPX), coding_config 0: all six channels (both broadcasters). Codec mode 3 (ASPX_ACPL_2): all six channels, Ls/Rs from the one-channel A-CPL of L/R (the public 5.1 test streams). Codec mode 4 (ASPX_ACPL_3): all six channels, L/R/C/Ls/Rs from the A-CPL upmix of the two-channel core, the LFE from its own data (see A-CPL below). On synthetic streams only (unverified on real streams): codec mode 0 (SIMPLE); coding_config 0 with 2ch_mode 1 and coding_config 1 - 3 (three, four and five_channel_data, every chel_matsel; Tables 178 - 180); ASPX_ACPL_1 (codec mode 2: the two max_sfb_master side tracks, Tables B.8 - B.19, 5.3.4.3.2) and coding_config 1 of codec modes 2 and 3 |
 | Stereo (`channel_pair_element`) | stereo_codec_mode 0 (SIMPLE), 1 (A-SPX), 2 (ASPX_ACPL_1) and 3 (ASPX_ACPL_2); modes 2 and 3 on synthetic streams only (unverified on real streams) |
+| Mono, 3.0, 5.0, 7.x | single_channel_element (mono: C), 3_0_channel_element (L R C, both coding configs), 5_X without LFE (5.0: L R C Ls Rs), 7_X_channel_element in codec modes SIMPLE and ASPX for all six 7.0 / 7.1 channel modes of Table 88 (L R C [LFE] Ls Rs plus Lb Rb, Lw Rw or Tfl Tfr; Tables 182, 183 with b_use_sap_add_ch; A-SPX on the four blocks of Table 213): on synthetic streams only (unverified on real streams). 7_X ASPX_ACPL_1 / _2 are concealed (`element.parse`) |
+| "IMS" (the kit's immersive-stereo streams) | presentation_version 2 with a 7.1 channel mode: the substream is a channel_pair_element (see Interpretations); its stereo core is decoded, both kit streams without a concealed frame. The rendering to 7.1 is not in the standard at hand |
 | Core (ASF/MDCT) | Huffman spectral data, scale factors, long and short frames with block switching, KBD windows, stereo processing (sap_mode 1 and 2: M/S; sap_mode 3: full SAP with prediction coefficients, see below), spectral noise fill (clause 5.1.4, the standard's own noise generator; no capture here signals it), LFE |
 | A-SPX | parsed and rendered on the L/R and Ls/Rs pairs and the centre: 64-band complex QMF, envelope decoding (1.5 and 3 dB steps), HF generation with TNA and pre-flattening, envelope adjustment with the limiter, noise, additional harmonics (sinusoids), FIC/TIC (interleaved waveform coding), joint-balance rendering; companding (5.7.5) of the core |
 | A-CPL | ASPX_ACPL_3 (clause 5.7.7.6.2): parameter decoding and dequantisation, interpolation, the three decorrelators with the transient ducker, the 5-channel upmix in the QMF domain. ASPX_ACPL_1/2 (5.7.7.6.1, one-channel A-CPL): in a channel pair, and ASPX_ACPL_2 in 5_X |
@@ -350,6 +352,22 @@ Where TS 103 190-1 leaves room, these are the readings both decoders take
 
 **Phase B2**
 
+* **The kit's "IMS" streams** (presentation_version 2, channel_mode 7.1
+  3/4/0 in ac4_substream_info_chan): read as a 7_X_channel_element no
+  frame parses (the LFE's sf_data fails at once); read as a
+  channel_pair_element (ASPX) every frame of both streams closes on
+  audio_size. TS 103 190-2 V1.3.1 gives no other syntax for such a
+  substream, so a presentation_version 2 presentation with a 7.x channel
+  mode is decoded as a stereo pair (`decoder.IMS_STEREO`); the decoder
+  does not render it to the signalled 7.1.
+* **7_X additional channels** (Table 33): the two chparam_info() of
+  b_use_sap_add_ch come before the additional channels' sf_info; each is
+  read with the framing of the track it pairs F (G) with (D / E for
+  3/4/0, A / B otherwise), and Table 183 is applied per transform window,
+  which needs both tracks to have the same windows: a frame where they
+  differ is concealed (`asf.add_ch`). The BS.1770 weight of Lb / Rb is
+  1.41 (the surrounds'), of Lw / Rw and Tfl / Tfr 1.0.
+
 * **max_sfb_master side tracks** (ASPX_ACPL_1 in 5_X, Table 25; 4.3.5.13
   names only the two sf_data elements): each side track takes the
   transform lengths and window grouping of the track it is paired with
@@ -584,8 +602,9 @@ are unchanged within the spread between runs.
   (see Interpretations).
 * Mixing the substream groups of one presentation (M&E + dialogue, main +
   associated): only its first channel-coded substream is decoded.
-* The SSF speech frontend; mono, 3.0, 5.0 and 7.x elements; immersive and object audio (A-JOC, IFM, OAMD); bitstream
-  versions 0 and 1.
+* The SSF speech frontend; 7_X in ASPX_ACPL_1 / _2; immersive and
+  object audio (A-JOC, IFM, OAMD), and the IMS rendering to 7.1;
+  bitstream versions 0 and 1.
 
 ## Survey
 

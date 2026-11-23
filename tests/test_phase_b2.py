@@ -453,7 +453,7 @@ C_CLI = __import__("os").path.join(
     "..", "c", "ac4dec-c")
 
 
-def _c_vs_python(tmp_path, frames, channels=6):
+def _c_vs_python(tmp_path, frames, channels=6, element="5_X", ch_mode=None):
     import os
     import subprocess
     from ac4.decoder import Decoder
@@ -468,7 +468,7 @@ def _c_vs_python(tmp_path, frames, channels=6):
                     "--no-guard", "-q", "--channels", str(channels)],
                    check=True)
     got = np.fromfile(raw, "<f8").reshape(-1, channels)
-    dec = Decoder("5_X", channels=channels, guard=False)
+    dec = Decoder(element, channels=channels, guard=False, ch_mode=ch_mode)
     dec.hf_ratio = None
     ref = dec.decode_pass(frames)
     assert dec.n_concealed == 0

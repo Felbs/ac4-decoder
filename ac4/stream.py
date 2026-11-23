@@ -390,7 +390,8 @@ class Ac4Stream:
                     # (C / Ls / Rs come from the A-CPL upmix, decoder.py)
                     chans = tuple(k for k in ("L", "R", "lfe")
                                   if k in chans)
-                    fm["lfe"] = r["lfe"]["framing"]
+                    if r.get("lfe") is not None:
+                        fm["lfe"] = r["lfe"]["framing"]
                     self.acpl3 = True
                     # 13.25: the output lists were built for the REQUESTED
                     # channels; from here every frame gives only a pair, so

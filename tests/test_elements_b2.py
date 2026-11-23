@@ -222,3 +222,30 @@ def test_decoder_pcm_7x(ch_mode):
     n = 8 if ch_mode == 6 else 7
     assert dec.n_concealed == 0 and y.shape == (5 * 1536, n)
     assert all(np.abs(y[:, c]).max() > 0 for c in range(n))
+
+
+# ------------------------------------------------ the C decoder
+@pytest.mark.parametrize("element,code,fn,nch", [
+    ("mono", "0", "_mono", 1), ("3_0", "1100", "_three0", 3),
+    ("5_0", "1101", "_five0", 5)])
+def test_c_elements(tmp_path, element, code, fn, nch):
+    rng = np.random.default_rng(30)
+    g = globals()[fn]
+    frames = [EW.frame((g(rng, 1, 5) if fn == "_three0" else g(rng))[0],
+                       seq=5 + i, ch_mode_code=code) for i in range(5)]
+    _c_vs_python(tmp_path, frames, nch, element)
+    if nch > 2:
+        _c_vs_python(tmp_path, frames, 2, element)
+
+
+@pytest.mark.parametrize("ch_mode", [5, 6, 7, 8, 9, 10])
+@pytest.mark.parametrize("cc,sap", [(0, True), (1, False), (3, True)])
+def test_c_seven_x(tmp_path, ch_mode, cc, sap):
+    rng = np.random.default_rng(40 + ch_mode + cc)
+    frames = [EW.frame(_seven(rng, ch_mode, cc, 1 if cc == 0 else 0, 3,
+                              sap)[0],
+                       seq=5 + i, ch_mode_code=CODE[ch_mode])
+              for i in range(5)]
+    n = 8 if ch_mode % 2 == 0 else 7
+    _c_vs_python(tmp_path, frames, n, "7_X", ch_mode)
+    _c_vs_python(tmp_path, frames, 2, "7_X", ch_mode)

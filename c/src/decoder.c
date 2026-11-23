@@ -67,14 +67,14 @@ void ac4_spectra_init(void);
 #define G_NEAR_RATIO 2.0
 #define G_RAMP 256
 
-enum { CH_L, CH_R, CH_C, CH_LFE, CH_LS, CH_RS };
+enum { CH_L, CH_R, CH_C, CH_LFE, CH_LS, CH_RS, CH_X1, CH_X2 };
+#define NCH AC4_NCH
 
-/* the QMF-path "pairs": L/R, Ls/Rs, and the centre as C/C (its
-   aspx_data_1ch rendered as the same channel twice, decoder.py) */
-#define NPAIR 3
-static const int PAIR_CH[NPAIR][2] = {
-    { CH_L, CH_R }, { CH_LS, CH_RS }, { CH_C, CH_C }
-};
+/* the QMF-path "pairs" (the A-SPX block groups): L/R, Ls/Rs, the centre
+   as C/C (its aspx_data_1ch rendered as the same channel twice,
+   decoder.py), and 7_X's fourth pair; d->pair_ch by the element's
+   layout (Table 213) */
+#define NPAIR 4
 
 static const char *REASONS[AC4E_COUNT] = {
     "none", "toc.parse", "toc.seq_range", "toc.sizes", "toc.version",
@@ -84,7 +84,8 @@ static const char *REASONS[AC4E_COUNT] = {
     "decoder.internal", "element.unknown", "seq.outlier", "aspx.config",
     "aspx.parse", "aspx.num_env", "aspx.borders", "acpl.parse",
     "audio_size.late", "guard.level", "aspx.level", "toc.presentation",
-    "toc.unsupported_rate", "asf.transf_length", "asf.chel_matsel"
+    "toc.unsupported_rate", "asf.transf_length", "asf.chel_matsel",
+    "asf.add_ch"
 };
 
 const char *ac4_reason_name(int code)
@@ -117,9 +118,9 @@ typedef struct {
     int unknown;                /* element not known: BAD, silence */
     int seq, iframe, seq_jump;
     int mask;                   /* channels synthesised */
-    int nwin[6];
-    int wlen[6][AC4_MAX_WIN];
-    double *win;                /* 6 x FRAME */
+    int nwin[NCH];
+    int wlen[NCH][AC4_MAX_WIN];
+    double *win;                /* NCH x FRAME */
     ac4_aspx_frame af[NPAIR];   /* L/R, Ls/Rs, C (as C/C) */
     ac4_meta meta;              /* presentation substream (valid 0: none) */
 } rec_t;
@@ -144,13 +145,13 @@ typedef struct {
     int ok;
     int n;                      /* samples (the frame length) */
     ac4_meta meta;
-    double pcm[6][FRAME];
+    double pcm[NCH][FRAME];
 } outf_t;
 
 typedef struct {
     double floor, init, ref;
     int seeded;
-    double last[6];
+    double last[NCH];
     int has_last, muted;
     int forced_hist[G_NEAR];    /* forced flags of the last frames judged */
     int n_hist;
@@ -162,6 +163,10 @@ struct ac4dec {
     int N, L, G;
     int element;                /* resolved ac4dec_element, 0 = not yet */
     int n_ch;
+    int ch_mode;                /* 7_X: Table 88 ch_mode */
+    int out_ch[NCH];            /* output channel c is slot out_ch[c] */
+    int el_mask;                /* the element's slots */
+    int pair_ch[NPAIR][2];
     /* the stream's rate (rates.py): (fs_index, frame_rate_index) of its
        first decodable frame whose next frame agrees; fl = frame_len_base
        (AC4_DEFAULT_FRAME until then); the output resampler is fixed at
@@ -178,8 +183,8 @@ struct ac4dec {
     ac4_rs_filter *rsf;
     ac4_qmf_tables *qmf;
     ac4_element el;
-    double spec[6][FRAME];
-    int spec_n[6];
+    double spec[NCH][FRAME];
+    int spec_n[NCH];
     double tmp[4 * FRAME];
     double zeros[FRAME];
 
@@ -219,11 +224,11 @@ struct ac4dec {
     int rec_n;
 
     /* ---- synthesis + A-SPX */
-    ac4_fb_state fb[6];
+    ac4_fb_state fb[NCH];
     long long n_synth;
-    double core[6][FRAME];
-    double core_prev[6][FRAME];
-    double core_tail[6][HF_DELAY];   /* delay line: last 577 core samples */
+    double core[NCH][FRAME];
+    double core_prev[NCH][FRAME];
+    double core_tail[NCH][HF_DELAY];   /* delay line: last 577 core samples */
     rec_t prev_info;            /* frame n_synth - 1 (no windows) */
     ac4_aspx_pair pair[NPAIR];
     int pair_active[NPAIR];
@@ -243,8 +248,8 @@ struct ac4dec {
     guard_t guard;
 
     /* ---- output */
-    ac4_rs_state rs[6];
-    double pcm_out[6][AC4DEC_MAX_OUT + 2];
+    ac4_rs_state rs[NCH];
+    double pcm_out[NCH][AC4DEC_MAX_OUT + 2];
     outf_t cur;                 /* the frame last given out */
     int flushing;
 
@@ -363,11 +368,31 @@ static ac4dec_element element_of_toc(const ac4dec_config *c, const ac4_toc *t)
     if (!s)
         return AC4DEC_ELEMENT_AUTO;
     cm = s->channel_mode;
-    if (cm == 1)
-        return AC4DEC_ELEMENT_PAIR;
-    if (cm == 4)
-        return AC4DEC_ELEMENT_5X;
+    switch (cm) {
+    case 0: return AC4DEC_ELEMENT_MONO;
+    case 1: return AC4DEC_ELEMENT_PAIR;
+    case 2: return AC4DEC_ELEMENT_3_0;
+    case 3: return AC4DEC_ELEMENT_5_0;
+    case 4: return AC4DEC_ELEMENT_5X;
+    default: break;
+    }
+    if (cm >= 5 && cm <= 10) {
+        /* presentation_version 2 with a 7.x mode (the kit's "IMS"): a
+           channel_pair_element (decoder.py IMS_STEREO) */
+        int pi = choose_pres(c, t);
+        if (pi >= 0 && pi < t->n_pres && t->pres[pi].version == 2)
+            return AC4DEC_ELEMENT_PAIR;
+        return AC4DEC_ELEMENT_7X;
+    }
     return AC4DEC_ELEMENT_AUTO;
+}
+
+/* the 7_X ch_mode of the chosen presentation's audio substream, or 0 */
+static int ch_mode_of_toc(const ac4dec_config *c, const ac4_toc *t)
+{
+    const ac4_toc_sub *s = ac4_toc_audio_substream(t, choose_pres(c, t));
+    return s && s->channel_mode >= 5 && s->channel_mode <= 10
+           ? (int)s->channel_mode : 0;
 }
 
 /* parse a TOC without side effects -> 0 ok */
@@ -409,6 +434,26 @@ ac4dec_element ac4dec_probe_config(const ac4dec_config *cfg,
     if (len > MAX_FRAME_BYTES || toc_try(data, len, &t) != 0)
         return AC4DEC_ELEMENT_AUTO;
     return element_of_toc(&c, &t);
+}
+
+int ac4dec_probe_ch_mode(const ac4dec_config *cfg, const uint8_t *data,
+                         size_t len)
+{
+    ac4_toc t;
+    ac4dec_config c;
+    memset(&c, 0, sizeof(c));
+    if (cfg)
+        c = *cfg;
+    if (len > MAX_FRAME_BYTES || toc_try(data, len, &t) != 0)
+        return 0;
+    if (element_of_toc(&c, &t) != AC4DEC_ELEMENT_7X)
+        return 0;
+    return ch_mode_of_toc(&c, &t);
+}
+
+int ac4dec_channels(const ac4dec *d)
+{
+    return d->element ? d->n_ch : 0;
 }
 
 int ac4dec_probe_rate(const uint8_t *data, size_t len, int *fs_index,
@@ -504,17 +549,75 @@ int ac4dec_presentations(const uint8_t *data, size_t len,
 
 double ac4dec_ref_peak(ac4dec_element e)
 {
-    return e == AC4DEC_ELEMENT_PAIR ? 2.0e5 : 9.0e5;
+    return e == AC4DEC_ELEMENT_PAIR || e == AC4DEC_ELEMENT_MONO ? 2.0e5
+                                                                : 9.0e5;
+}
+
+/* the element's output channels (slots, in output order) -> count */
+static int element_slots(int element, int ch_mode, int *slot)
+{
+    static const int S51[6] = { CH_L, CH_R, CH_C, CH_LFE, CH_LS, CH_RS };
+    static const int S50[5] = { CH_L, CH_R, CH_C, CH_LS, CH_RS };
+    static const int S71[8] = { CH_L, CH_R, CH_C, CH_LFE, CH_LS, CH_RS,
+                                CH_X1, CH_X2 };
+    static const int S70[7] = { CH_L, CH_R, CH_C, CH_LS, CH_RS, CH_X1,
+                                CH_X2 };
+    const int *src = S51;
+    int n = 6, i;
+    switch (element) {
+    case AC4DEC_ELEMENT_PAIR: n = 2; break;
+    case AC4DEC_ELEMENT_MONO: src = S51 + 2; n = 1; break;
+    case AC4DEC_ELEMENT_3_0: n = 3; break;
+    case AC4DEC_ELEMENT_5_0: src = S50; n = 5; break;
+    case AC4DEC_ELEMENT_7X:
+        if (ch_mode % 2 == 0) {
+            src = S71;
+            n = 8;
+        } else {
+            src = S70;
+            n = 7;
+        }
+        break;
+    default: break;
+    }
+    for (i = 0; i < n; i++)
+        slot[i] = src[i];
+    return n;
 }
 
 static void set_element(ac4dec *d, int element)
 {
     double ref;
+    int slot[NCH], n, i;
     d->element = element;
-    if (element == AC4DEC_ELEMENT_PAIR)
-        d->n_ch = 2;
-    else
-        d->n_ch = d->cfg.channels ? d->cfg.channels : 6;
+    if (element == AC4DEC_ELEMENT_7X && !d->ch_mode)
+        d->ch_mode = d->cfg.ch_mode ? d->cfg.ch_mode : 6;
+    n = element_slots(element, d->ch_mode, slot);
+    d->el_mask = 0;
+    for (i = 0; i < n; i++)
+        d->el_mask |= 1 << slot[i];
+    if (d->cfg.channels == 2 && n > 2 && (d->el_mask & 3) == 3) {
+        n = 2;
+        slot[0] = CH_L;
+        slot[1] = CH_R;
+    }
+    d->n_ch = n;
+    for (i = 0; i < NCH; i++)
+        d->out_ch[i] = i < n ? slot[i] : i;
+    /* A-SPX block groups -> channel pairs (Table 213) */
+    d->pair_ch[0][0] = CH_L;
+    d->pair_ch[0][1] = CH_R;
+    d->pair_ch[1][0] = CH_LS;
+    d->pair_ch[1][1] = CH_RS;
+    d->pair_ch[2][0] = d->pair_ch[2][1] = CH_C;
+    d->pair_ch[3][0] = CH_X1;
+    d->pair_ch[3][1] = CH_X2;
+    if (element == AC4DEC_ELEMENT_7X && (d->ch_mode == 7 || d->ch_mode == 8)) {
+        d->pair_ch[1][0] = CH_X1;         /* 5/2/0: (Lw, Rw) second */
+        d->pair_ch[1][1] = CH_X2;
+        d->pair_ch[3][0] = CH_LS;
+        d->pair_ch[3][1] = CH_RS;
+    }
     ref = ac4dec_ref_peak((ac4dec_element)element);
     d->guard.floor = G_FLOOR_FRAC * ref;
     d->guard.init = G_INIT_FRAC * ref;
@@ -533,7 +636,7 @@ static void set_rate(ac4dec *d, int fs, int fri)
     if (fl != d->fl) {
         long long j;
         d->fl = fl;
-        for (k = 0; k < 6; k++) {
+        for (k = 0; k < NCH; k++) {
             memset(&d->fb[k], 0, sizeof(d->fb[k]));
             d->fb[k].n_full = fl;
         }
@@ -546,7 +649,7 @@ static void set_rate(ac4dec *d, int fs, int fri)
         for (j = d->rec_first; j < d->rec_first + d->rec_n; j++) {
             rec_t *r = &d->recs[(int)(j % d->rec_cap)];
             if (r->code != AC4E_NONE)
-                for (k = 0; k < 6; k++) {
+                for (k = 0; k < NCH; k++) {
                     r->nwin[k] = 1;
                     r->wlen[k][0] = fl;
                     memset(r->win + k * FRAME, 0, sizeof(double) * FRAME);
@@ -563,7 +666,7 @@ static int chan_mask(const ac4dec *d, int acpl3)
         return (1 << CH_L) | (1 << CH_R);
     if (acpl3)
         return (1 << CH_L) | (1 << CH_R) | (1 << CH_LFE);
-    return 0x3f;
+    return d->el_mask;
 }
 
 /* the channels of the mask the element does not code (ASPX_ACPL_2: R of
@@ -642,7 +745,7 @@ static void stream_reset(ac4dec *d)
     d->rec_first = 0;
     d->rec_n = 0;
     memset(d->fb, 0, sizeof(d->fb));
-    for (i = 0; i < 6; i++)
+    for (i = 0; i < NCH; i++)
         d->fb[i].n_full = AC4_DEFAULT_FRAME;
     d->n_synth = 0;
     memset(d->core_prev, 0, sizeof(d->core_prev));
@@ -664,7 +767,7 @@ static void stream_reset(ac4dec *d)
     }
     if (d->element)
         set_element(d, d->element);
-    for (i = 0; i < 6; i++)
+    for (i = 0; i < NCH; i++)
         ac4_rs_init(&d->rs[i]);
     d->flushing = 0;
 }
@@ -678,11 +781,20 @@ ac4dec *ac4dec_open(const ac4dec_config *cfg)
     memset(&c, 0, sizeof(c));
     if (cfg)
         c = *cfg;
-    if (c.channels != 0 && c.channels != 2 && c.channels != 6)
+    if (c.channels < 0 || c.channels > NCH)
         return NULL;
-    if (c.element != AC4DEC_ELEMENT_AUTO && c.element != AC4DEC_ELEMENT_5X
-        && c.element != AC4DEC_ELEMENT_PAIR)
+    if ((int)c.element < AC4DEC_ELEMENT_AUTO
+        || (int)c.element > AC4DEC_ELEMENT_7X)
         return NULL;
+    if (c.ch_mode != 0 && (c.ch_mode < 5 || c.ch_mode > 10))
+        return NULL;
+    if (c.element != AC4DEC_ELEMENT_AUTO && c.channels) {
+        int slot[NCH], n = element_slots(c.element, c.ch_mode ? c.ch_mode
+                                                              : 6, slot);
+        if (c.channels != n && !(c.channels == 2 && n > 2
+                                 && c.element != AC4DEC_ELEMENT_MONO))
+            return NULL;
+    }
     if (c.lookahead == 0)
         c.lookahead = AC4DEC_DEFAULT_LOOKAHEAD;
     if (c.lookahead < AC4DEC_MIN_LOOKAHEAD || c.lookahead > 100000)
@@ -726,7 +838,7 @@ ac4dec *ac4dec_open(const ac4dec_config *cfg)
         return NULL;
     }
     for (i = 0; i < d->rec_cap; i++) {
-        d->recs[i].win = (double *)calloc(6 * FRAME, sizeof(double));
+        d->recs[i].win = (double *)calloc(NCH * FRAME, sizeof(double));
         if (!d->recs[i].win) {
             ac4dec_close(d);
             return NULL;
@@ -833,23 +945,47 @@ static rec_t *rec_new(ac4dec *d, long long index)
     return r;
 }
 
+/* companding_control, per channel (stream.py): L R C Ls Rs for 5_X codec
+   mode 1; L R C for ASPX_ACPL_1 / _2 and 3.0; L R for a pair and
+   ASPX_ACPL_3; the "m" track of a pair in ASPX_ACPL_1 / _2; C for mono */
+static void set_comp(ac4_aspx_frame *f, int g, const ac4_element *e,
+                     int acpl1)
+{
+    int ch;
+    for (ch = 0; ch < 2; ch++) {
+        ac4_aspx_chd *cd = &f->g.c[ch];
+        int i = g == 0 ? (ch == 0 || acpl1 == AC4_ACPL1_PAIR ? 0 : 1)
+                : g == 1 ? 3 + ch : e->comp_c;
+        cd->comp_set = 1;
+        cd->comp_sync = e->comp_sync;
+        cd->comp_avg = e->comp_avg;
+        cd->comp_on = e->comp_sync ? e->comp_on[0]
+                      : (i < e->comp_n ? e->comp_on[i] : 0);
+    }
+}
+
+/* every pair group of a record: A-SPX, A-CPL and 1ch A-CPL kinds */
+static void af_kinds(rec_t *r, int kind)
+{
+    int p;
+    for (p = 0; p < NPAIR; p++)
+        r->af[p].kind = r->af[p].acpl.kind = r->af[p].acpl1_kind = kind;
+}
+
 /* a concealed frame: one zero window per channel, A-SPX muted */
 static void rec_conceal(ac4dec *d, rec_t *r, int code)
 {
     int k;
     r->code = code;
     r->mask = chan_mask(d, d->acpl3);
-    for (k = 0; k < 6; k++) {
+    for (k = 0; k < NCH; k++) {
         r->nwin[k] = 1;
         r->wlen[k][0] = d->fl;
         memset(r->win + k * FRAME, 0, sizeof(double) * (size_t)d->fl);
     }
-    r->af[0].kind = r->af[1].kind = r->af[2].kind = AC4_GRP_CONCEALED;
-    r->af[0].has_tab = r->af[1].has_tab = r->af[2].has_tab = 0;
-    r->af[0].acpl.kind = r->af[1].acpl.kind = r->af[2].acpl.kind =
-        AC4_GRP_CONCEALED;
-    r->af[0].acpl1_kind = r->af[1].acpl1_kind = r->af[2].acpl1_kind =
-        AC4_GRP_CONCEALED;
+    af_kinds(r, AC4_GRP_CONCEALED);
+    for (k = 0; k < NPAIR; k++)
+        r->af[k].has_tab = 0;
     r->seq_jump = 0;
 }
 
@@ -1096,10 +1232,18 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     code = setjmp(jb);
     if (code != 0)
         goto fail;
-    if (d->element == AC4DEC_ELEMENT_PAIR)
-        ac4_parse_pair(&b, &d->books, ifr, e);
-    else
-        ac4_parse_5x(&b, &d->books, ifr, e);
+    switch (d->element) {
+    case AC4DEC_ELEMENT_PAIR: ac4_parse_pair(&b, &d->books, ifr, e); break;
+    case AC4DEC_ELEMENT_MONO: ac4_parse_mono(&b, &d->books, ifr, e); break;
+    case AC4DEC_ELEMENT_3_0: ac4_parse_3_0(&b, &d->books, ifr, e); break;
+    case AC4DEC_ELEMENT_5_0:
+        ac4_parse_5x_lfe(&b, &d->books, ifr, 0, e);
+        break;
+    case AC4DEC_ELEMENT_7X:
+        ac4_parse_7x(&b, &d->books, ifr, d->ch_mode, e);
+        break;
+    default: ac4_parse_5x(&b, &d->books, ifr, e); break;
+    }
     if (changed == AC4E_NONE && d->mode >= 0 && e->mode != d->mode)
         changed = AC4E_ELEMENT_MODE;
     if (e->has_aspx_cfg) {
@@ -1113,11 +1257,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     acpl1 = e->acpl1;
     has_aspx = e->n_blocks > 0;
     end = e->bits_end;
-    r->af[0].kind = r->af[1].kind = r->af[2].kind = AC4_GRP_NONE;
-    r->af[0].acpl.kind = r->af[1].acpl.kind = r->af[2].acpl.kind =
-        AC4_GRP_NONE;
-    r->af[0].acpl1_kind = r->af[1].acpl1_kind = r->af[2].acpl1_kind =
-        AC4_GRP_NONE;
+    af_kinds(r, AC4_GRP_NONE);
     if (cfg && has_aspx) {
         const ac4_acpl_cfg *pc = e->has_acpl_cfg ? &e->acpl_cfg
                                  : (d->has_pcfg ? &d->pcfg : NULL);
@@ -1140,27 +1280,8 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
                for 5_X codec mode 1; L R C for ASPX_ACPL_1 / _2; L R for
                a pair and ASPX_ACPL_3; the "m" track of a pair in
                ASPX_ACPL_1 / _2 */
-            if (e->comp_present) {
-                int ch, idx[2];
-                if (g == 0) {
-                    idx[0] = 0;
-                    idx[1] = acpl1 == AC4_ACPL1_PAIR ? 0 : 1;
-                } else if (g == 1) {
-                    idx[0] = 3;
-                    idx[1] = 4;
-                } else {
-                    idx[0] = idx[1] = 2;
-                }
-                for (ch = 0; ch < 2; ch++) {
-                    ac4_aspx_chd *cd = &r->af[g].g.c[ch];
-                    cd->comp_set = 1;
-                    cd->comp_sync = e->comp_sync;
-                    cd->comp_avg = e->comp_avg;
-                    cd->comp_on = e->comp_sync ? e->comp_on[0]
-                                  : (idx[ch] < e->comp_n
-                                     ? e->comp_on[idx[ch]] : 0);
-                }
-            }
+            if (e->comp_present)
+                set_comp(&r->af[g], g, e, acpl1);
         }
         end = b.p;
         if (acpl3 && pc) {
@@ -1197,7 +1318,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     r->mask = chan_mask(d, acpl3);
     silent = silent_mask(e, r->mask);
     need = need_mask(e, r->mask) & ~silent;
-    for (k = 0; k < 6; k++)
+    for (k = 0; k < NCH; k++)
         if ((need & (1 << k)) && e->has_ch[k])
             d->spec_n[k] = ac4_packed_spectrum(chan_src(e, k), d->spec[k],
                                                &jb);
@@ -1265,7 +1386,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     if (acpl1)
         d->acpl1 = acpl1;
     /* the silent channels: zero */
-    for (k = 0; k < 6; k++)
+    for (k = 0; k < NCH; k++)
         if (silent & (1 << k))
             d->spec_n[k] = 0;
     /* stereo processing, ungroup (ASPX_ACPL_1's side track can be
@@ -1314,7 +1435,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
                        &e->st[e->steps[i].st0], &e->fr[e->steps[i].key[0]]);
         }
     }
-    for (k = 0; k < 6; k++) {
+    for (k = 0; k < NCH; k++) {
         const ac4_framing *fr;
         int w, sum = 0;
         if (!((r->mask | need) & (1 << k)))
@@ -1429,11 +1550,12 @@ static void parse_held(ac4dec *d, const uint8_t *nx, size_t nx_len,
     const uint8_t *data = d->raw_null ? NULL : d->raw;
     if (!d->element) {
         ac4_toc tt;
-        ac4dec_element el = (data && d->raw_len
-                             && d->raw_len <= MAX_FRAME_BYTES
-                             && toc_try(data, d->raw_len, &tt) == 0)
-                            ? element_of_toc(&d->cfg, &tt)
-                            : AC4DEC_ELEMENT_AUTO;
+        int ok = data && d->raw_len && d->raw_len <= MAX_FRAME_BYTES
+                 && toc_try(data, d->raw_len, &tt) == 0;
+        ac4dec_element el = ok ? element_of_toc(&d->cfg, &tt)
+                               : AC4DEC_ELEMENT_AUTO;
+        if (el == AC4DEC_ELEMENT_7X && !d->cfg.ch_mode)
+            d->ch_mode = ch_mode_of_toc(&d->cfg, &tt);
         if (el != AC4DEC_ELEMENT_AUTO)
             set_element(d, el);
     }
@@ -1442,11 +1564,7 @@ static void parse_held(ac4dec *d, const uint8_t *nx, size_t nx_len,
         rec_conceal(d, r, AC4E_UNKNOWN_ELEMENT);
         r->unknown = 1;
         r->mask = 0;
-        r->af[0].kind = r->af[1].kind = r->af[2].kind = AC4_GRP_NONE;
-        r->af[0].acpl.kind = r->af[1].acpl.kind = r->af[2].acpl.kind =
-            AC4_GRP_NONE;
-        r->af[0].acpl1_kind = r->af[1].acpl1_kind = r->af[2].acpl1_kind =
-            AC4_GRP_NONE;
+        af_kinds(r, AC4_GRP_NONE);
         return;
     }
     parse_frame(d, data, d->raw_len, nx, nx_len, has_next, r);
@@ -1460,10 +1578,12 @@ static int pair_capable(const ac4dec *d, int p)
     if (d->element == AC4DEC_ELEMENT_PAIR)
         return p == 0 && d->mode >= 1;
     if (p == 0)
-        return 1;                   /* 5_X codec modes 1 - 4 */
+        return (d->el_mask & 1) != 0;   /* L/R: every element but mono */
     if (p == 1 && d->acpl1)
         return 0;                   /* ASPX_ACPL_1 / _2: no Ls/Rs A-SPX */
-    return !d->acpl3 && d->n_ch == 6;   /* Ls/Rs and C (as C/C) */
+    if (d->acpl3 || d->n_ch <= 2)
+        return 0;
+    return (d->el_mask >> d->pair_ch[p][0]) & 1;  /* the element has it */
 }
 
 static void np_frame_stats(const double *x, int n, double *rms,
@@ -1561,7 +1681,7 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
     o->aspx_flag = 0;
     /* every channel 577 samples late: the delay line, unless its pair
        is on the QMF path (below) */
-    for (k = 0; k < 6; k++) {
+    for (k = 0; k < NCH; k++) {
         /* (tail ++ core)[:fl] out, its last HF_DELAY kept: the frame can
            be shorter than the delay (512, 384) */
         double x[HF_DELAY + FRAME];
@@ -1582,8 +1702,8 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
         dc[1] = dcore[p][1];
         if (bursts(d, p, y, dc, &bad))
             o->aspx_flag = 1;
-        memcpy(o->pcm[PAIR_CH[p][0]], y[0], sizeof(o->pcm[0]));
-        memcpy(o->pcm[PAIR_CH[p][1]], y[1], sizeof(o->pcm[0]));
+        memcpy(o->pcm[d->pair_ch[p][0]], y[0], sizeof(o->pcm[0]));
+        memcpy(o->pcm[d->pair_ch[p][1]], y[1], sizeof(o->pcm[0]));
         if (p == 0 && d->pair[0].acpl_on) {
             /* the A-CPL upmix (decoder.py): a frame the checks above gave
                its core plays the core (the stereo downmix) on L / R and
@@ -1606,8 +1726,12 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
             }
         }
     }
+    /* the output channels in order (output c is slot out_ch[c] >= c) */
+    for (k = 0; k < d->n_ch; k++)
+        if (d->out_ch[k] != k)
+            memcpy(o->pcm[k], o->pcm[d->out_ch[k]], sizeof(o->pcm[k]));
     /* channels a frame does not have are silent */
-    for (k = d->n_ch; k < 6; k++)
+    for (k = d->n_ch; k < NCH; k++)
         memset(o->pcm[k], 0, sizeof(o->pcm[k]));
     o->n = d->fl;
     o->pk = frame_peak(o, d->n_ch, d->fl);
@@ -1619,9 +1743,9 @@ static void synth_one(ac4dec *d)
 {
     rec_t *r = &d->recs[(int)(d->rec_first % d->rec_cap)];
     double (*hf)[2][FRAME] = d->hf, (*dcore)[2][FRAME] = d->dcore;
-    int have[NPAIR] = { 0, 0, 0 }, k, w, p, i;
+    int have[NPAIR] = { 0, 0, 0, 0 }, k, w, p, i;
     /* IMDCT / overlap-add */
-    for (k = 0; k < 6; k++) {
+    for (k = 0; k < NCH; k++) {
         int pos = 0;
         if (!(r->mask & (1 << k))) {
             memset(d->core[k], 0, sizeof(d->core[k]));
@@ -1666,8 +1790,8 @@ static void synth_one(ac4dec *d)
         if (d->pair_active[p]) {
             const double *x[2];
             double *y[2], *dc[2];
-            x[0] = d->core[PAIR_CH[p][0]];
-            x[1] = d->core[PAIR_CH[p][1]];
+            x[0] = d->core[d->pair_ch[p][0]];
+            x[1] = d->core[d->pair_ch[p][1]];
             if (p == 0 && d->acpl1 == AC4_ACPL1_PAIR)
                 x[1] = d->core[CH_L];       /* the "m" track twice */
             if (p == 0 && d->pair[0].acpl_on >= 2) {
@@ -1698,7 +1822,7 @@ static void synth_one(ac4dec *d)
 static void finish(ac4dec *d)
 {
     double (*hf)[2][FRAME] = d->hf, (*dcore)[2][FRAME] = d->dcore;
-    int have[NPAIR] = { 0, 0, 0 }, p;
+    int have[NPAIR] = { 0, 0, 0, 0 }, p;
     if (d->finished)
         return;
     d->finished = 1;
@@ -1900,13 +2024,15 @@ static void emit(ac4dec *d, ac4dec_frame *out)
         d->rs_fixed = 1;
     }
     if (d->cfg.loudness) {
-        double *pp[6];
+        double *pp[NCH];
         if (!d->lev) {
             int drc = d->cfg.drc == 0 ? AC4_DRC_AUTO
                       : d->cfg.drc < 0 ? AC4_DRC_OFF : d->cfg.drc - 1;
             d->lev = (ac4_leveler *)malloc(sizeof(ac4_leveler));
             if (d->lev)
-                ac4_leveler_init(d->lev, d->n_ch, d->n_ch == 6,
+                ac4_leveler_init(d->lev, d->n_ch, d->out_ch,
+                                 d->element == AC4DEC_ELEMENT_7X
+                                 && d->ch_mode <= 6,
                                  d->cfg.target_level, drc,
                                  (double)d->out_rate * d->rs_down / d->rs_up);
         }

@@ -452,11 +452,14 @@ static const double KA1[3] = { 1.0, -1.69065929318241, 0.73248077421585 };
 static const double KB2[3] = { 1.0, -2.0, 1.0 };
 static const double KA2[3] = { 1.0, -1.99004745483398, 0.99007225036621 };
 
-void ac4_leveler_init(ac4_leveler *lv, int n_ch, int five, double target,
-                      int drc, double rate)
+void ac4_leveler_init(ac4_leveler *lv, int n_ch, const int *slot,
+                      int backs, double target, int drc, double rate)
 {
-    static const double W6[6] = { 1.0, 1.0, 1.0, 0.0, 1.41, 1.41 };
-    static const int GRP6[6] = { 0, 0, 1, 0, 2, 2 };
+    /* per slot (decoder.c CH_*: L R C LFE Ls Rs X1 X2): BS.1770 weights
+       (LFE 0, surrounds 1.41; the 7_X pair 1.41 when it is Lb / Rb) and
+       the transmitted-gain channel groups (Table 168: L R LFE, C, rest) */
+    static const double W[8] = { 1.0, 1.0, 1.0, 0.0, 1.41, 1.41, 1.0, 1.0 };
+    static const int GRP[8] = { 0, 0, 1, 0, 2, 2, 2, 2 };
     int k;
     memset(lv, 0, sizeof(*lv));
     lv->n_ch = n_ch;
@@ -465,8 +468,9 @@ void ac4_leveler_init(ac4_leveler *lv, int n_ch, int five, double target,
     lv->rate = rate;
     lv->mode_id = -1;
     for (k = 0; k < n_ch; k++) {
-        lv->w[k] = five ? W6[k] : 1.0;
-        lv->grp[k] = five ? GRP6[k] : 0;
+        int sl = slot[k];
+        lv->w[k] = (backs && sl >= 6) ? 1.41 : W[sl];
+        lv->grp[k] = GRP[sl];
     }
 }
 

@@ -807,7 +807,7 @@ def aspx_config(b):
                 num_env_bits_fixfix=b.u(1), freq_res_mode=b.u(2))
 
 
-def _acpl3_core(b, T, b_iframe, sub):
+def _acpl3_core(b, T, b_iframe, sub, has_lfe=True):
     """5_X_codec_mode 4 = ASPX_ACPL_3 -- decode the core (LFE + stereo pair).
 
     TS 103 190-1 Table 96 gives 5_X_codec_mode 4 = ASPX_ACPL_3 (A-SPX plus
@@ -837,7 +837,7 @@ def _acpl3_core(b, T, b_iframe, sub):
         aspx = aspx_config(b)
         from .acpl_parse import acpl_config_2ch
         acpl = acpl_config_2ch(b)                    # Table 60, four bits
-    lfe = mono_data(b, T, b_lfe=True)                # b_has_lfe (5.1)
+    lfe = mono_data(b, T, b_lfe=True) if has_lfe else None   # b_has_lfe
     comp = companding_control(b, 2)
     l, r, st_lr = stereo_data(b, T)                  # Table 23
     return dict(lfe=lfe, L=l, R=r, st_lr=st_lr, aspx=aspx, acpl3=True,
@@ -919,7 +919,7 @@ def decode_element(sub, T, b_iframe=False, has_lfe=True):
     asz, a0 = audio_size(b)
     codec_mode = b.u(3)
     if codec_mode == 4:
-        r = _acpl3_core(b, T, b_iframe, sub)
+        r = _acpl3_core(b, T, b_iframe, sub, has_lfe)
         r.update(audio_size=asz, audio_start=a0, mode=("5_X", 4),
                  aspx_blocks=((0, True),), acpl_blocks=0)
         return r

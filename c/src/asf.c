@@ -608,7 +608,7 @@ static const msfb_master_t MSFB_MASTER[] = {
         { 0, 1, 1, 2, 2, 3, 3, 4 } } },
 };
 
-enum { K_L, K_R, K_C, K_LFE, K_LS, K_RS };   /* decoder.c CH_* */
+enum { K_L, K_R, K_C, K_LFE, K_LS, K_RS, K_X1, K_X2 };  /* decoder.c CH_* */
 
 static ac4_stereo *new_st(ac4_bits *b, ac4_element *e)
 {
@@ -630,7 +630,10 @@ static void track(ac4_bits *b, const ac4_books *bk, ac4_element *e, int k)
 static void add_step(ac4_element *e, int kind, int matsel, int st0, int nk,
                      const int *keys)
 {
-    int i, s = e->n_steps++;
+    int i, s;
+    if (e->n_steps >= 4)
+        return;                           /* cannot happen (3 at most) */
+    s = e->n_steps++;
     e->steps[s].kind = kind;
     e->steps[s].nk = nk;
     e->steps[s].matsel = matsel;
@@ -809,6 +812,8 @@ static void acpl_config_1ch(ac4_bits *b, int partial, ac4_acpl1_cfg *c)
 static void set_blocks(ac4_element *e, int n, int g0, int t0, int g1,
                        int t1, int g2, int t2)
 {
+    e->blk_grp[3] = 3;
+    e->blk_two[3] = 1;
     e->n_blocks = n;
     e->blk_grp[0] = g0;
     e->blk_two[0] = t0;
@@ -828,6 +833,7 @@ static void element_reset(ac4_element *e)
     e->comp_present = 0;
     e->has_aspx_cfg = e->has_acpl_cfg = 0;
     e->n_st = e->n_steps = e->n_side = e->n_order = 0;
+    e->comp_c = 2;
     for (k = 0; k < AC4_NCH; k++)
         e->has_ch[k] = 0;
 }
@@ -836,6 +842,12 @@ static void element_reset(ac4_element *e)
    the track to channel mapping of Tables 180 / 181 */
 void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
                   ac4_element *e)
+{
+    ac4_parse_5x_lfe(b, bk, b_iframe, 1, e);
+}
+
+void ac4_parse_5x_lfe(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                      int has_lfe, ac4_element *e)
 {
     element_reset(e);
     audio_size(b, e);
@@ -847,7 +859,8 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
             acpl_config_2ch(b, &e->acpl_cfg);   /* Table 60 */
             e->has_aspx_cfg = e->has_acpl_cfg = 1;
         }
-        mono_data(b, bk, 1, e, K_LFE);
+        if (has_lfe)
+            mono_data(b, bk, 1, e, K_LFE);
         companding_control(b, 2, e);
         two_ch(b, bk, e, K_L, K_R, 1);    /* stereo_data */
         set_blocks(e, 1, 0, 1, 0, 0, 0, 0);
@@ -862,7 +875,8 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
             acpl_config_1ch(b, e->mode == 2, &e->acpl1_cfg);
             e->has_aspx_cfg = e->has_acpl_cfg = 1;
         }
-        mono_data(b, bk, 1, e, K_LFE);
+        if (has_lfe)
+            mono_data(b, bk, 1, e, K_LFE);
         companding_control(b, 3, e);
         cc = (int)ac4_bit(b);             /* coding_config */
         if (cc) {
@@ -905,7 +919,8 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
         aspx_config(b, &e->aspx_cfg);
         e->has_aspx_cfg = 1;
     }
-    mono_data(b, bk, 1, e, K_LFE);
+    if (has_lfe)
+        mono_data(b, bk, 1, e, K_LFE);
     if (e->mode == 1)
         companding_control(b, 5, e);
     switch (ac4_u(b, 2)) {                /* coding_config */
@@ -994,6 +1009,128 @@ void ac4_parse_pair(ac4_bits *b, const ac4_books *bk, int b_iframe,
         set_blocks(e, 1, 0, 0, 0, 0, 0, 0);
         e->acpl1 = AC4_ACPL1_PAIR;
         e->n_acpl1 = 1;
+    }
+    e->bits_end = b->p;
+}
+
+/* single_channel_element (Table 20): the track on C */
+void ac4_parse_mono(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                    ac4_element *e)
+{
+    element_reset(e);
+    audio_size(b, e);
+    e->mode = (int)ac4_bit(b);            /* mono_codec_mode */
+    if (b_iframe && e->mode == 1) {
+        aspx_config(b, &e->aspx_cfg);
+        e->has_aspx_cfg = 1;
+    }
+    if (e->mode == 1)
+        companding_control(b, 1, e);
+    mono_data(b, bk, 0, e, K_C);
+    e->comp_c = 0;
+    set_blocks(e, e->mode == 1 ? 1 : 0, 2, 0, 0, 0, 0, 0);
+    e->bits_end = b->p;
+}
+
+/* 3_0_channel_element (Table 24, 5.3.4.2) */
+void ac4_parse_3_0(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                   ac4_element *e)
+{
+    element_reset(e);
+    audio_size(b, e);
+    e->mode = (int)ac4_bit(b);            /* 3_0_codec_mode */
+    if (e->mode == 1) {
+        if (b_iframe) {
+            aspx_config(b, &e->aspx_cfg);
+            e->has_aspx_cfg = 1;
+        }
+        companding_control(b, 3, e);
+    }
+    if (ac4_bit(b) == 0) {                /* 3_0_coding_config */
+        two_ch(b, bk, e, K_L, K_R, 1);    /* stereo_data */
+        mono_data(b, bk, 0, e, K_C);
+    } else {
+        static const int K3[3] = { K_L, K_R, K_C };
+        n_ch(b, bk, e, 3, K3);
+    }
+    set_blocks(e, e->mode == 1 ? 2 : 0, 0, 1, 2, 0, 0, 0);
+    e->bits_end = b->p;
+}
+
+/* 7_X_channel_element (Table 33), codec modes SIMPLE and ASPX, ch_mode 5
+   - 10: the tracks of A..G (Table 182) go straight to their channels (A
+   L, B R, D Ls, E Rs, F X1, G X2); Table 183's pairs, (D, F) / (E, G) for
+   3/4/0 and (A, F) / (B, G) otherwise, are the side steps (per window,
+   with the b_use_sap_add_ch parameters, read with the base track's
+   framing; the two tracks must have the same windows: asf.add_ch) */
+void ac4_parse_7x(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                  int ch_mode, ac4_element *e)
+{
+    int has_lfe = ch_mode % 2 == 0, l340 = ch_mode <= 6, cc, i, s0 = -1;
+    int base[2];
+    element_reset(e);
+    audio_size(b, e);
+    e->mode = (int)ac4_u(b, 2);           /* 7_X_codec_mode */
+    if (e->mode >= 2)                     /* ASPX_ACPL_1 / _2: not built */
+        ac4_fail(b, AC4E_ELEMENT_PARSE);
+    if (b_iframe && e->mode == 1) {
+        aspx_config(b, &e->aspx_cfg);
+        e->has_aspx_cfg = 1;
+    }
+    if (has_lfe)
+        mono_data(b, bk, 1, e, K_LFE);
+    cc = (int)ac4_u(b, 2);                /* coding_config */
+    if (cc == 0) {
+        if (ac4_bit(b)) {                 /* 2ch_mode 1: (A, D), (B, E) */
+            two_ch(b, bk, e, K_L, K_LS, 0);
+            two_ch(b, bk, e, K_R, K_RS, 0);
+        } else {
+            two_ch(b, bk, e, K_L, K_R, 0);
+            two_ch(b, bk, e, K_LS, K_RS, 0);
+        }
+    } else if (cc == 1) {
+        static const int K3[3] = { K_L, K_R, K_C };
+        n_ch(b, bk, e, 3, K3);
+        two_ch(b, bk, e, K_LS, K_RS, 0);
+    } else if (cc == 2) {
+        static const int K4[4] = { K_L, K_R, K_LS, K_RS };
+        n_ch(b, bk, e, 4, K4);
+    } else {
+        static const int K5[5] = { K_L, K_R, K_C, K_LS, K_RS };
+        n_ch(b, bk, e, 5, K5);
+    }
+    base[0] = l340 ? K_LS : K_L;
+    base[1] = l340 ? K_RS : K_R;
+    if (ac4_bit(b)) {                     /* b_use_sap_add_ch */
+        s0 = e->n_st;
+        for (i = 0; i < 2; i++)
+            chparam_info(b, bk, &e->fr[base[i]], new_st(b, e));
+    }
+    two_ch(b, bk, e, K_X1, K_X2, 0);      /* the additional channels */
+    if (cc == 0 || cc == 2)
+        mono_data(b, bk, 0, e, K_C);
+    if (s0 >= 0) {
+        for (i = 0; i < 2; i++) {
+            const ac4_framing *fb = &e->fr[base[i]];
+            const ac4_framing *fa = &e->fr[i ? K_X2 : K_X1];
+            int w;
+            if (fb->num_windows != fa->num_windows)
+                ac4_fail(b, AC4E_ADD_CH);
+            for (w = 0; w < fb->num_windows; w++)
+                if (fb->glen[fb->w2g[w]] != fa->glen[fa->w2g[w]])
+                    ac4_fail(b, AC4E_ADD_CH);
+            e->side[i].ka = base[i];
+            e->side[i].kb = i ? K_X2 : K_X1;
+            e->side[i].st = s0 + i;
+        }
+        e->n_side = 2;
+    }
+    if (e->mode == 1) {
+        set_blocks(e, 4, 0, 1, 1, 1, 2, 0);
+        e->blk_grp[3] = 3;
+        e->blk_two[3] = 1;
+    } else {
+        set_blocks(e, 0, 0, 0, 0, 0, 0, 0);
     }
     e->bits_end = b->p;
 }

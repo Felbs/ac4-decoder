@@ -4,7 +4,7 @@
  * The C port of `ac4dec` (ac4/cli.py): A-SPX rendered, output guard on,
  * as the Python CLI (see include/ac4dec.h).
  *
- *   ac4dec-c IN OUT.wav [--element auto|5_X|pair] [--channels 2|6]
+ *   ac4dec-c IN OUT.wav [--element auto|5_X|pair|mono|3_0|5_0|7_X] [--channels N]
  *            [--presentation N|id:N] [--language xx]
  *            [--seconds S] [--max-pass N] [--target-level L]
  *            [--drc auto|off|N] [--legacy-level] [--ref-peak X] [--no-guard]
@@ -49,8 +49,9 @@
 static void usage(void)
 {
     fprintf(stderr,
-            "usage: ac4dec-c IN OUT.wav [--element auto|5_X|pair] "
-            "[--channels 2|6]\n"
+            "usage: ac4dec-c IN OUT.wav "
+            "[--element auto|5_X|pair|mono|3_0|5_0|7_X]\n"
+            "                [--channels N]\n"
             "                [--presentation N|id:N] [--language xx]\n"
             "                [--seconds S] [--max-pass N] [--target-level L]\n"
             "                [--drc auto|off|N] [--legacy-level] [--ref-peak X] "
@@ -61,6 +62,8 @@ static void usage(void)
 }
 
 static const char *const KIND[4] = { "unknown", "mp4", "sync", "ts" };
+static const char *const EL_NAME[7] = { "auto", "5_X", "pair", "mono",
+                                        "3_0", "5_0", "7_X" };
 static const char *const CMODE[11] = {
     "Mono", "Stereo", "3.0", "5.0", "5.1", "7.0 (3/4/0)", "7.1 (3/4/0.1)",
     "7.0 (5/2/0)", "7.1 (5/2/0.1)", "7.0 (3/2/2)", "7.1 (3/2/2.1)"
@@ -393,7 +396,7 @@ int main(int argc, char **argv)
         }
     }
     if (!src || (!dst && !list)
-        || (channels != 0 && channels != 2 && channels != 6)) {
+        || channels < 0 || channels > AC4DEC_MAX_CHANNELS) {
         usage();
         return 2;
     }
@@ -401,6 +404,14 @@ int main(int argc, char **argv)
         element = AC4DEC_ELEMENT_5X;
     else if (!strcmp(el_arg, "pair"))
         element = AC4DEC_ELEMENT_PAIR;
+    else if (!strcmp(el_arg, "mono"))
+        element = AC4DEC_ELEMENT_MONO;
+    else if (!strcmp(el_arg, "3_0"))
+        element = AC4DEC_ELEMENT_3_0;
+    else if (!strcmp(el_arg, "5_0"))
+        element = AC4DEC_ELEMENT_5_0;
+    else if (!strcmp(el_arg, "7_X"))
+        element = AC4DEC_ELEMENT_7X;
     else if (strcmp(el_arg, "auto")) {
         usage();
         return 2;
@@ -490,6 +501,11 @@ int main(int argc, char **argv)
 
     t0 = now();
     cfg.element = element;
+    if (element == AC4DEC_ELEMENT_7X)
+        for (long f = 0; f < n_frames && f < 64 && !cfg.ch_mode; f++)
+            if (smp[f].len)
+                cfg.ch_mode = ac4dec_probe_ch_mode(&cfg, smp[f].p,
+                                                   smp[f].len);
     cfg.channels = channels;
     cfg.internal_rate = 1;          /* the level rule runs before resampling */
     cfg.lookahead = (int)lookahead;
@@ -502,7 +518,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "cannot open the decoder (bad --lookahead?)\n");
         return 1;
     }
-    n_ch = (element == AC4DEC_ELEMENT_PAIR) ? 2 : (channels ? channels : 6);
+    n_ch = ac4dec_channels(dec);
     k.n_ch = n_ch;
     k.internal = internal;
     k.quiet = quiet;
@@ -611,7 +627,7 @@ int main(int argc, char **argv)
                "element %s, %d ch, %.3f s -> %s  [%.2f s, %.2fx real time; "
                "A-SPX bursts %ld]\n",
                n_frames, stats.n_bad, stats.n_concealed, stats.n_seq_jumps,
-               element == AC4DEC_ELEMENT_PAIR ? "pair" : "5_X", n_ch,
+               EL_NAME[element], n_ch,
                (double)k.n_out / out_fs, dst, dt,
                dt > 0 ? ((double)k.n_out / out_fs) / dt : 0.0,
                stats.n_burst);
