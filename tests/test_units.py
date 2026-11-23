@@ -424,3 +424,34 @@ def test_noise_fill_is_applied_by_the_stream(monkeypatch):
         np.mean(L[off[0]:off[1]] ** 2)))
     assert np.allclose(L[off[1]:off[5]], seq[:n] * amp, rtol=1e-12)
     assert np.allclose(Rr[off[1]:off[5]], seq[n:] * amp, rtol=1e-12)
+
+
+# ---------------------------------------------------------------- A-SPX
+def _aspx_cfg():
+    from ac4 import aspx_render as R37
+    cfg = dict(start_freq=2, stop_freq=1, master_freq_scale=1, noise_sbg=1,
+               quant_mode_env=0, interpolation=0, preflat=0, limiter=1,
+               num_env_bits_fixfix=0, freq_res_mode=0)
+    t = R37.t_for(cfg)
+    assert t["n_hi"] >= 1 and t["num_sb_aspx"] >= 1
+    return cfg, t
+
+
+def test_aspx_frames_without_data_are_core_only():
+    """Frames with no A-SPX data (before the stream's first aspx_config)
+    come out of the QMF bank as their core, 577 samples late, with nothing
+    patched above the crossover. Before the fix every slot of the call was
+    HF-generated, so those frames played the copied low band unadjusted."""
+    from ac4 import aspx_render as R37
+    cfg, _t = _aspx_cfg()
+    rng = np.random.default_rng(1)
+    n = 8
+    x = {k: rng.standard_normal(n * 1536) for k in ("L", "R")}
+    out, applied = R37.apply_hf_pair(x["L"], x["R"], [None] * n, cfg)
+    assert applied == 0
+    for k in ("L", "R"):
+        y = out[k]
+        ref = np.concatenate([np.zeros(577), x[k]])[:len(y)]
+        err = y[1536:] - ref[1536:]
+        snr = 10 * np.log10(np.sum(ref[1536:] ** 2) / np.sum(err ** 2))
+        assert snr > 60, snr

@@ -12,12 +12,10 @@
  * aspx.borders rule), i.e. at most 10 slots into frame j + 1, so frame j
  * is adjusted and synthesised once core frame j + 1 has been analysed.
  *
- * One deliberate difference: the Python HF-generates (copies low subbands
- * up) every QMF slot of a pass that has an A-SPX configuration, including
- * the slots of frames from before the stream's first aspx_config, which
- * then play that copy unadjusted. Here a slot is HF-generated only when
- * the frame its envelope belongs to (frame floor((slot - 4) / 24)) has
- * A-SPX data or was concealed with a configuration known. */
+ * A slot is HF-generated only when the frame its envelope belongs to
+ * (frame floor((slot - 4) / 24)) has A-SPX data or was concealed with a
+ * configuration known: the slots of frames from before the stream's first
+ * aspx_config keep the core alone (the Python does the same). */
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>

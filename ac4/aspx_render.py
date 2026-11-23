@@ -126,7 +126,20 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None):
     Qh = {}
     for k, x in (("L", pcmL), ("R", pcmR)):
         xx = x[:(len(x) // Q.NSB) * Q.NSB]
-        Qh[k] = G.hf_generate(Q.analyse(xx, w, Q.analysis_matrix()), t)
+        Qa = Q.analyse(xx, w, Q.analysis_matrix())
+        Qh[k] = G.hf_generate(Qa, t)
+        # HF generation only on the QMF slots of frames that have A-SPX
+        # data (or are concealed, whose high band is muted below): slot ts
+        # carries frame (ts - TS_OFFSET) // 24. The others -- frames from
+        # before the stream's first aspx_config, and the TS_OFFSET slots
+        # before the first frame -- keep the analysed core and nothing
+        # above it; patched there, they would play the copied low band
+        # unadjusted (up to 0.88 of full scale was measured).
+        f = (np.arange(Qh[k].shape[1]) - TS_OFFSET) // 24
+        has = np.array([g is not None for g in groups] + [False], bool)
+        keep = ~has[np.where((f >= 0) & (f < len(groups)), f, len(groups))]
+        if keep.any():
+            Qh[k][:, keep] = Qa[:, keep]
 
     prev = {0: (None, 0), 1: (None, 0)}
     nprev = {0: None, 1: None}

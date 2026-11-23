@@ -21,15 +21,7 @@ output against the Python's; the per-frame status (concealed frames and
 their reasons) of both; and the 16-bit WAVs of both CLIs (same level
 rule): how many samples differ, and by how many LSB at most.
 
-ONE KNOWN DIFFERENCE, measured separately ("py-fixed"): the Python
-HF-generates every QMF slot of a pass that holds an A-SPX configuration,
-so the frames from before the stream's first aspx_config play the patched
-high band unadjusted (a Python bug); the C does not patch those slots.
-"py-fixed" is the Python with exactly that removed (a test-side wrapper
-around aspx_render.apply_hf_pair; the package is not changed), and the C
-must match it everywhere. Against the plain Python the difference is
-reported for the frames up to the first A-SPX frame + 1 ("pre") and for
-the rest ("post") separately.
+The reference is the plain Python package (no test-side changes).
 """
 from __future__ import annotations
 
@@ -46,8 +38,6 @@ REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, REPO)
 
 from ac4 import mp4                                   # noqa: E402
-from ac4 import aspx_hfgen                            # noqa: E402
-from ac4 import aspx_render                           # noqa: E402
 from ac4 import cli as PYCLI                          # noqa: E402
 from ac4.decoder import Decoder, REF_PEAK, probe_element  # noqa: E402
 from ac4.resample import StreamResampler              # noqa: E402
@@ -58,69 +48,23 @@ CHANS6 = ("L", "R", "C", "LFE", "Ls", "Rs")
 MAX_PASS = 1800
 FRAME = 1536
 
-_ORIG_APPLY = aspx_render.apply_hf_pair
-_ORIG_HFGEN = aspx_hfgen.hf_generate
-
-
-def _fixed_apply(pcmL, pcmR, groups, cfg, state0=None, state_log=None):
-    """apply_hf_pair with HF generation only on the QMF slots whose
-    envelope frame (floor((slot - 4) / 24)) has A-SPX data or is
-    concealed: what the C does."""
-    owner_ok = [g is not None for g in groups]
-
-    def hfgen(Qm, t):
-        out = _ORIG_HFGEN(Qm, t)
-        for ts in range(Qm.shape[1]):
-            f = (ts - aspx_render.TS_OFFSET) // 24
-            if f < 0 or f >= len(owner_ok) or not owner_ok[f]:
-                out[:, ts] = Qm[:, ts]
-        return out
-
-    aspx_hfgen.hf_generate = hfgen
-    try:
-        return _ORIG_APPLY(pcmL, pcmR, groups, cfg, state0, state_log)
-    finally:
-        aspx_hfgen.hf_generate = _ORIG_HFGEN
-
-
-def python_reference(path, fixed=False, max_pass=MAX_PASS):
+def python_reference(path, max_pass=MAX_PASS):
     """-> (float64 (n, ch) at 48 kHz, decoder scale; element; Decoder;
     per-frame status list)."""
     frames = mp4.read_frames(path)
     element = probe_element(frames)
-    if fixed:
-        if len(frames) > max_pass:
-            raise RuntimeError("py-fixed needs a one-pass decode")
-        aspx_render.apply_hf_pair = _fixed_apply
-    try:
-        dec = Decoder(element)
-        rs = StreamResampler()
-        out, status = [], []
-        for i in range(0, len(frames), max(8, max_pass)):
-            y = dec.decode_pass(frames[i:i + max_pass])
-            for s, c in zip(dec.last_status, dec.last_concealed):
-                status.append(s if s is not None else
-                              ("level" if c else None))
-            if len(y):
-                out.append(rs.push(y))
-    finally:
-        aspx_render.apply_hf_pair = _ORIG_APPLY
+    dec = Decoder(element)
+    rs = StreamResampler()
+    out, status = [], []
+    for i in range(0, len(frames), max(8, max_pass)):
+        y = dec.decode_pass(frames[i:i + max_pass])
+        for s, c in zip(dec.last_status, dec.last_concealed):
+            status.append(s if s is not None else
+                          ("level" if c else None))
+        if len(y):
+            out.append(rs.push(y))
     pcm = np.vstack(out) if out else np.zeros((0, len(dec.chans)))
     return pcm, element, dec, status
-
-
-def first_aspx_frame(path):
-    """Index of the first frame with A-SPX data (the first accepted frame
-    at or after the first aspx_config), or None."""
-    from ac4.stream import Ac4Stream
-    frames = mp4.read_frames(path)
-    el = probe_element(frames)
-    st = Ac4Stream("pair" if el == "pair" else "5_X")
-    _w, _l, groups, _c = st.decode_frames(frames, ("L", "R"))
-    for i, g in enumerate(groups["lr"]):
-        if g is not None and len(g):
-            return i
-    return None
 
 
 def read_wav16(path):
@@ -161,10 +105,6 @@ def compare(path, tag):
         return None
     ref, element, dec, py_status = python_reference(path)
     n_frames = len(py_status)
-    try:
-        fix, _e, _d, fix_status = python_reference(path, fixed=True)
-    except RuntimeError:
-        fix, fix_status = None, None
     got = np.fromfile(c_raw, "<f8").reshape(-1, ref.shape[1])
     c_status = read_status(c_st)
     fs = REF_PEAK[element] / 0.9
@@ -172,14 +112,9 @@ def compare(path, tag):
     py_wav = os.path.join(OUT, tag + ".py.wav")
     PYCLI.decode_file(path, py_wav, quiet=True)
     w_py, w_c = read_wav16(py_wav), read_wav16(c_wav)
-    fa = first_aspx_frame(path)
-    # the 48 kHz sample where frame fa + 1 ends (its output reaches the QMF
-    # synthesis delay into the next frame)
-    cut = 0 if fa is None else int(np.ceil((fa + 2) * FRAME * 1001 / 960))
     print(f"\n{tag}  ({os.path.basename(path)}, element {element}"
           f"{', ASPX_ACPL_3 core' if dec.acpl3 else ''}, {n_frames} frames, "
-          f"{len(ref)} samples; first A-SPX frame {fa}; "
-          f"lengths py {len(ref)} c {len(got)})")
+          f"{len(ref)} samples; lengths py {len(ref)} c {len(got)})")
     if got.shape != ref.shape:
         print("  LENGTH MISMATCH")
         return None
@@ -189,38 +124,19 @@ def compare(path, tag):
           f"c {len(c_bad)} {sorted(set(c_bad.values()))}  "
           f"{'same frames' if set(py_bad) == set(c_bad) else 'DIFFERENT FRAMES'}")
     rows = []
-    print(f"  {'ch':4s} {'peak (dec)':>11s} | {'vs py-fixed':>11s} "
-          f"{'SNR dB':>7s} | {'vs py: pre':>10s} {'post':>9s} {'SNR post':>8s}")
+    print(f"  {'ch':4s} {'peak (dec)':>11s} | {'max |C-py|':>11s} "
+          f"{'SNR dB':>7s}")
     for c, nm in enumerate(names):
         pk = float(np.abs(ref[:, c]).max()) if len(ref) else 0.0
-        if fix is not None:
-            _m, rf, sf = _row(nm, got[:, c], fix[:, c], fs)
-        else:
-            rf, sf = float("nan"), float("nan")
-        _m, rpre, _s = _row(nm, got[:, c], ref[:, c], fs, slice(0, cut))
-        _m, rpost, spost = _row(nm, got[:, c], ref[:, c], fs,
-                                slice(cut, None))
-        rows.append((tag, nm, pk, rf, rpre, rpost))
-        print(f"  {nm:4s} {pk:11.5g} | {rf:11.2e} {sf:7.1f} | {rpre:10.2e} "
-              f"{rpost:9.2e} {spost:8.1f}")
+        _m, rel, snr = _row(nm, got[:, c], ref[:, c], fs)
+        rows.append((tag, nm, pk, rel))
+        print(f"  {nm:4s} {pk:11.5g} | {rel:11.2e} {snr:7.1f}")
     if w_py.shape == w_c.shape:
         dif = np.abs(w_py.astype(int) - w_c.astype(int))
-        print(f"  16-bit WAVs vs py: {int((dif > 0).sum())} of {dif.size} "
+        print(f"  16-bit WAVs: {int((dif > 0).sum())} of {dif.size} "
               f"samples differ, max {int(dif.max()) if dif.size else 0} LSB")
     else:
         print(f"  16-bit WAVs: shapes differ {w_py.shape} {w_c.shape}")
-    if fix is not None:
-        fx_wav = os.path.join(OUT, tag + ".pyfixed.wav")
-        aspx_render.apply_hf_pair = _fixed_apply
-        try:
-            PYCLI.decode_file(path, fx_wav, quiet=True)
-        finally:
-            aspx_render.apply_hf_pair = _ORIG_APPLY
-        w_fx = read_wav16(fx_wav)
-        dif = np.abs(w_fx.astype(int) - w_c.astype(int))
-        print(f"  16-bit WAVs vs py-fixed: {int((dif > 0).sum())} of "
-              f"{dif.size} samples differ, max "
-              f"{int(dif.max()) if dif.size else 0} LSB")
     print(f"  ({time.time() - t0:.1f} s)")
     return rows
 
@@ -236,7 +152,7 @@ def main(argv):
         files = sorted(files)
     if not os.path.exists(C_CLI):
         sys.exit(f"build {C_CLI} first (make -C c)")
-    worst_fix = worst_post = 0.0
+    worst = 0.0
     seen = {}
     for p in files:
         base = os.path.splitext(os.path.basename(p))[0]
@@ -247,14 +163,12 @@ def main(argv):
             tag += f"_{seen[tag]}"
         rows = compare(p, tag)
         if rows is None:
-            worst_fix = worst_post = float("inf")
+            worst = float("inf")
             continue
-        worst_fix = max([worst_fix] + [r[3] for r in rows])
-        worst_post = max([worst_post] + [r[5] for r in rows])
-    ok = worst_fix < 1e-6 and worst_post < 1e-6
-    print(f"\nworst max |diff| relative to full scale: {worst_fix:.2e} against "
-          f"py-fixed, {worst_post:.2e} against the Python after its first "
-          f"A-SPX frame ({'PASS' if ok else 'FAIL'} against 1e-6)")
+        worst = max([worst] + [r[3] for r in rows])
+    ok = worst < 1e-6
+    print(f"\nworst max |C - Python| relative to full scale: {worst:.2e} "
+          f"({'PASS' if ok else 'FAIL'} against 1e-6)")
     return 0 if ok else 1
 
 
