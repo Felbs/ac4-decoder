@@ -59,7 +59,9 @@ HF_TAIL = 2                 # frames after a burst frame that also play core
 # The receiver's fixed output reference per element, in decoder units: the
 # level written at 0.9 of full scale. Hand-tuned; the decoder's true full
 # scale is NOT established. Used for the default burst limit and by the CLI.
-REF_PEAK = {"5_X": 9.0e5, "pair": 2.0e5}
+REF_PEAK = {"5_X": 9.0e5, "pair": 2.0e5, "mono": 2.0e5, "3_0": 9.0e5,
+            "5_0": 9.0e5, "7_X": 9.0e5}
+ELEMENTS = tuple(REF_PEAK)
 
 
 def core_for_bursts(hf_a, hf_b, core_a, core_b, lead, limit, owed,
@@ -135,7 +137,7 @@ class Decoder:
 
     def __init__(self, element="5_X", channels=None, burst_limit=None,
                  guard=True, presentation=None, language=None,
-                 target_level=None, drc="auto"):
+                 target_level=None, drc="auto", ch_mode=None):
         """The frame length follows the stream (TS 103 190-1 Table 83):
         `frame` is FRAME (1536) until the first frame whose rate the
         decoder takes (see Ac4Stream), then that frame_len_base; out_rate
@@ -145,32 +147,38 @@ class Decoder:
         (loudness.FULL_SCALE), normalised from dialnorm to this level and
         compressed by the stream's DRC mode for it (drc "auto"; "off"; or
         a mode ID) -- loudness.Leveler. None: decoder scale, untouched."""
-        if element not in ("5_X", "pair"):
-            raise ValueError(f"element {element!r}: '5_X' or 'pair'")
+        if element not in ELEMENTS:
+            raise ValueError(f"element {element!r}: one of {ELEMENTS}")
+        self.stream = Ac4Stream(element=element, presentation=presentation,
+                                language=language, ch_mode=ch_mode)
+        full = self.stream.CHANS
         if channels is None:
-            channels = 6 if element == "5_X" else 2
-        if channels not in (2, 6):
-            raise ValueError("channels must be 2 or 6")
-        if element == "pair":
-            channels = 2
+            channels = len(full)
+        if channels not in (2, len(full)) or (channels == 2
+                                               and "L" not in full):
+            raise ValueError(f"channels must be {len(full)}"
+                             + (" or 2" if "L" in full else ""))
         self.element = element
-        self.chans = Ac4Stream.CHANS if channels == 6 else ("L", "R")
+        self.chans = full if channels == len(full) else ("L", "R")
         self.burst_limit = (2.0 * REF_PEAK[element] if burst_limit is None
                             else float(burst_limit))
-        self.stream = Ac4Stream(element=element, presentation=presentation,
-                                language=language)
         self.fb_state = {k: None for k in self.chans}
-        self.lead_pcm = {k: np.zeros(0) for k in ("L", "R", "Ls", "Rs", "C")}
+        self.pairs = [(self.stream.PAIRS[g], gk) for g, gk in
+                      ((0, "lr"), (1, "sr"), (2, "c"), (3, "xr"))
+                      if g in self.stream.PAIRS]
+        self.lead_pcm = {k: np.zeros(0) for (ka, kb), _g in self.pairs
+                         for k in (ka, kb)}
         self.lead_core = {}
-        self.lead_groups = {"lr": [], "sr": [], "c": []}
+        self.lead_groups = {"lr": [], "sr": [], "c": [], "xr": []}
         # the last HF_DELAY core samples of every channel: the delay line
         # of the channels that do not go through the QMF bank
         self.core_tail = {k: np.zeros(HF_DELAY) for k in self.chans}
-        self.hf_state = {"lr": [None], "sr": [None], "c": [None]}
+        self.hf_state = {"lr": [None], "sr": [None], "c": [None],
+                         "xr": [None]}
         # the A-SPX tables in force before the lead-in of the next pass
         # (aspx_render.apply_hf_pair t_start)
-        self.t_hold = {"lr": None, "sr": None, "c": None}
-        self.hf_hot = {"lr": 0, "sr": 0, "c": 0}
+        self.t_hold = {"lr": None, "sr": None, "c": None, "xr": None}
+        self.hf_hot = {"lr": 0, "sr": 0, "c": 0, "xr": 0}
         self.n_burst = 0
         self.n_hf_fail = 0
         self.acpl3 = False
@@ -253,12 +261,15 @@ class Decoder:
         if self.element == "pair":
             return gkey == "lr" and mode[1] >= 1
         if gkey == "lr":
-            return True
+            return "L" in self.chans
         if gkey == "c" and not SC.CENTRE_ASPX:
             return False
         if gkey == "sr" and self.stream.acpl1:
             return False                # ASPX_ACPL_1 / _2: no Ls/Rs A-SPX
-        return not (self.acpl3 or self.stream.acpl3) and len(self.chans) == 6
+        if self.acpl3 or self.stream.acpl3:
+            return False
+        ka = dict((g, p) for p, g in self.pairs)[gkey][0]
+        return ka in self.chans and len(self.chans) > 2
 
     def decode_pass(self, frames):
         """-> float64 array (len(frames) * 1536, n_channels) at the internal
@@ -380,8 +391,7 @@ class Decoder:
         if up1:
             upmix = True
         ga = grp.get("acpl") or [None] * len(grp["lr"])
-        for (ka, kb), gkey in ((("L", "R"), "lr"), (("Ls", "Rs"), "sr"),
-                               (("C", "C"), "c")):
+        for (ka, kb), gkey in self.pairs:
             # the centre (aspx_data_1ch) goes through the pair renderer as
             # the same channel twice: with balance 0 each half is decoded
             # alone, so either half is the mono rendering
@@ -503,26 +513,49 @@ def probe_rate(frames, limit=64):
     return prev
 
 
-def probe_element(frames, limit=64, presentation=None, language=None):
-    """Guess the element from the channel_mode of the audio substream of
-    the presentation that would be decoded (toc.choose).
-    -> "5_X" for 5.1, "pair" for stereo, None if not recognised."""
+ELEMENT_OF_CH_MODE = {0: "mono", 1: "pair", 2: "3_0", 3: "5_0", 4: "5_X",
+                      5: "7_X", 6: "7_X", 7: "7_X", 8: "7_X", 9: "7_X",
+                      10: "7_X"}
+
+
+# A presentation_version 2 presentation whose channel-coded substream
+# signals a 7.x channel mode (the public kit's "IMS" streams): its
+# substream is a channel_pair_element (every frame of both kit streams
+# closes on audio_size so, none as a 7_X_channel_element); the rendering
+# to the signalled layout is not in TS 103 190-1/-2 V1.3.1, so its stereo
+# core is decoded (README, Interpretations)
+IMS_CH_MODES = (5, 6, 7, 8, 9, 10)
+IMS_STEREO = 1
+
+
+def probe_ch_mode(frames, limit=64, presentation=None, language=None):
+    """The channel_mode (Table 88 ch_mode) of the audio substream of the
+    presentation that would be decoded (toc.choose), or None."""
     from . import toc as M
     for f in frames[:limit]:
         try:
             st = M.parse(f)
         except Exception:                                      # noqa: BLE001
             continue
-        sel = M.audio_substream(st, M.choose(st, presentation, language))
+        pi = M.choose(st, presentation, language)
+        sel = M.audio_substream(st, pi)
         if sel is None:
             continue
         cm = sel["channel_mode"]
-        if cm == 1:
-            return "pair"
-        if cm == 4:
-            return "5_X"
-        return None
+        if (pi is not None and cm in IMS_CH_MODES
+                and st["presentations"][pi].get("version") == 2):
+            return IMS_STEREO
+        return cm
     return None
+
+
+def probe_element(frames, limit=64, presentation=None, language=None):
+    """Guess the element from the channel_mode of the audio substream of
+    the presentation that would be decoded (toc.choose).
+    -> "mono", "pair", "3_0", "5_0", "5_X" (5.1), "7_X", or None if not
+    recognised."""
+    return ELEMENT_OF_CH_MODE.get(probe_ch_mode(frames, limit, presentation,
+                                                language))
 
 
 def decode(frames, element=None, channels=None, max_pass=1800,
@@ -541,8 +574,11 @@ def decode(frames, element=None, channels=None, max_pass=1800,
     if element is None:
         raise ValueError("cannot tell the element from the stream; pass "
                          "element='5_X' or 'pair'")
+    ch_mode = (probe_ch_mode(frames, presentation=presentation,
+                             language=language) if element == "7_X" else None)
     dec = Decoder(element, channels, presentation=presentation,
-                  language=language, target_level=target_level, drc=drc)
+                  language=language, target_level=target_level, drc=drc,
+                  ch_mode=ch_mode)
     rs = StreamResampler(up, down)
     out = []
     for i in range(0, len(frames), max(1, max_pass)):

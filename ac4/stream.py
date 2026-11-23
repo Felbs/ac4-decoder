@@ -35,6 +35,7 @@ from . import robust as RB                                          # noqa: E402
 from . import acpl_parse as AP                                      # noqa: E402
 from . import rates as RT                                           # noqa: E402
 from . import multichannel as MC                                    # noqa: E402
+from . import elements as EL                                        # noqa: E402
 
 # Marks a CONCEALED frame in the A-SPX group lists (where None means "no
 # A-SPX data for this frame"). The renderer mutes the high band for it and
@@ -48,10 +49,17 @@ CENTRE_ASPX = True
 
 
 class Ac4Stream:
-    def __init__(self, element="5_X", presentation=None, language=None):
+    def __init__(self, element="5_X", presentation=None, language=None,
+                 ch_mode=None):
         # "5_X" = the 5.1 programme element. "pair" = the stereo
-        # channel_pair_element (Table 22).
+        # channel_pair_element (Table 22). "mono", "3_0", "5_0" (5_X
+        # without LFE) and "7_X" (ch_mode 5 - 10 of Table 88): elements.py
         self.element = element
+        if element == "7_X" and ch_mode is None:
+            ch_mode = 6
+        self.ch_mode = ch_mode
+        self.CHANS = EL.channels_of(element, ch_mode)
+        self.PAIRS = EL.aspx_pairs(element, ch_mode)
         # presentation choice (toc.choose): None = the first enabled,
         # decodable one (preferring `language`, then complete main); an int
         # = by position in the TOC; "id:N" = by presentation_id
@@ -145,6 +153,7 @@ class Ac4Stream:
         chans = tuple(chans) if chans else self.CHANS
         if self.element == "pair":
             chans = ("L", "R")           # a pair element HAS only a pair
+        chans = tuple(k for k in chans if k in self.CHANS)
         wins = {k: [] for k in chans}
         lengths = {k: [] for k in chans}
         counts = {k: [] for k in chans}   # windows per FRAME, per channel --
@@ -152,7 +161,7 @@ class Ac4Stream:
         # window lists do not align positionally when framings diverge
         # "acpl": per frame the A-CPL parameters of an ASPX_ACPL_3 frame
         # (acpl.render's frame dict), None without, CONCEALED
-        groups = {"lr": [], "sr": [], "c": [], "acpl": []}
+        groups = {"lr": [], "sr": [], "c": [], "xr": [], "acpl": []}
         self.status = []
         self.seq_break = []
         self.meta = []
@@ -256,11 +265,7 @@ class Ac4Stream:
                 why = RT.unsupported(st, sel) if on else None
                 if why:
                     raise RB.Damaged("toc.unsupported_rate", why)
-                if self.element == "pair":
-                    from . import pair as PAIR
-                    r = PAIR.decode_pair(sub, self.Tf, b_iframe=ifr)
-                else:
-                    r = C.decode_element(sub, self.Tf, b_iframe=ifr)
+                r = self._element(sub, ifr)
                 if r["bits"] > r["nbits"]:
                     raise RB.Damaged("element.parse",
                                      "element overran its substream")
@@ -283,7 +288,7 @@ class Ac4Stream:
                 # A-SPX: Table 25 / Table 22 put the A-SPX blocks right after
                 # the channel data; parse them all (the 5_X element: L/R,
                 # Ls/Rs and the centre) so the frame closes on audio_size
-                aspx_lr = aspx_sr = aspx_c = None
+                aspx_lr = aspx_sr = aspx_c = aspx_x = None
                 got_acpl = None
                 end = r["bits"]
                 acpl3 = bool(r.get("acpl3"))
@@ -308,8 +313,8 @@ class Ac4Stream:
                                 if not isinstance(e, RB.Damaged) else e
                         # (checks off: a later block mis-parsing does not
                         # cost an earlier one, as before)
-                    aspx_lr, aspx_sr, aspx_c = (got.get(0), got.get(1),
-                                                got.get(2))
+                    aspx_lr, aspx_sr, aspx_c, aspx_x = (
+                        got.get(0), got.get(1), got.get(2), got.get(3))
                     end = b.p
                     # ASPX_ACPL_3: acpl_data_2ch() closes the frame;
                     # ASPX_ACPL_1 / _2: one acpl_data_1ch() per module
@@ -366,9 +371,8 @@ class Ac4Stream:
                 # each channel's OWN framing: with b_enable_mdct_stereo_proc
                 # = 0 the two channels of a pair carry separate sf_info and
                 # can differ (with it on, both are the shared one)
-                fm = {"L": r["L"]["framing"]}
-                if r.get("R") is not None:
-                    fm["R"] = r["R"]["framing"]
+                fm = {k: r[k]["framing"] for k in ("L", "R")
+                      if isinstance(r.get(k), dict)}
                 # channels the element does not code (ASPX_ACPL_2: R of a
                 # pair, Ls / Rs of a 5_X element; 5.3.4.1, Table 181): one
                 # silent long block each
@@ -397,15 +401,9 @@ class Ac4Stream:
                     for k in list(wins):
                         if k not in chans:
                             wins.pop(k); lengths.pop(k); counts.pop(k)
-                elif acpl1 == "5_X":
-                    fm.update({k: r[k]["framing"]
-                               for k in ("C", "lfe", "Ls", "Rs")
-                               if r.get(k) is not None})
-                elif self.element != "pair":
-                    fm.update({"Ls": r["Ls"]["framing"],
-                               "Rs": r["Rs"]["framing"],
-                               "C": r["C"]["framing"],
-                               "lfe": r["lfe"]["framing"]})
+                else:
+                    fm.update({k: r[k]["framing"] for k in self.CHANS
+                               if isinstance(r.get(k), dict)})
                 order = R.BITSTREAM_ORDER["pair" if self.element == "pair"
                                           else ("acpl3" if acpl3
                                                 else ("acpl12" if acpl1
@@ -454,7 +452,7 @@ class Ac4Stream:
                         # first configuration: the late check parses the
                         # frames from before it with them
                         self.xover0 = {g: dict.get(self.fstate, ("xover", g),
-                                                   0) for g in range(3)}
+                                                   0) for g in range(4)}
                     self.cfg = r["aspx"]
                 if r.get("acpl"):
                     self.acpl_cfg = r["acpl"]
@@ -496,7 +494,11 @@ class Ac4Stream:
                     # the "m" track's aspx_data_1ch, rendered as the
                     # centre is (the same channel twice)
                     got_lr = [aspx_lr[0], aspx_lr[0]]
-                got_sr = aspx_sr if "Ls" in pk else None
+                # the pairs of the A-SPX blocks (Table 213): groups 1 and
+                # 3 by the element's layout
+                got_sr = (aspx_sr if self.PAIRS[1][0] in pk else None)
+                got_x = (aspx_x if 3 in self.PAIRS
+                         and self.PAIRS[3][0] in pk else None)
                 # the centre's aspx_data_1ch, as a "pair" of the same
                 # channel twice (decoder.py renders it with the pair
                 # renderer; with balance 0 each half decodes alone)
@@ -512,8 +514,10 @@ class Ac4Stream:
                     flag = (lambda i: on[0] if sync else
                             (on[i] if i < len(on) else 0))
                     lr_idx = (0, 0) if acpl1 == "pair" else (0, 1)
-                    for grp, idx in ((got_lr, lr_idx), (got_sr, (3, 4)),
-                                     (got_c, (2, 2))):
+                    cidx = r.get("compand_idx") or {}
+                    for grp, idx in ((got_lr, cidx.get(0, lr_idx)),
+                                     (got_sr, (3, 4)),
+                                     (got_c, cidx.get(2, (2, 2)))):
                         if isinstance(grp, list):
                             for ch, i in zip(grp, idx):
                                 ch["compand"] = dict(on=flag(i), avg=avg,
@@ -543,7 +547,7 @@ class Ac4Stream:
                     early.append((fi, wpos))
                 u = {k: [np.zeros(fl)] for k in chans}
                 seq_l = {k: [fl] for k in chans}
-                got_lr = got_sr = got_c = got_acpl = CONCEALED
+                got_lr = got_sr = got_c = got_x = got_acpl = CONCEALED
                 self.meta.append(None)
                 self.n_bad += 1
                 self.damage.add(reason)
@@ -570,6 +574,7 @@ class Ac4Stream:
             groups["lr"].append(got_lr)
             groups["sr"].append(got_sr)
             groups["c"].append(got_c)
+            groups["xr"].append(got_x)
             groups["acpl"].append(got_acpl)
         if early and self.frame_len not in (None, RT.DEFAULT_FRAME):
             # frames concealed before the rate was learnt in this pass take
@@ -584,6 +589,22 @@ class Ac4Stream:
         if pending and self.cfg and RB.CHECKS:
             self._late_closure(pending, wins, lengths, counts, groups)
         return wins, lengths, groups, counts
+
+    def _element(self, sub, ifr):
+        """The audio substream's channel element (Table 19)."""
+        el = self.element
+        if el == "pair":
+            from . import pair as PAIR
+            return PAIR.decode_pair(sub, self.Tf, b_iframe=ifr)
+        if el == "mono":
+            return EL.single_channel_element(sub, self.Tf, b_iframe=ifr)
+        if el == "3_0":
+            return EL.three_0_channel_element(sub, self.Tf, b_iframe=ifr)
+        if el == "7_X":
+            return EL.seven_x_channel_element(sub, self.Tf, self.ch_mode,
+                                              b_iframe=ifr)
+        return C.decode_element(sub, self.Tf, b_iframe=ifr,
+                                has_lfe=el != "5_0")
 
     def _pres_metadata(self, f, st, pi, sel):
         """dialnorm and the DRC frame of the presentation substream of
@@ -681,7 +702,7 @@ class Ac4Stream:
                 wins[k][p0:p0 + c] = [np.zeros(fl)]
                 lengths[k][p0:p0 + c] = [fl]
                 counts[k][fi] = 1
-            for key in ("lr", "sr", "c", "acpl"):
+            for key in ("lr", "sr", "c", "xr", "acpl"):
                 if key in groups:
                     groups[key][fi] = CONCEALED
             self.status[fi] = "audio_size.late"

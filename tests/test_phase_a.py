@@ -157,7 +157,7 @@ def presentation(w, groups, pres_sub, md_compat=0, pres_id=None,
 
 
 def group(w, ch_mode_code, index, ndot=1, cc=None, lang=None, fs=1, frf=1,
-          sf_mult=None):
+          sf_mult=None, add_ch_base=None):
     """ac4_substream_group_info with one channel-coded substream."""
     w.u(1, 1).u(1, 0).u(1, 1)                # present, no hsf, single
     w.u(1, 1)                                # b_channel_coded
@@ -168,6 +168,8 @@ def group(w, ch_mode_code, index, ndot=1, cc=None, lang=None, fs=1, frf=1,
         else:
             w.u(1, 1).u(1, sf_mult)
     w.u(1, 0)                                # b_bitrate_info
+    if add_ch_base is not None:              # 7.x 5/2/0 and 3/2/2
+        w.u(1, add_ch_base)
     for _ in range(frf):
         w.u(1, ndot)                         # b_audio_ndot
     w.u(2, index)

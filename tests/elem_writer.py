@@ -113,6 +113,9 @@ def element(body_bits):
 
 def frame(sub, seq=5, ch_mode_code="1110", fri=3, iframe=1):
     t = dict(pres=[dict(groups=[0], pres_sub=0)],
-             groups=[dict(ch_mode_code=ch_mode_code, index=1, ndot=iframe)],
+             groups=[dict(ch_mode_code=ch_mode_code, index=1, ndot=iframe,
+                          add_ch_base=(0 if ch_mode_code in (
+                              "1111010", "1111011", "1111100", "1111101")
+                              else None))],
              sizes=[2, len(sub)])
     return build_toc(**t, seq=seq, fri=fri, iframe=iframe) + bytes(2) + sub

@@ -26,7 +26,8 @@ DAMAGED INPUT. Frames that break a rule of the bitstream are concealed
 
 OUT is 16-bit PCM at 48 kHz (44,1 kHz for a 44,1 kHz stream), every
 frame rate of TS 103 190-1 Table 83 resampled as the table says: 6 channels in WAV 5.1 order (L R C LFE Ls Rs)
-for a 5.1 element, 2 for stereo.
+for a 5.1 element, 2 for stereo, 1 for mono, L R C for 3.0, L R C Ls Rs for 5.0,
+and L R C LFE Ls Rs plus the layout's pair (Lb Rb, Lw Rw or Tfl Tfr) for 7.x.
 
 OUTPUT LEVEL. Loudness normalisation (TS 103 190-1 5.7.9): the stream's
 reference level (dialnorm) is brought to --target-level (default -24 dB,
@@ -167,9 +168,17 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
             return 1
     t0 = time.time()
     legacy = bool(ref_peak)
-    dec = Decoder(element, channels, guard=guard,
-                  presentation=presentation, language=language,
-                  target_level=None if legacy else target_level, drc=drc)
+    from .decoder import probe_ch_mode
+    ch_mode = (probe_ch_mode(frames, presentation=presentation,
+                             language=language) if element == "7_X" else None)
+    try:
+        dec = Decoder(element, channels, guard=guard,
+                      presentation=presentation, language=language,
+                      target_level=None if legacy else target_level, drc=drc,
+                      ch_mode=ch_mode)
+    except ValueError as e:
+        say(str(e))
+        return 1
     lvl = LevelPolicy(element, ref_peak) if legacy else None
     n_clip = 0
     rs = StreamResampler(*RT.ratio(*rate))
@@ -232,9 +241,12 @@ def main(argv=None):
     ap.add_argument("--language", default=None,
                     help="preferred language (BCP 47, e.g. fr) for the "
                          "automatic choice")
-    ap.add_argument("--element", default="auto", choices=("auto", "5_X", "pair"))
-    ap.add_argument("--channels", type=int, choices=(2, 6), default=None,
-                    help="default: 6 for a 5.1 element, 2 for stereo")
+    ap.add_argument("--element", default="auto",
+                    choices=("auto", "5_X", "pair", "mono", "3_0", "5_0",
+                             "7_X"))
+    ap.add_argument("--channels", type=int, default=None,
+                    help="default: all of the element's channels (6 for "
+                    "5.1, 8 for 7.1, ...); 2: L, R only")
     ap.add_argument("--seconds", type=float, default=None,
                     help="decode only the first S seconds")
     ap.add_argument("--max-pass", type=int, default=1800,
