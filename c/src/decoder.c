@@ -1338,15 +1338,16 @@ static int guard_one(ac4dec *d, outf_t *o)
     for (c = 0; c < d->n_ch; c++)
         g->last[c] = o->pcm[c][FRAME - 1];
     g->has_last = 1;
-    /* history of forced (or muted by this guard) flags for the frames
-       after this one: every channel is 577 samples late, so a damaged
-       frame's core still reaches into the second output frame after it */
+    /* history of forced flags (and of frames muted by the plain rule, not
+       by the near rule, so it cannot chain) for the frames after this one:
+       every channel is 577 samples late, so a damaged frame's core still
+       reaches into the second output frame after it */
     if (g->n_hist < G_NEAR) {
-        g->forced_hist[g->n_hist++] = o->forced || loud;
+        g->forced_hist[g->n_hist++] = o->forced || (loud && !near);
     } else {
         memmove(g->forced_hist, g->forced_hist + 1,
                 sizeof(int) * (G_NEAR - 1));
-        g->forced_hist[G_NEAR - 1] = o->forced || loud;
+        g->forced_hist[G_NEAR - 1] = o->forced || (loud && !near);
     }
     return loud;
 }

@@ -417,16 +417,18 @@ class OutputGuard:
             seed = float(w[min(self.KTH, len(w)) - 1]) if len(w) else 0.0
             self.ref = max(seed, self.floor)
         ramp_in = np.linspace(0.0, 1.0, self.RAMP, endpoint=False)[:, None]
+        spark = np.zeros(n, dtype=bool)  # muted by the plain (not near) rule
         for f in range(n):
             seg = y[f * F:(f + 1) * F]
             ref = self.level()
             self.init *= self.INIT_RELEASE
             # near damage: a frame concealed upstream within NEAR frames, or
-            # a frame this guard muted in the NEAR before it (every channel
+            # a frame this guard muted by the plain rule (not by this near
+            # rule, so it cannot chain) in the NEAR before it (every channel
             # is 577 samples late, so a damaged frame's core still reaches
             # into the second output frame after it)
             near = bool(forced[max(0, f - self.NEAR):f + self.NEAR + 1].any()
-                        or fired[max(0, f - self.NEAR):f].any())
+                        or spark[max(0, f - self.NEAR):f].any())
             if near:
                 loud = pk[f] > self.NEAR_RATIO * max(self.ref, self.floor)
             else:
@@ -437,6 +439,7 @@ class OutputGuard:
                 self.n_sustained += 1
             if loud:
                 fired[f] = True
+                spark[f] = not near
                 self.n_fired += 1
                 seg[:] = 0.0
                 if not self.muted and self.last is not None:
