@@ -15,9 +15,9 @@ Syntax (TS 103 190-1 Table 22, channel_pair_element):
     SIMPLE: stereo_data()
     ASPX:   companding_control(2); stereo_data(); aspx_data_2ch()
 
-`stereo_data` (Table 23) has the same shape as the 5_X pair block m28
-already decodes (4.2.6.7 two_channel_data): one b_enable_mdct_stereo_proc
-bit, then shared-or-separate framing + two sf_data. Reused, not rewritten.
+`stereo_data` (Table 23) is the 5_X pair block (4.2.6.7 two_channel_data)
+plus one spec_frontend bit before each channel's sf_info when MDCT stereo
+processing is off (channels.stereo_data).
 The trailing aspx_data_2ch is the caller's to parse (m42 does it at
 r["bits"], exactly as for 5_X).
 """
@@ -30,7 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 from .toc import Bits                                     # noqa: E402
 from .channels import (aspx_config, audio_size,                # noqa: E402
-                       companding_control, two_channel_data)
+                       companding_control, stereo_data)
 
 
 def decode_pair(sub, T, b_iframe=False):
@@ -47,7 +47,7 @@ def decode_pair(sub, T, b_iframe=False):
         aspx = aspx_config(b)
     if mode == 1:
         companding_control(b, 2)
-    l, r, st = two_channel_data(b, T)
+    l, r, st = stereo_data(b, T)                     # Table 23
     return dict(L=l, R=r, st_lr=st, aspx=aspx, codec_mode=mode,
                 bits=b.p, nbits=len(sub) * 8,
                 audio_size=asz, audio_start=a0, mode=("pair", mode))

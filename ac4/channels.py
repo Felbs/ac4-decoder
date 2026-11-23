@@ -630,6 +630,31 @@ def two_channel_data(b, T):
                                     framing=frs[0])
 
 
+def stereo_data(b, T):
+    """Clause 4.2.6.4, Table 23 -- the pair of a channel_pair_element (and
+    of the ASPX_ACPL_3 core). The same as two_channel_data (Table 26)
+    except that, without MDCT stereo processing, each channel's sf_info is
+    preceded by its own spec_frontend bit (0 = ASF, 1 = SSF). Reading this
+    block as two_channel_data dropped those two bits: every such frame
+    misparsed from the first channel's b_long_frame on."""
+    if b.u(1):                                      # b_enable_mdct_stereo_proc
+        fr = Framing(b)
+        sap, ms_used, sap_d = chparam_info(b, fr, T["sf"])
+        frs = [fr, fr]
+    else:
+        sap, ms_used, sap_d = None, None, None
+        frs = []
+        for _ in range(2):
+            if b.u(1) != 0:                         # spec_frontend_l / _r
+                raise ValueError("SSF (speech frontend) not implemented")
+            frs.append(Framing(b))
+    chans = [sf_data(b, frs[i], T) for i in range(2)]
+    return chans[0], chans[1], dict(sap_mode=sap, ms_used=ms_used,
+                                    sap=sap_d,
+                                    max_sfb=frs[0].max_sfb_g(0),
+                                    framing=frs[0])
+
+
 def mono_data(b, T, b_lfe):
     """Clause 4.2.6.2."""
     if b_lfe:
@@ -722,7 +747,7 @@ def _acpl3_core(b, T, b_iframe, sub):
         acpl = acpl_config_2ch(b)                    # Table 60, four bits
     lfe = mono_data(b, T, b_lfe=True)                # b_has_lfe (5.1)
     companding_control(b, 2)
-    l, r, st_lr = two_channel_data(b, T)             # stereo_data(), Table 23
+    l, r, st_lr = stereo_data(b, T)                  # Table 23
     return dict(lfe=lfe, L=l, R=r, st_lr=st_lr, aspx=aspx, acpl3=True,
                 acpl=acpl, acpl_cfg=acpl, codec_mode=4,
                 bits=b.p, nbits=len(sub) * 8, coding_config=None)
