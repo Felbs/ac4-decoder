@@ -15,8 +15,12 @@ README's PROVENANCE section):
 
 `StreamResampler` (resample.py) then takes the internal rate to 48 kHz.
 
-What it does NOT do: A-CPL upmix (an ASPX_ACPL_3 5.1 stream gives
-L/R; the other four channels are silent), A-SPX on the centre channel,
+ASPX_ACPL_3 (a 5.1 programme sent as a two-channel core plus A-CPL): the
+A-CPL upmix (acpl.py) runs on the core pair's A-SPX output in the QMF
+domain and gives L, R, C, Ls, Rs; the LFE is decoded from its own
+mono_data. With channels=2 such a stream gives its stereo core.
+
+What it does NOT do: A-SPX on the centre channel,
 companding, DRC / dialogue / loudness metadata,
 presentation or substream choice (substream 1 is always decoded), frame
 rates other than 29.97 and sample rates other than 48 kHz.
@@ -55,14 +59,15 @@ REF_PEAK = {"5_X": 9.0e5, "pair": 2.0e5}
 
 
 def core_for_bursts(hf_a, hf_b, core_a, core_b, lead, limit, owed,
-                    hf_ratio=None, flagged=None, hf_floor=0.0):
+                    hf_ratio=None, flagged=None, hf_floor=0.0, bad_out=None):
     """One pair's A-SPX output with the core put back wherever A-SPX ran
     away. -> (a, b, frames replaced, frames still owed to the next pass).
 
     hf_ratio (damaged-input check, robust.py): a frame whose A-SPX output
     RMS is above hf_ratio x the RMS of the core it was made from is also
     replaced, unless its A-SPX peak is below hf_floor; `flagged` (a bool
-    array of n frames) receives those frames."""
+    array of n frames) receives those frames; `bad_out` (a bool array)
+    every frame replaced."""
     n = min(len(hf_a), len(hf_b)) // FRAME
     if not n:
         return hf_a, hf_b, 0, owed
@@ -89,6 +94,8 @@ def core_for_bursts(hf_a, hf_b, core_a, core_b, lead, limit, owed,
             bad[f], left = True, HF_TAIL
         elif left:
             bad[f], left = True, left - 1
+    if bad_out is not None:
+        bad_out[:n] |= bad
     if not bad.any():
         return hf_a, hf_b, 0, 0
     out = []
@@ -147,6 +154,10 @@ class Decoder:
         self.n_burst = 0
         self.n_hf_fail = 0
         self.acpl3 = False
+        # A-CPL (ASPX_ACPL_3): the lead-in groups and the logged state, as
+        # for the A-SPX pairs
+        self.lead_acpl = []
+        self.acpl_state = [None]
         self.log = []               # human-readable notes, in order
         # damaged input (robust.py): frames concealed, by reason
         self.guard = RB.OutputGuard(REF_PEAK[element], FRAME) if guard \
@@ -255,12 +266,14 @@ class Decoder:
         pcm, self.fb_state = FB.synthesise_frames(
             wins, lens, cnts, FRAME, states=self.fb_state, return_state=True)
         if len(pcm) < len(chans):
-            # ASPX_ACPL_3: a two-channel core plus A-CPL (upmix not built)
+            # ASPX_ACPL_3: a two-channel core (and the LFE) plus A-CPL;
+            # C / Ls / Rs come from the upmix below
             if not self.acpl3:
                 self.acpl3 = True
                 self.log.append(
-                    "stream is ASPX_ACPL_3 (2-ch core + A-CPL): rendering L/R; "
-                    f"{[k for k in chans if k not in pcm]} written silent")
+                    "stream is ASPX_ACPL_3 (2-ch core + A-CPL): "
+                    f"{[k for k in chans if k not in pcm]} from the A-CPL "
+                    "upmix")
             n_ref = len(next(iter(pcm.values())))
             for k in chans:
                 if k not in pcm:
@@ -280,6 +293,10 @@ class Decoder:
         # so all of them are time-aligned.
         core = dict(pcm)
         via_qmf = set()
+        # the A-CPL upmix: an ASPX_ACPL_3 stream decoded to 5.1
+        upmix = ((self.acpl3 or dec.acpl3) and "C" in chans
+                 and self.element == "5_X")
+        ga = grp.get("acpl") or [None] * len(grp["lr"])
         for (ka, kb), gkey in ((("L", "R"), "lr"), (("Ls", "Rs"), "sr")):
             if ka not in chans:
                 continue
@@ -291,11 +308,20 @@ class Decoder:
                 gg = self.lead_groups[gkey][-LEAD:] + gl
                 n_lead = len(gg) - len(gl)
                 hs, slog = self.hf_state[gkey], []
+                up = upmix and gkey == "lr"
+                if up:
+                    gacpl = self.lead_acpl[-LEAD:] + ga
+                    acs, alog = self.acpl_state, []
                 try:
                     hf, _n = R37.apply_hf_pair(
                         pa, pb, gg, dec.cfg,
                         state0=hs[max(0, len(hs) - 1 - n_lead)],
-                        state_log=slog)
+                        state_log=slog,
+                        acpl_groups=gacpl if up else None,
+                        acpl_state0=(acs[max(0, len(acs) - 1 - n_lead)]
+                                     if up else None),
+                        acpl_log=alog if up else None)
+                    bad = np.zeros(len(gl) + 1, dtype=bool)
                     pcm[ka], pcm[kb], nb_, self.hf_hot[gkey] = \
                         core_for_bursts(hf["L"][lead:], hf["R"][lead:],
                                         pa, pb, lead, self.burst_limit,
@@ -304,8 +330,26 @@ class Decoder:
                                                   if RB.CHECKS
                                                   else None),
                                         flagged=self._aspx_flag,
-                                        hf_floor=self.hf_floor)
+                                        hf_floor=self.hf_floor,
+                                        bad_out=bad)
                     via_qmf |= {ka, kb}
+                    if up:
+                        # the five channels of the upmix; a frame whose
+                        # A-SPX output the checks above replaced by its
+                        # core plays the core (the stereo downmix) on
+                        # L / R and nothing on C / Ls / Rs
+                        n = len(pcm[ka])
+                        for k in ("L", "R", "C", "Ls", "Rs"):
+                            v = hf["up"][k][lead:lead + n]
+                            if k in (ka, kb):
+                                v = np.where(np.repeat(bad, FRAME)[:n],
+                                             pcm[k], v)
+                            else:
+                                v = np.where(np.repeat(bad, FRAME)[:n],
+                                             0.0, v)
+                            pcm[k] = v
+                        via_qmf |= {"C", "Ls", "Rs"}
+                        self.acpl_state = alog[-(LEAD + 1):]
                     if nb_:
                         self.n_burst += nb_
                         self.log.append(
@@ -315,6 +359,8 @@ class Decoder:
                 except Exception as e:                         # noqa: BLE001
                     self.hf_state[gkey] = (
                         hs + [hs[-1]] * len(gl))[-(LEAD + 1):]
+                    if up:
+                        self.acpl_state = [None]
                     self.n_hf_fail += 1
                     self.log.append(
                         f"A-SPX pass failed ({type(e).__name__}: "
@@ -328,6 +374,8 @@ class Decoder:
                     self.hf_state[gkey] + [self.hf_state[gkey][-1]]
                     * len(gl))[-(LEAD + 1):]
             self.lead_groups[gkey] = (self.lead_groups[gkey] + gl)[-LEAD:]
+            if gkey == "lr":
+                self.lead_acpl = (self.lead_acpl + ga)[-LEAD:]
         for k in chans:
             x = np.concatenate([self.core_tail[k], core[k]])
             if k not in via_qmf:

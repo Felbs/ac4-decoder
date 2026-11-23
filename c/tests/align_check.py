@@ -3,9 +3,10 @@
 
     python3 c/tests/align_check.py [CAPTURE.m4s ...]
 
-Captures: arguments, or the 5_X captures under AC4_TEST_DIR whose L/R
-pair goes through the A-SPX path (ASPX_ACPL_3 streams, whose other
-channels are silent, are skipped). Each is decoded by the Python
+Captures: arguments, or the 5_X captures under AC4_TEST_DIR (codec mode 1,
+and ASPX_ACPL_3, whose L, R, C, Ls and Rs all come from the A-CPL upmix
+in the QMF domain and whose LFE goes through the delay line; there the
+measure runs from the first I-frame, before which only the core plays). Each is decoded by the Python
 (Decoder, one pass) and the C (libac4dec.so through ctypes), both at the
 internal rate; the lag of L, R, Ls, Rs and LFE against the centre is
 measured by cross-correlation (where the channels share programme: the
@@ -52,9 +53,16 @@ def check(path):
         return None
     d = Decoder("5_X")
     yp = d.decode_pass(frames)
-    if d.acpl3:
-        return None
     yc, _c, _w = RC.c_decode(frames, "5_X", lookahead=0)
+    s0 = 0
+    if d.acpl3:
+        from ac4 import toc as M
+        ifr = [i for i, f in enumerate(frames)
+               if M.parse(f).get("b_iframe_global")]
+        if not ifr:
+            return None
+        s0 = ifr[0] * 1536 + 577 + 4 * 64
+        yp, yc = yp[s0:], yc[s0:]
     ok = True
     for nm, y in (("py", yp), ("c", yc)):
         row = []
@@ -63,7 +71,8 @@ def check(path):
             row.append(f"{NAMES[k]} {lg:+d} ({r:.2f})")
             if k in (0, 1) and (r <= 0.3 or abs(lg) > 2):
                 ok = False
-        print(f"{os.path.basename(path)} {nm}: lag against C: "
+        print(f"{os.path.basename(path)} {nm}"
+              f"{' (A-CPL)' if d.acpl3 else ''}: lag against C: "
               + ", ".join(row))
     return ok
 

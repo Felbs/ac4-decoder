@@ -5,9 +5,10 @@
  * A port of the Python decoder in ../ac4 (the reference): the ASF/MDCT
  * core, A-SPX (rendered on the L/R pair of a stereo element in
  * stereo_codec_mode 1 and on the L/R and Ls/Rs pairs of a 5_X element in
- * codec mode 1, joint balance included), A-CPL side data (parsed for bit
- * accounting only: an ASPX_ACPL_3 5.1 stream decodes to its two-channel
- * core, the other four channels silent, as the Python), the 1001/960
+ * codec mode 1, joint balance included), A-CPL (the 5.1 upmix of an
+ * ASPX_ACPL_3 stream: L, R, C, Ls, Rs from the two-channel core in the QMF
+ * domain, the LFE from its own data; with channels = 2 such a stream gives
+ * its stereo core), the 1001/960
  * resampler, and every damaged-input rule of ac4/robust.py including the
  * output guard. What it leaves out is the Python's list (README).
  *
@@ -162,7 +163,7 @@ typedef struct {
                               after each: Decoder.n_burst) */
     long n_seq_jumps;
     int element;           /* ac4dec_element once known */
-    int acpl3;             /* the stream is ASPX_ACPL_3 (2-ch core) */
+    int acpl3;             /* the stream is ASPX_ACPL_3 (2-ch core + A-CPL) */
     int aspx;              /* A-SPX is being rendered (a pair is on the QMF
                               path and an aspx_config is known) */
 } ac4dec_stats;

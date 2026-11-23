@@ -555,29 +555,68 @@ void ac4_aspx_data(ac4_bits *b, const ac4_aspx_books *bk,
 static const int ACPL_TYPE[11] = { 0, 0, 1, 1, 2, 3, 3, 3, 3, 3, 3 };
 static const int ACPL_WHICH[11] = { 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1 };
 
+/* Annex A.3: cb_off of the F0 / DF / DT books per data type and quant
+   mode (0 fine, 1 coarse) (acpl_parse.CB_OFF) */
+static const int ACPL_CB_OFF[4][2][3] = {
+    { { 0, 32, 32 }, { 0, 16, 16 } },         /* ALPHA */
+    { { 0, 8, 8 }, { 0, 4, 4 } },             /* BETA */
+    { { 0, 16, 16 }, { 0, 8, 8 } },           /* BETA3 */
+    { { 20, 40, 40 }, { 10, 20, 20 } },       /* GAMMA */
+};
+
 void ac4_acpl_data_2ch(ac4_bits *b, const ac4_aspx_books *bk,
-                       const ac4_acpl_cfg *cfg)
+                       const ac4_acpl_cfg *cfg, ac4_acpl_qstate *qs,
+                       ac4_acpl_frame *out)
 {
     int interp, n_sets, i, p, s, k;
     int n = cfg->num_param_bands, st = cfg->param_band;
+    int tsl[2] = { 0, 0 };
     /* Table 63 */
     interp = (int)ac4_bit(b);
     n_sets = (int)ac4_bit(b) + 1;
     if (interp == 1)
         for (i = 0; i < n_sets; i++)
-            ac4_u(b, 5);
+            tsl[i] = (int)ac4_u(b, 5);
+    if (out) {
+        memset(out, 0, sizeof(*out));
+        out->kind = AC4_GRP_DATA;
+        out->cfg = *cfg;
+        out->interp = interp;
+        out->n_sets = n_sets;
+        out->ts[0] = tsl[0];
+        out->ts[1] = tsl[1];
+    }
     for (p = 0; p < 11; p++) {
         int q = ACPL_WHICH[p] ? cfg->quant_mode_1 : cfg->quant_mode_0;
         int base = 6 * ACPL_TYPE[p] + 3 * (q ? 1 : 0);
+        const int *off = ACPL_CB_OFF[ACPL_TYPE[p]][q ? 1 : 0];
         for (s = 0; s < n_sets; s++) {
-            /* Table 65, Pseudocode 8 */
+            int cur[AC4_ACPL_NB];
+            for (k = 0; k < AC4_ACPL_NB; k++)
+                cur[k] = 0;
+            /* Table 65, Pseudocode 8; Pseudocode 121 */
             if (ac4_bit(b) == 0) {            /* DIFF_FREQ */
-                ac4_huff_decode(&bk->acpl[base], b);
+                int v = ac4_huff_decode(&bk->acpl[base], b);
+                cur[st] = v - off[0];
                 for (k = st + 1; k < n; k++)
-                    ac4_huff_decode(&bk->acpl[base + 1], b);
+                    cur[k] = cur[k - 1]
+                             + (ac4_huff_decode(&bk->acpl[base + 1], b)
+                                - off[1]);
             } else {                          /* DIFF_TIME */
-                for (k = st; k < n; k++)
-                    ac4_huff_decode(&bk->acpl[base + 2], b);
+                for (k = st; k < n; k++) {
+                    int v = ac4_huff_decode(&bk->acpl[base + 2], b);
+                    int prev = (qs && k < qs->n[p]) ? qs->q[p][k] : 0;
+                    cur[k] = prev + (v - off[2]);
+                }
+            }
+            if (out) {
+                for (k = 0; k < n; k++)
+                    out->q[p][s][k] = cur[k];
+            }
+            if (qs) {
+                for (k = 0; k < n; k++)
+                    qs->q[p][k] = cur[k];
+                qs->n[p] = n;
             }
         }
     }

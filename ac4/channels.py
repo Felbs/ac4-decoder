@@ -691,7 +691,7 @@ def aspx_config(b):
 
 
 def _acpl3_core(b, T, b_iframe, sub):
-    """5_X_codec_mode 4 = ASPX_ACPL_3 -- decode the STEREO CORE only.
+    """5_X_codec_mode 4 = ASPX_ACPL_3 -- decode the core (LFE + stereo pair).
 
     TS 103 190-1 Table 96 gives 5_X_codec_mode 4 = ASPX_ACPL_3 (A-SPX plus
     Advanced Coupling mode 3), and Table 25's branch for it is
@@ -710,14 +710,10 @@ def _acpl3_core(b, T, b_iframe, sub):
     coupling.  Everything up to and including aspx_data_2ch is machinery this
     decoder already has -- `stereo_data` (Table 23) has the same shape as
     two_channel_data (4.2.6.7), which is why m43 decodes the pair element with
-    the same block.  What we do NOT have is acpl_data_2ch and the A-CPL
-    synthesis that upmixes the core back to 5 channels (Table 62:
-    acpl_framing_data, then alpha1/alpha2/beta1/beta2/beta3 via acpl_ec_data).
-
-    Decoding the core therefore yields a correct STEREO rendering of the
-    programme -- it is the coded downmix, not an invention -- and leaves the
-    5.1 upmix for an A-CPL build.  acpl_data_2ch sits LAST in the frame, so
-    not parsing it costs nothing upstream.
+    the same block.  acpl_data_2ch (Table 62) closes the frame; the stream
+    (stream.py) parses it after the A-SPX block, and acpl.py upmixes the
+    core pair to L, R, C, Ls, Rs in the QMF domain (TS 103 190-1
+    5.7.7.6.2). This function decodes the core: the LFE and the pair.
     """
     aspx = acpl = None
     if b_iframe:

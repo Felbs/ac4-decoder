@@ -706,6 +706,66 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
     }
 }
 
+/* ------------------------------------------------------------ A-CPL */
+/* acpl.render for one frame: the A-CPL of frame f (its parameters in
+   fr->acpl, or none) on slots [24 f + TS_OFFSET, + 24) clipped to nts,
+   from the pair's A-SPX output into the upmix ring */
+static void acpl_frame(ac4_aspx_pair *p, const ac4_aspx_frame *fr,
+                       long long f, long long nts)
+{
+    ac4_acpl_work *w = &p->acpl_work;
+    long long a = 24 * f + TS_OFFSET, z = a + 24, ts;
+    const double (*xr[2])[64], (*xi[2])[64];
+    double (*zr[5])[64], (*zi[5])[64];
+    int c, n, i;
+    if (z > nts)
+        z = nts;
+    n = (int)(z - a);
+    if (n < 0)
+        n = 0;
+    for (c = 0; c < 2; c++)
+        for (i = 0; i < n; i++) {
+            memcpy(w->xr[c][i], p->qre[c][QI(a + i)], sizeof(w->xr[c][i]));
+            memcpy(w->xi[c][i], p->qim[c][QI(a + i)], sizeof(w->xi[c][i]));
+        }
+    for (c = 0; c < 2; c++) {
+        xr[c] = (const double (*)[64])w->xr[c];
+        xi[c] = (const double (*)[64])w->xi[c];
+    }
+    for (c = 0; c < 5; c++) {
+        zr[c] = w->zr[c];
+        zi[c] = w->zi[c];
+    }
+    ac4_acpl_run(&p->acpl, w, fr && fr->acpl.kind != AC4_GRP_NONE
+                              ? &fr->acpl : NULL, n, xr, xi, zr, zi);
+    for (c = 0; c < 5; c++)
+        for (i = 0; i < n; i++) {
+            ts = a + i;
+            memcpy(p->ure[c][QI(ts)], w->zr[c][i], sizeof(w->zr[c][i]));
+            memcpy(p->uim[c][QI(ts)], w->zi[c][i], sizeof(w->zi[c][i]));
+        }
+}
+
+/* the TS_OFFSET slots before the first frame: no frame, so the core
+   passes through (acpl.render leaves them as they are) */
+static void acpl_lead(ac4_aspx_pair *p)
+{
+    long long ts;
+    int c;
+    for (ts = 0; ts < TS_OFFSET; ts++)
+        for (c = 0; c < 5; c++) {
+            if (c < 2) {
+                memcpy(p->ure[c][QI(ts)], p->qre[c][QI(ts)],
+                       sizeof(p->ure[c][0]));
+                memcpy(p->uim[c][QI(ts)], p->qim[c][QI(ts)],
+                       sizeof(p->uim[c][0]));
+            } else {
+                memset(p->ure[c][QI(ts)], 0, sizeof(p->ure[c][0]));
+                memset(p->uim[c][QI(ts)], 0, sizeof(p->uim[c][0]));
+            }
+        }
+}
+
 /* ------------------------------------------------------------ streaming */
 static void synth_frame(ac4_aspx_pair *p, const ac4_qmf_tables *q,
                         long long slot0, double *const y[2])
@@ -717,6 +777,13 @@ static void synth_frame(ac4_aspx_pair *p, const ac4_qmf_tables *q,
             qmf_synth_slot(q, p->syn[c], p->qre[c][QI(ts)],
                            p->qim[c][QI(ts)], y[c] + 64 * i);
         }
+    if (p->acpl_on)
+        for (c = 0; c < 5; c++)
+            for (i = 0; i < 24; i++) {
+                long long ts = slot0 + i;
+                qmf_synth_slot(q, p->usyn[c], p->ure[c][QI(ts)],
+                               p->uim[c][QI(ts)], p->upout[c] + 64 * i);
+            }
 }
 
 static void delayed_core(const ac4_aspx_pair *p, double *const dc[2])
@@ -750,6 +817,11 @@ int ac4_aspx_pair_push(ac4_aspx_pair *p, const ac4_qmf_tables *q,
         }
     if (j >= 1) {
         apply_frame(p, &p->prev, s0 - 24, s0 + 24);
+        if (p->acpl_on) {
+            if (j == 1)
+                acpl_lead(p);
+            acpl_frame(p, &p->prev, j - 1, s0 + 24);
+        }
         synth_frame(p, q, s0 - 24, y);
         delayed_core(p, dc);
         out = 1;
@@ -771,6 +843,11 @@ int ac4_aspx_pair_finish(ac4_aspx_pair *p, const ac4_qmf_tables *q,
     if (p->n_in < 1)
         return 0;
     apply_frame(p, &p->prev, s0 - 24, s0);
+    if (p->acpl_on) {
+        if (p->n_in == 1)
+            acpl_lead(p);
+        acpl_frame(p, &p->prev, p->n_in - 1, s0);
+    }
     synth_frame(p, q, s0 - 24, y);
     delayed_core(p, dc);
     return 1;

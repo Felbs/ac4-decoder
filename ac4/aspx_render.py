@@ -94,7 +94,8 @@ def t_for(cfg):
     return _T_CACHE[key]
 
 
-def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None):
+def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
+                  acpl_groups=None, acpl_state0=None, acpl_log=None):
     """Steps 2-5 for the L/R pair, JOINTLY.
 
     Three things run on from one frame to the next: the noise-table index
@@ -114,6 +115,13 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None):
     which explicitly covers only balance = 0) made the right channel 20x too
     loud and uncorrelated with its own core, while the left channel looked
     perfect -- so a single-channel gate could never have caught it.
+
+    acpl_groups (ASPX_ACPL_3, one entry per group, see acpl.render): the
+    A-CPL upmix runs on the A-SPX output in the QMF domain (TS 103 190-1
+    6.2.11) and out["up"] receives its five channels, synthesised (L, R,
+    C, Ls, Rs); out["L"], out["R"] stay the A-SPX output before the upmix
+    (for the decoder's level checks). acpl_state0 / acpl_log as state0 /
+    state_log, for the A-CPL state.
     """
     if cfg is None:
         # no A-SPX configuration yet: the pair only goes through the QMF
@@ -123,10 +131,14 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None):
         if state_log is not None:             # the state is untouched
             state_log.extend([state0] * (len(groups) + 1))
         out = {}
+        Qa = {}
         for k, x in (("L", pcmL), ("R", pcmR)):
             xx = x[:(len(x) // Q.NSB) * Q.NSB]
-            out[k] = Q.synthesise(Q.analyse(xx, w, Q.analysis_matrix()), w,
-                                  Q.synthesis_matrix(255))
+            Qa[k] = Q.analyse(xx, w, Q.analysis_matrix())
+            out[k] = Q.synthesise(Qa[k], w, Q.synthesis_matrix(255))
+        if acpl_groups is not None:
+            out["up"] = _upmix(Qa["L"], Qa["R"], acpl_groups, acpl_state0,
+                               acpl_log, w)
         return out, 0
     t = t_for(cfg)
     lim = E.sbg_lim(t)
@@ -253,7 +265,20 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None):
                           (nprev[0], nprev[1])))
     for k in ("L", "R"):
         out[k] = Q.synthesise(Qh[k], w, Q.synthesis_matrix(255))
+    if acpl_groups is not None:
+        out["up"] = _upmix(Qh["L"], Qh["R"], acpl_groups, acpl_state0,
+                           acpl_log, w)
     return out, applied
+
+
+def _upmix(QL, QR, acpl_groups, state0, log, w):
+    """A-CPL (acpl.render) on the pair's QMF matrices, then synthesis of
+    the five channels."""
+    from . import acpl as ACPL
+    up = ACPL.render(QL, QR, acpl_groups, state0=state0, state_log=log,
+                     ts_offset=TS_OFFSET)
+    return {k: Q.synthesise(v, w, Q.synthesis_matrix(255))
+            for k, v in up.items()}
 
 
 def band(x, lo, hi):

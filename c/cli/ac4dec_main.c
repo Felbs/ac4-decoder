@@ -449,8 +449,9 @@ int main(int argc, char **argv)
         if (!first)
             printf("\n");
         if (stats.acpl3)
-            printf("  stream is ASPX_ACPL_3 (2-ch core + A-CPL): rendering "
-                   "L/R; the other channels are written silent\n");
+            printf("  stream is ASPX_ACPL_3 (2-ch core + A-CPL): %s\n",
+                   n_ch == 6 ? "5.1 from the A-CPL upmix"
+                                         : "its stereo core");
         printf("%ld frames (%ld bad, %ld concealed, %ld sequence jumps), "
                "element %s, %d ch, %.3f s -> %s  [%.2f s, %.2fx real time; "
                "A-SPX bursts %ld]\n",

@@ -54,6 +54,9 @@ class Ac4Stream:
         # A-CPL books, for bit accounting of ASPX_ACPL_3 frames only
         self.acpl_books = AP.load_books(arrays)
         self.acpl_cfg = None        # acpl_config_2ch, from the last I-frame
+        # acpl_<SET>_q_prev of the eleven sets (Pseudocode 121), rolled back
+        # with a concealed frame like the A-SPX framing state
+        self.acpl_q = [None] * 11
         for nm in self.tabs:
             P.CENTRE[nm] = 0 if nm.endswith("_F0") else \
                 (len(arrays[nm + "_LEN"]) - 1) // 2
@@ -117,13 +120,16 @@ class Ac4Stream:
         counts = {k: [] for k in chans}   # windows per FRAME, per channel --
         # the grouped filterbank needs frame boundaries because channels'
         # window lists do not align positionally when framings diverge
-        groups = {"lr": [], "sr": []}
+        # "acpl": per frame the A-CPL parameters of an ASPX_ACPL_3 frame
+        # (acpl.render's frame dict), None without, CONCEALED
+        groups = {"lr": [], "sr": [], "acpl": []}
         self.status = []
         self.seq_break = []
         pending = []            # frames decoded before any aspx_config
         for fi, f in enumerate(frames):
             wpos = {k: len(v) for k, v in wins.items()}
             fstate0 = dict(self.fstate)
+            acpl_q0 = list(self.acpl_q)
             seq = None
             brk = False
             resume = None       # the counter to expect after an outlier
@@ -207,6 +213,7 @@ class Ac4Stream:
                 # the channel data; parse them all (the 5_X element: L/R,
                 # Ls/Rs and the centre) so the frame closes on audio_size
                 aspx_lr = aspx_sr = None
+                got_acpl = None
                 end = r["bits"]
                 acpl3 = bool(r.get("acpl3"))
                 five = self.element != "pair" and not acpl3
@@ -236,12 +243,24 @@ class Ac4Stream:
                     end = b.p
                     # ASPX_ACPL_3: acpl_data_2ch() closes the frame
                     acfg = r.get("acpl") or self.acpl_cfg
-                    if on and acpl3 and acfg:
+                    if acpl3 and acfg:
                         try:
-                            AP.acpl_data_2ch(b, self.acpl_books, acfg)
+                            ad = AP.acpl_data_2ch(b, self.acpl_books, acfg)
                         except Exception as e:                 # noqa: BLE001
-                            raise RB.Damaged("acpl.parse", str(e)[:60])
-                        end = b.p
+                            if on:
+                                raise RB.Damaged("acpl.parse", str(e)[:60])
+                            ad = None
+                        else:
+                            end = b.p
+                        if ad is not None:
+                            # differential decoding (Pseudocode 121)
+                            q = AP.quantised_2ch(ad, acfg, self.acpl_q)
+                            fr_a = ad["framing"]
+                            got_acpl = dict(
+                                cfg=acfg, q=q,
+                                interp=fr_a["interpolation_type"],
+                                timeslots=tuple(fr_a["param_timeslot"]),
+                                clamped=AP.out_of_range_2ch(q, acfg))
                 r["end"] = end
                 # every block of audio_data() parsed?  Not before the first
                 # aspx_config (the A-SPX blocks cannot be sized) nor, for
@@ -269,7 +288,11 @@ class Ac4Stream:
                 # this frame has only a pair to give no matter what `chans`
                 # asked for. Narrow the request instead of KeyError-ing.
                 if r.get("acpl3"):
-                    chans = ("L", "R")
+                    # the two core channels, and the LFE when asked for
+                    # (C / Ls / Rs come from the A-CPL upmix, decoder.py)
+                    chans = tuple(k for k in ("L", "R", "lfe")
+                                  if k in chans)
+                    fm["lfe"] = r["lfe"]["framing"]
                     self.acpl3 = True
                     # 13.25: the output lists were built for the REQUESTED
                     # channels; from here every frame gives only a pair, so
@@ -334,6 +357,8 @@ class Ac4Stream:
                     u[k], seq_l[k] = R.ungroup(pk[k], fm[k])
                 got_lr = aspx_lr
                 got_sr = aspx_sr if "Ls" in pk else None
+                if not acpl3:
+                    got_acpl = None
                 self.n_ok += 1
                 self.status.append(None)
                 self.seq_break.append(brk)
@@ -346,10 +371,11 @@ class Ac4Stream:
                 # stays frame-accurate.  Nothing it parsed is kept: the
                 # A-SPX framing state goes back to before it (hold).
                 self.fstate = fstate0
+                self.acpl_q = acpl_q0
                 reason = RB.reason_of(e)
                 u = {k: [np.zeros(1536)] for k in chans}
                 seq_l = {k: [1536] for k in chans}
-                got_lr = got_sr = CONCEALED
+                got_lr = got_sr = got_acpl = CONCEALED
                 self.n_bad += 1
                 self.damage.add(reason)
                 self.status.append(reason)
@@ -374,6 +400,7 @@ class Ac4Stream:
                 counts[k].append(len(seq_l[k]))
             groups["lr"].append(got_lr)
             groups["sr"].append(got_sr)
+            groups["acpl"].append(got_acpl)
         if pending and self.cfg and RB.CHECKS:
             self._late_closure(pending, wins, lengths, counts, groups)
         return wins, lengths, groups, counts
@@ -441,6 +468,8 @@ class Ac4Stream:
                 lengths[k][p0:p0 + c] = [1536]
                 counts[k][fi] = 1
             groups["lr"][fi] = groups["sr"][fi] = CONCEALED
+            if "acpl" in groups:
+                groups["acpl"][fi] = CONCEALED
             self.status[fi] = "audio_size.late"
             self.n_bad += 1
             self.n_ok -= 1

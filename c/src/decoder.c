@@ -175,6 +175,7 @@ struct ac4dec {
     int has_pcfg;
     ac4_acpl_cfg pcfg;
     ac4_aspx_state fstate;
+    ac4_acpl_qstate aq;         /* A-CPL q_prev (Pseudocode 121) */
     pending_t *pend;
     int n_pend;
     int late_done;
@@ -376,11 +377,14 @@ static void set_element(ac4dec *d, int element)
     d->guard.init = G_INIT_FRAC * ref;
 }
 
-/* which of the six channels a frame synthesises */
+/* which of the six channels a frame synthesises (ASPX_ACPL_3 in 5.1:
+   the core pair and the LFE; C, Ls, Rs come from the A-CPL upmix) */
 static int chan_mask(const ac4dec *d, int acpl3)
 {
-    if (d->element == AC4DEC_ELEMENT_PAIR || acpl3 || d->n_ch == 2)
+    if (d->element == AC4DEC_ELEMENT_PAIR || d->n_ch == 2)
         return (1 << CH_L) | (1 << CH_R);
+    if (acpl3)
+        return (1 << CH_L) | (1 << CH_R) | (1 << CH_LFE);
     return 0x3f;
 }
 
@@ -417,6 +421,7 @@ static void stream_reset(ac4dec *d)
     memset(&d->relearn, 0, sizeof(d->relearn));
     d->has_cfg = d->has_pcfg = 0;
     memset(&d->fstate, 0, sizeof(d->fstate));
+    memset(&d->aq, 0, sizeof(d->aq));
     d->late_done = 0;
     d->has_raw = 0;
     d->n_in = d->n_parsed = 0;
@@ -616,6 +621,7 @@ static void rec_conceal(ac4dec *d, rec_t *r, int code)
     }
     r->af[0].kind = r->af[1].kind = AC4_GRP_CONCEALED;
     r->af[0].has_tab = r->af[1].has_tab = 0;
+    r->af[0].acpl.kind = r->af[1].acpl.kind = AC4_GRP_CONCEALED;
     r->seq_jump = 0;
 }
 
@@ -668,7 +674,7 @@ static int late_one(ac4dec *d, const pending_t *pd, ac4_aspx_state *st)
         if (!d->has_pcfg)
             return -1;
         b.eof_code = AC4E_ACPL_PARSE;
-        ac4_acpl_data_2ch(&b, &d->abk, &d->pcfg);
+        ac4_acpl_data_2ch(&b, &d->abk, &d->pcfg, NULL, NULL);
     }
     stop = pd->start + 8 * pd->size;
     return b.p <= stop && b.p + 7 >= stop;
@@ -735,6 +741,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     volatile int changed = AC4E_NONE, resume = -1, seq = -1, brk = 0;
     volatile int first_cfg = 0;
     ac4_aspx_state fstate0 = d->fstate;
+    ac4_acpl_qstate aq0 = d->aq;
     int code = AC4E_NONE, k, ifr = 0, five, has_aspx, acpl3, complete;
     size_t o, sub_len = 0;
     const uint8_t *sub = NULL;
@@ -826,6 +833,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     has_aspx = !(d->element == AC4DEC_ELEMENT_PAIR && e->mode == 0);
     end = e->bits_end;
     r->af[0].kind = r->af[1].kind = AC4_GRP_NONE;
+    r->af[0].acpl.kind = r->af[1].acpl.kind = AC4_GRP_NONE;
     if (cfg && has_aspx) {
         const ac4_acpl_cfg *pc = e->has_acpl_cfg ? &e->acpl_cfg
                                  : (d->has_pcfg ? &d->pcfg : NULL);
@@ -844,7 +852,8 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         end = b.p;
         if (acpl3 && pc) {
             b.eof_code = AC4E_ACPL_PARSE;
-            ac4_acpl_data_2ch(&b, &d->abk, pc);
+            /* parsed, and differentially decoded (Pseudocode 121) */
+            ac4_acpl_data_2ch(&b, &d->abk, pc, &d->aq, &r->af[0].acpl);
             end = b.p;
         }
     }
@@ -981,6 +990,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
 
 fail:
     d->fstate = fstate0;
+    d->aq = aq0;
     /* a frame concealed after it was put on the late list (a rule checked
        after add_pending) is not judged by the late check: it keeps its
        reason, is counted once, and its A-SPX does not feed the check's
@@ -1021,6 +1031,7 @@ static void parse_held(ac4dec *d, const uint8_t *nx, size_t nx_len,
         r->unknown = 1;
         r->mask = 0;
         r->af[0].kind = r->af[1].kind = AC4_GRP_NONE;
+        r->af[0].acpl.kind = r->af[1].acpl.kind = AC4_GRP_NONE;
         return;
     }
     parse_frame(d, data, d->raw_len, nx, nx_len, has_next, r);
@@ -1055,8 +1066,10 @@ static void np_frame_stats(const double *x, double *rms, double *amax)
 }
 
 /* core_for_bursts for one frame of one pair: the burst guard and the
-   aspx.level check. -> 1 when aspx.level flags the frame */
-static int bursts(ac4dec *d, int p, double *y[2], double *dc[2])
+   aspx.level check. -> 1 when aspx.level flags the frame; *bad_out: the
+   frame plays its core */
+static int bursts(ac4dec *d, int p, double *y[2], double *dc[2],
+                  int *bad_out)
 {
     double limit = 2.0 * ac4dec_ref_peak((ac4dec_element)d->element);
     double floor_ = HF_MIN_FRAC * ac4dec_ref_peak((ac4dec_element)d->element);
@@ -1085,6 +1098,7 @@ static int bursts(ac4dec *d, int p, double *y[2], double *dc[2])
         for (c = 0; c < 2; c++)
             memcpy(y[c], dc[c], sizeof(double) * FRAME);
     }
+    *bad_out = bad;
     return over;
 }
 
@@ -1113,7 +1127,7 @@ static void assemble(ac4dec *d, double hf[2][2][FRAME], double dcore[2][2][FRAME
 {
     outf_t *o;
     const rec_t *ri = &d->prev_info;
-    int k, p;
+    int k, p, bad;
     o = &d->ring[(int)((d->ring_first + d->ring_n) % d->ring_cap)];
     if (d->ring_n == 0)
         d->ring_first = ri->index;
@@ -1146,10 +1160,26 @@ static void assemble(ac4dec *d, double hf[2][2][FRAME], double dcore[2][2][FRAME
         y[1] = hf[p][1];
         dc[0] = dcore[p][0];
         dc[1] = dcore[p][1];
-        if (bursts(d, p, y, dc))
+        if (bursts(d, p, y, dc, &bad))
             o->aspx_flag = 1;
         memcpy(o->pcm[a], y[0], sizeof(o->pcm[a]));
         memcpy(o->pcm[a + 1], y[1], sizeof(o->pcm[a + 1]));
+        if (p == 0 && d->pair[0].acpl_on) {
+            /* the A-CPL upmix (decoder.py): a frame the checks above gave
+               its core plays the core (the stereo downmix) on L / R and
+               nothing on C / Ls / Rs */
+            static const int CH5[5] = { CH_L, CH_R, CH_C, CH_LS, CH_RS };
+            int c;
+            for (c = 0; c < 5; c++) {
+                if (bad && c < 2)
+                    continue;
+                if (bad)
+                    memset(o->pcm[CH5[c]], 0, sizeof(o->pcm[0]));
+                else
+                    memcpy(o->pcm[CH5[c]], d->pair[0].upout[c],
+                           sizeof(o->pcm[0]));
+            }
+        }
     }
     /* channels a frame does not have are silent */
     for (k = d->n_ch; k < 6; k++)
@@ -1191,6 +1221,11 @@ static void synth_one(ac4dec *d)
         if (!d->pair_active[p] && pair_capable(d, p)) {
             d->pair_active[p] = 1;
             d->pair_start[p] = r->index;
+            /* ASPX_ACPL_3 decoded to 5.1: the A-CPL upmix on the core
+               pair, from its first frame */
+            if (p == 0 && d->acpl3 && d->n_ch == 6
+                && d->element == AC4DEC_ELEMENT_5X)
+                d->pair[0].acpl_on = 1;
         }
         if (d->pair_active[p]) {
             int a = p == 0 ? CH_L : CH_LS;

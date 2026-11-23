@@ -55,9 +55,11 @@ A-SPX (4.2.10, 4.3.10, 5.7.6)
   aspx.parse      the A-SPX data does not parse
 
 A-CPL (4.2.13; ASPX_ACPL_3 frames)
-  acpl.parse      acpl_data_2ch() does not parse. It is read for bit
-                  accounting only (the upmix is not built), so that these
-                  frames close exactly on audio_size as well
+  acpl.parse      acpl_data_2ch() does not parse (it is also counted in
+                  the audio_size closure). Values that time-differential
+                  decoding takes outside what the codebooks and tables
+                  cover (after frames lost on air) are not damage: they
+                  are clamped at dequantisation (acpl.dequantise_2ch)
 
 SEQUENCE (4.3.3.2.2): a counter that is neither prev+1, nor the 1020 -> 1
 wrap, nor a frame after a splice (prev 0) marks a source change or lost

@@ -334,9 +334,60 @@ void ac4_aspx_data(ac4_bits *b, const ac4_aspx_books *bk,
                    const ac4_aspx_tab *t, const ac4_aspx_cfg *cfg,
                    int b_iframe, int two_ch, ac4_aspx_state *st, int grp,
                    ac4_aspx_grp *out);
-/* acpl_data_2ch, parsed for bit accounting only. Raises b->eof_code. */
+/* ------------------------------------------------------------ A-CPL
+ * Port of ac4/acpl_parse.py (quantised_2ch) and ac4/acpl.py: the upmix
+ * of 5_X_codec_mode ASPX_ACPL_3, TS 103 190-1 5.7.7. */
+#define AC4_ACPL_NB 15          /* acpl_max_num_param_bands */
+#define AC4_ACPL_NQ 19          /* interpolated quantities (acpl.QUANTITIES) */
+
+/* acpl_<SET>_q_prev of the eleven sets (Pseudocode 121); n[k] = 0: none */
+typedef struct {
+    int q[11][AC4_ACPL_NB];
+    int n[11];
+} ac4_acpl_qstate;
+
+/* one frame's A-CPL parameters (acpl.render's frame dict) */
+typedef struct {
+    int kind;                   /* AC4_GRP_NONE / _CONCEALED / _DATA */
+    ac4_acpl_cfg cfg;
+    int interp, n_sets, ts[2];
+    int q[11][2][AC4_ACPL_NB];  /* acpl_<SET>_q, Pseudocode 121 */
+} ac4_acpl_frame;
+
+/* acpl_data_2ch. Raises b->eof_code. With out not NULL, the parameters
+   are differentially decoded into it against qs (updated). */
 void ac4_acpl_data_2ch(ac4_bits *b, const ac4_aspx_books *bk,
-                       const ac4_acpl_cfg *cfg);
+                       const ac4_acpl_cfg *cfg, ac4_acpl_qstate *qs,
+                       ac4_acpl_frame *out);
+
+/* the tool's state between frames (acpl.new_state) */
+typedef struct {
+    int warm;
+    double prev[AC4_ACPL_NQ][64];
+    double xr[3][14][64], xi[3][14][64];    /* decorrelator input history */
+    double yr[3][7][64], yi[3][7][64];      /* and output history */
+    double peak[3][AC4_ACPL_NB], smooth[3][AC4_ACPL_NB],
+           spd[3][AC4_ACPL_NB];
+} ac4_acpl_state;
+
+/* scratch space of ac4_acpl_run (no state) */
+typedef struct {
+    double ip[AC4_ACPL_NQ][24][64];
+    double sets[AC4_ACPL_NQ][2][64];
+    double vr[3][14 + 24][64], vi[3][14 + 24][64];
+    double ur[3][7 + 24][64], ui[3][7 + 24][64];
+    /* the renderer's gather / scatter buffers */
+    double xr[2][24][64], xi[2][24][64];
+    double zr[5][24][64], zi[5][24][64];
+} ac4_acpl_work;
+
+/* acpl.upmix_frame / render for one frame of n (<= 24) slots: x[c] the
+   pair's QMF slots (re, im: [n][64]); z[ch] receives L, R, C, Ls, Rs.
+   f NULL = no A-CPL data (passthrough, state cleared). */
+void ac4_acpl_run(ac4_acpl_state *s, ac4_acpl_work *w,
+                  const ac4_acpl_frame *f, int n,
+                  const double (*xr[2])[64], const double (*xi[2])[64],
+                  double (*zr[5])[64], double (*zi[5])[64]);
 
 /* ------------------------------------------------------------ A-SPX render
  * One channel pair, streaming. Core frames go in one at a time; the
@@ -352,6 +403,7 @@ typedef struct {
     int has_tab;
     ac4_aspx_tab tab;           /* the tables this frame's data is for */
     ac4_aspx_grp g;
+    ac4_acpl_frame acpl;        /* ASPX_ACPL_3 (pair 0 only) */
 } ac4_aspx_frame;
 
 typedef struct ac4_qmf_tables ac4_qmf_tables;
@@ -376,6 +428,14 @@ typedef struct {
     double core[2][2 * 1536];   /* the last two core frames */
     int hot_left;               /* burst guard: frames still owed */
     long n_applied;
+    /* A-CPL (ASPX_ACPL_3 decoded to 5.1): on, its state, the upmixed
+       channels' QMF slots (L, R, C, Ls, Rs) and their synthesis banks */
+    int acpl_on;
+    ac4_acpl_state acpl;
+    ac4_acpl_work acpl_work;
+    double ure[5][AC4_QRING][64], uim[5][AC4_QRING][64];
+    double usyn[5][1280];
+    double upout[5][1536];      /* the last output frame's upmix */
 } ac4_aspx_pair;
 
 void ac4_aspx_pair_reset(ac4_aspx_pair *p);
@@ -386,6 +446,8 @@ void ac4_aspx_pair_reset(ac4_aspx_pair *p);
 int ac4_aspx_pair_push(ac4_aspx_pair *p, const ac4_qmf_tables *q,
                        const double *const x[2], const ac4_aspx_frame *f,
                        double *const y[2], double *const dc[2]);
+/* With p->acpl_on, the push / finish that writes output frame j - 1 also
+   writes its A-CPL upmix (L, R, C, Ls, Rs) to p->upout. */
 /* End of stream: the last frame's output (its envelopes clipped at the
    end of the analysed signal, as at the end of a Python decode pass).
    -> 1 if a frame was written. */
