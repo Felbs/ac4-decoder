@@ -581,7 +581,8 @@ def test_aspx_noise_index_runs_on_across_envelopes(monkeypatch):
     monkeypatch.setattr(V, "reconstruct", lambda d, t, m, p: (None, p))
     monkeypatch.setattr(E, "noise_qscf", lambda d, t, p: (None, p))
     monkeypatch.setattr(E, "map_scf_joint",
-                        lambda *a: (np.zeros((n_sb, 2)), np.zeros((n_sb, 2))))
+                        lambda *a, **k: (np.zeros((n_sb, 2)),
+                                         np.zeros((n_sb, 2))))
     monkeypatch.setattr(E, "map_noise_joint",
                         lambda *a: (np.zeros((n_sb, 2)), np.zeros((n_sb, 2))))
     monkeypatch.setattr(E, "estimate", zeros)
@@ -596,7 +597,7 @@ def test_aspx_noise_index_runs_on_across_envelopes(monkeypatch):
     R37.apply_hf_pair(x, x, [None, got, got, None], cfg)
     nt = E.noise_table()
     Qh = seen[0]
-    # frame 1: slots 24 + 4 .. 24 + 4 + 16; frame 2 continues
+    # frame 1: slots 24 + TS_OFFSET .. + 16; frame 2 continues
     for f in (1, 2):
         t0 = 24 * f + R37.TS_OFFSET
         for ts in range(t0, t0 + 16):
@@ -736,7 +737,8 @@ def test_aspx_transient_envelopes_from_the_framing(monkeypatch):
     monkeypatch.setattr(V, "reconstruct", lambda d, t, m, p: (None, p))
     monkeypatch.setattr(E, "noise_qscf", lambda d, t, p: (None, p))
     monkeypatch.setattr(E, "map_scf_joint",
-                        lambda *a: (np.zeros((n_sb, 2)), np.zeros((n_sb, 2))))
+                        lambda *a, **k: (np.zeros((n_sb, 2)),
+                                         np.zeros((n_sb, 2))))
     monkeypatch.setattr(E, "map_noise_joint",
                         lambda *a: (np.zeros((n_sb, 2)), np.zeros((n_sb, 2))))
     seen = []

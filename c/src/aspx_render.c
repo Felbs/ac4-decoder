@@ -8,12 +8,13 @@
  *
  * The Python renders a whole decode pass at once; this renders frame by
  * frame with the same arithmetic. A frame's envelopes cover QMF slots
- * [24 j + 4 + 2 b0, 24 j + 4 + 2 bn) with 0 <= b0 and bn <= 15 (the
- * aspx.borders rule), i.e. at most 10 slots into frame j + 1, so frame j
- * is adjusted and synthesised once core frame j + 1 has been analysed.
+ * [24 j + 18 + 2 b0, 24 j + 18 + 2 bn) with 0 <= b0 and bn <= 15 (the
+ * aspx.borders rule; TS_OFFSET 18, see aspx_render.TS_OFFSET), i.e. at
+ * most to the end of frame j + 1, so frame j is adjusted and synthesised
+ * once core frame j + 1 has been analysed.
  *
  * A slot is HF-generated only when the frame its envelope belongs to
- * (frame floor((slot - 4) / 24)) has A-SPX data or was concealed with a
+ * (frame floor((slot - 18) / 24)) has A-SPX data or was concealed with a
  * configuration known: the slots of frames from before the stream's first
  * aspx_config keep the core alone (the Python does the same). */
 #include <math.h>
@@ -25,7 +26,7 @@
 #define NSB 64
 #define AC4_PI 3.14159265358979323846   /* np.pi */
 #define NWIN 640
-#define TS_OFFSET 4
+#define TS_OFFSET 18            /* 24 - ts_offset_hfgen: aspx_render.py */
 #define NOISE_FLOOR_OFFSET 6
 #define PAN_OFFSET 12
 #define EPSILON 1.0
@@ -815,7 +816,7 @@ int ac4_aspx_pair_push(ac4_aspx_pair *p, const ac4_qmf_tables *q,
     long long j = p->n_in, s0 = j * 24;
     int c, i, out = 0;
     /* analyse core frame j, HF-generating the slots whose frame has
-       A-SPX (slots s0 .. s0+3 belong to frame j - 1's envelopes) */
+       A-SPX (slots s0 .. s0+17 belong to frame j - 1's envelopes) */
     for (c = 0; c < 2; c++)
         for (i = 0; i < 24; i++) {
             long long ts = s0 + i;

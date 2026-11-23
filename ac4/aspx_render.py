@@ -74,13 +74,99 @@ from .robust import CONCEALED                                        # noqa: E40
 
 FS = 48000
 
-# QMF ANALYSIS DELAY, MEASURED not assumed: an impulse at input slot 10 has its
-# subband-energy centroid at slot 14.0, so frame i's audio occupies QMF slots
-# [i*24 + TS_OFFSET, ...).  The MDCT render itself was measured to add ZERO
-# frames of delay (frame 6's spectrum peaks in output frame 6), so this is the
-# whole correction.  Applying the control at offset 0 -- the previous default --
-# smears the high band ~4 slots (~5.3 ms) early against the core.
-TS_OFFSET = 4
+# THE TIME GRID OF THE QMF TOOLS (A-SPX, A-CPL, companding): frame f's
+# A-SPX interval slot ts (atsg borders x num_ts_in_ats) acts on QMF
+# analysis slot 24 f + TS_OFFSET + ts of the decoded core.
+#
+# TS 103 190-1 Pseudocode 75 feeds the HF generator Q_low[ts] =
+# Q[ts - ts_offset_hfgen] (6 slots for frame lengths 1536 to 2048, Table
+# 192), and 5.7.6.5 outputs Qin(i - ts_offset_hfgen) + Y(i): read
+# literally, slot ts of frame f's interval is analysis slot 24 f + ts - 6.
+# On air the data of frame f fits the core one frame later, at
+# 24 f + ts - 6 + 24: the envelope-to-envelope swing of the envelope
+# adjuster's E_ref / E_est (it jumps wherever envelope and core are
+# misaligned) is smallest at offsets 16 to 18 on both broadcasters and a
+# public test stream, and largest at -6 (c/tests/... see README,
+# Interpretations); the A-SPX transient borders lead the core's own
+# transients by 12-13 slots at the old offset 4, i.e. 16-17. So
+# TS_OFFSET = 24 - ts_offset_hfgen = 18. (Was 4: an impulse measurement
+# of the analysis filter's own delay.)
+TS_HFGEN = 6
+TS_OFFSET = 24 - TS_HFGEN
+
+
+# COMPANDING (TS 103 190-1 5.7.5). The tool's levels L(ts) are not scale
+# invariant (its gain is L^((1 - alpha) / alpha) * 2^(1 / alpha)), and the
+# standard does not say what full scale they refer to. Its fixed point,
+# L = 2^(-1 / (1 - alpha)) = 0.138, sits at programme level only for a
+# full scale of 1, so the levels are taken relative to this decoder's full
+# scale: IMDCT_K * 2^14.5 decoder units, the full scale the loudness
+# metadata of five streams gives (BS.1770 against loudrelgat: 122.1 dB re
+# 1, spread +-1.8 dB; IMDCT_K * 2^14.5 is 122.2 dB). See README,
+# Interpretations.
+COMPANDING = False      # off: see README, Interpretations (companding)
+COMPAND_ALPHA = 0.65
+COMPAND_SCALE = FB.IMDCT_K * 2.0 ** 14.5
+
+
+def compand_levels(Q, sb0, sb1):
+    """L(ts) = 0.9105 * mean over sb0..sb1-1 of max(|Re|, |Im|) + min / 2."""
+    re, im = np.abs(Q[sb0:sb1].real), np.abs(Q[sb0:sb1].imag)
+    e = np.maximum(re, im) + 0.5 * np.minimum(re, im)
+    return 0.9105 * e.mean(axis=0) / COMPAND_SCALE
+
+
+def compand(Qs, groups, sbx, ts_offset=None):
+    """The companding tool (5.7.5.2) on the analysed core of the channels
+    of one A-SPX group, in place, before HF generation (6.2.9). Qs: the
+    channels' QMF matrices (list); groups: per frame the A-SPX data (one
+    dict per channel, with its "compand" flags) or None / CONCEALED. Each
+    frame acts on subbands 0 .. sbx - 1 and on the slots of its A-SPX
+    interval, atsg_sig[0] .. atsg_sig[num_atsg_sig] (x num_ts_in_ats),
+    placed like the envelopes."""
+    off = TS_OFFSET if ts_offset is None else ts_offset
+    a = COMPAND_ALPHA
+    G = 2.0 ** (1.0 / a)
+    expo = (1.0 - a) / a
+    for f, got in enumerate(groups):
+        if not isinstance(got, list):
+            continue
+        flags = [c.get("compand") for c in got]
+        if any(fl is None for fl in flags):
+            continue
+        sync = flags[0]["sync"]
+        spans, Ls = [], []
+        for c, Q in zip(got, Qs):
+            bd = c["fr"].get("borders") or [0, 12]
+            ta = max(f * 24 + int(bd[0]) * 2 + off, 0)
+            tz = min(f * 24 + int(bd[-1]) * 2 + off, Q.shape[1])
+            spans.append((ta, tz))
+            Ls.append(compand_levels(Q[:, ta:tz], 0, sbx) if tz > ta
+                      else np.zeros(0))
+        if sync:
+            n = min(len(x) for x in Ls)
+            if n == 0:
+                continue
+            gs = np.mean([x[:n] ** expo for x in Ls], axis=0)
+            if flags[0]["on"]:
+                gains = [gs] * len(Qs)
+            elif flags[0]["avg"]:
+                gains = [np.full(n, gs.mean())] * len(Qs)
+            else:
+                continue
+            for (ta, tz), Q, g in zip(spans, Qs, gains):
+                Q[:sbx, ta:ta + n] *= g * G
+            continue
+        for (ta, tz), Q, L, fl in zip(spans, Qs, Ls, flags):
+            if tz <= ta:
+                continue
+            if fl["on"]:
+                g = L ** expo
+            elif fl["avg"]:
+                g = np.full(tz - ta, L.mean() ** expo)
+            else:
+                continue
+            Q[:sbx, ta:tz] *= g * G
 
 
 _T_CACHE = {}
@@ -149,9 +235,14 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
 
     out = {}
     Qh = {}
+    Qan = {}
     for k, x in (("L", pcmL), ("R", pcmR)):
         xx = x[:(len(x) // Q.NSB) * Q.NSB]
-        Qa = Q.analyse(xx, w, Q.analysis_matrix())
+        Qan[k] = Q.analyse(xx, w, Q.analysis_matrix())
+    if COMPANDING:
+        compand([Qan["L"], Qan["R"]], groups, sbx)
+    for k in ("L", "R"):
+        Qa = Qan[k]
         Qh[k] = G.hf_generate(Qa, t)
         # HF generation only on the QMF slots of frames that have A-SPX
         # data (or are concealed, whose high band is muted below): slot ts

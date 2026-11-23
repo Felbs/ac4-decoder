@@ -338,3 +338,37 @@ def test_fixfix_single_envelope_reports_qmode_0(monkeypatch):
     out = P.aspx_data(Bits(bytes(4)), {}, {}, dict(quant_mode_env=1), 12,
                       False, False, {}, 0)
     assert out[0]["qmode"] == 0 and calls["SIGNAL"] == [0]
+
+
+def test_aspx_grid_is_one_frame_after_pseudocode_75(monkeypatch):
+    """Frame f's A-SPX interval slot ts acts on analysis slot 24 f + 24 -
+    ts_offset_hfgen + ts (TS_OFFSET 18; see aspx_render.TS_OFFSET): a
+    noise-only high band from frame 1's interval [0, 12) A-SPX slots
+    occupies exactly analysis slots 42 .. 65."""
+    from ac4 import aspx_render as R37
+    from ac4 import aspx_env as V
+    from ac4 import aspx_envadj as E
+    from ac4 import qmf as Q
+    from test_units import _aspx_cfg
+    cfg, t = _aspx_cfg()
+    n_sb, sbx = t["num_sb_aspx"], t["sbx"]
+    got = [{"fr": {"borders": [0, 12]}, "balance": 1},
+           {"fr": {"borders": [0, 12]}, "balance": 1}]
+    z = (lambda *a, **k: (np.zeros((n_sb, 1)), np.zeros((n_sb, 1))))
+    monkeypatch.setattr(V, "reconstruct", lambda d, t, m, p: (None, p))
+    monkeypatch.setattr(E, "noise_qscf", lambda d, t, p: (None, p))
+    monkeypatch.setattr(E, "map_scf_joint", z)
+    monkeypatch.setattr(E, "map_noise_joint", z)
+    monkeypatch.setattr(E, "estimate", lambda *a, **k: np.zeros((n_sb, 1)))
+    monkeypatch.setattr(E, "adjust", lambda *a: (np.zeros((n_sb, 1)),
+                                                 np.ones((n_sb, 1))))
+    seen = []
+    real = Q.synthesise
+    monkeypatch.setattr(Q, "synthesise",
+                        lambda Qm, *a: (seen.append(Qm.copy()),
+                                        real(Qm, *a))[1])
+    x = np.zeros(4 * 1536)
+    R37.apply_hf_pair(x, x, [None, got, None, None], cfg)
+    hf = np.abs(seen[0][sbx:sbx + n_sb]).sum(axis=0)
+    assert R37.TS_OFFSET == 24 - R37.TS_HFGEN == 18
+    assert list(np.flatnonzero(hf)) == list(range(42, 66))
