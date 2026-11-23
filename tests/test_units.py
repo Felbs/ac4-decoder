@@ -217,3 +217,48 @@ def test_mp4_default_sample_size():
     moof = _box(b"moof", mfhd + _box(b"traf", tfhd + trun))
     data = _box(b"moov", _trak(tid, b"ac-4")) + moof + _box(b"mdat", b"".join(samples))
     assert mp4.frames(data) == samples
+
+
+# ---------------------------------------------------------------- TOC
+def _bits(s):
+    """'0101..' -> Bits over the string padded to whole bytes."""
+    s = s + "0" * (-len(s) % 8)
+    return Bits(bytes(int(s[i:i + 8], 2) for i in range(0, len(s), 8)))
+
+
+# TS 103 190-2 table 56: channel_mode code -> ch_mode
+CHANNEL_MODE_CODES = [
+    ("0", 0), ("10", 1), ("1100", 2), ("1101", 3), ("1110", 4),
+    ("1111000", 5), ("1111001", 6), ("1111010", 7), ("1111011", 8),
+    ("1111100", 9), ("1111101", 10), ("11111100", 11), ("11111101", 12),
+    ("111111100", 13), ("111111101", 14), ("111111110", 15),
+    # 0b111111111 + variable_bits(2): chunk 00, more 0 -> 16 + 0;
+    # chunk 01, more 1, chunk 10, more 0 -> 16 + ((1 << 2) + 4 + 2)
+    ("111111111" + "000", 16), ("111111111" + "011" + "100", 26),
+]
+
+
+@pytest.mark.parametrize("code,ch_mode", CHANNEL_MODE_CODES)
+def test_channel_mode_prefix_code(code, ch_mode):
+    from ac4 import toc
+    b = _bits(code)
+    assert toc.channel_mode(b) == ch_mode
+    assert b.p == len(code)
+
+
+@pytest.mark.parametrize("code,ch_mode", [c for c in CHANNEL_MODE_CODES
+                                          if c[1] in (11, 12, 13, 14)])
+def test_substream_info_chan_reads_top_channel_fields(code, ch_mode):
+    """7.0.4 / 7.1.4 / 9.0.4 / 9.1.4 carry b_4_back_channels_present,
+    b_centre_present and top_channels_present (4 bits) before
+    b_bitrate_info (TS 103 190-2 6.2.1.8)."""
+    from ac4 import toc
+    # code, the 4 bits, b_bitrate_info = 1, bitrate_indicator 010,
+    # b_audio_ndot = 1; fs_index 0, frame_rate_factor 1, no substream index
+    s = code + "1011" + "1" + "010" + "1"
+    st = {"channel_modes": [], "fs_index": 0, "ndot_bits": []}
+    b = _bits(s)
+    toc.substream_info_chan(b, False, 1, st)
+    assert st["channel_modes"] == [ch_mode]
+    assert b.p == len(s)
+    assert st["ndot_bits"] == [len(s) - 1]

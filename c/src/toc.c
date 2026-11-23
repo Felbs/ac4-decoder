@@ -23,9 +23,14 @@ uint64_t ac4_vb(ac4_bits *b, int n)
     }
 }
 
-static long channel_mode(ac4_bits *b)
+/* channel_mode -> ch_mode, TS 103 190-2 table 56: 0 / 10 / 1100..1110 /
+   1111000..1111101 (5..10) / 11111100, 11111101 (7.0.4, 7.1.4: 11, 12) /
+   111111100..111111110 (9.0.4, 9.1.4, 22.2: 13..15) / 111111111 +
+   variable_bits(2) (reserved, 16 and up). 1111110 is not a code: it
+   starts the two 8-bit ones. */
+long ac4_toc_channel_mode(ac4_bits *b)
 {
-    uint32_t two, tail;
+    uint32_t two, tail, last;
     if (ac4_bit(b) == 0)
         return 0;
     if (ac4_bit(b) == 0)
@@ -34,13 +39,14 @@ static long channel_mode(ac4_bits *b)
     if (two != 3)
         return two == 0 ? 2 : two == 1 ? 3 : 4;
     tail = ac4_u(b, 3);
-    if (tail != 7)
+    if (tail <= 5)
         return 5 + (long)tail;
-    if (ac4_bit(b) == 0)
-        return 12;
-    if (ac4_bit(b) == 0)
-        return 13;
-    return 14 + (long)ac4_vb(b, 2);
+    if (tail == 6)
+        return 11 + (long)ac4_bit(b);
+    last = ac4_u(b, 2);
+    if (last != 3)
+        return 13 + (long)last;
+    return 16 + (long)ac4_vb(b, 2);
 }
 
 static void content_type(ac4_bits *b)
@@ -182,19 +188,21 @@ static uint64_t presentation_v1_info(ac4_bits *b, int fri, int *frf_out)
     return n_sg;
 }
 
-static void substream_info_chan(ac4_bits *b, int present, int frf,
-                                ac4_toc *t)
+void ac4_toc_substream_info_chan(ac4_bits *b, int present, int frf,
+                                 ac4_toc *t)
 {
-    long cm = channel_mode(b);
+    long cm = ac4_toc_channel_mode(b);
     int i;
     if (t->n_cmodes < AC4_MAX_CMODES)
         t->cmodes[t->n_cmodes] = cm;
     if (t->n_cmodes < 1 << 30)
         t->n_cmodes++;
-    if (cm == 252 || cm == 253 || cm == 508 || cm == 509) {
-        ac4_bit(b);
-        ac4_bit(b);
-        ac4_u(b, 2);
+    /* the spec compares the channel_mode code with 0b11111100,
+       0b11111101, 0b111111100 and 0b111111101: ch_mode 11 .. 14 */
+    if (cm >= 11 && cm <= 14) {
+        ac4_bit(b);                     /* b_4_back_channels_present */
+        ac4_bit(b);                     /* b_centre_present */
+        ac4_u(b, 2);                    /* top_channels_present */
     }
     if (t->fs_index == 1) {
         if (ac4_bit(b))                 /* b_sf_multiplier */
@@ -204,7 +212,7 @@ static void substream_info_chan(ac4_bits *b, int present, int frf,
         if (ac4_u(b, 3) == 7)
             ac4_u(b, 2);
     }
-    if (cm >= 7 && cm <= 10)
+    if (cm >= 7 && cm <= 10)            /* 0b1111010 .. 0b1111101 */
         ac4_bit(b);                     /* add_ch_base */
     for (i = 0; i < frf; i++)
         ac4_bit(b);                     /* b_audio_ndot */
@@ -229,7 +237,7 @@ static void substream_group_info(ac4_bits *b, int frf, ac4_toc *t)
     }
     if (ac4_bit(b)) {                   /* b_channel_coded */
         for (i = 0; i < n_lf; i++) {
-            substream_info_chan(b, present, frf, t);
+            ac4_toc_substream_info_chan(b, present, frf, t);
             if (hsf && present) {
                 if (ac4_u(b, 2) == 3)
                     ac4_vb(b, 2);

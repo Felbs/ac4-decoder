@@ -48,7 +48,14 @@ from .toc_v1 import CH_MODE_NAME                             # noqa: E402
 
 
 def channel_mode(b):
-    """Table 79 -- part 1's code extended to 8- and 9-bit forms."""
+    """channel_mode -> ch_mode, TS 103 190-2 table 56 (presentation_version
+    1; part 1's table 88 is the 7-bit subset).
+
+    The prefix code: 0 / 10 / 1100..1110 / 1111000..1111101 (ch_mode
+    5..10) / 11111100, 11111101 (7.0.4, 7.1.4: ch_mode 11, 12) /
+    111111100..111111110 (9.0.4, 9.1.4, 22.2: 13..15) / 111111111 followed
+    by variable_bits(2) (reserved, ch_mode 16 and up). A 7-bit 1111110 is
+    NOT a code: it is the start of the two 8-bit ones."""
     if b.u(1) == 0:
         return 0
     if b.u(1) == 0:
@@ -57,14 +64,23 @@ def channel_mode(b):
     if two != 0b11:
         return {0b00: 2, 0b01: 3, 0b10: 4}[two]
     tail = b.u(3)                         # past '1111'
-    if tail != 0b111:
-        return 5 + tail                   # 1111000..1111110 -> 5..11
-    # '1111111' -- part 2 extends with one or two more bits
-    if b.u(1) == 0:
-        return 12                         # 0b11111110
-    if b.u(1) == 0:
-        return 13                         # 0b111111110
-    return 14 + b.vb(2)                   # 0b111111111 escape
+    if tail <= 0b101:
+        return 5 + tail                   # 1111000..1111101 -> 5..10
+    if tail == 0b110:
+        return 11 + b.u(1)                # 11111100, 11111101 -> 11, 12
+    last = b.u(2)                         # past '1111111'
+    if last != 0b11:
+        return 13 + last                  # 111111100..111111110 -> 13..15
+    return 16 + b.vb(2)                   # 0b111111111 + variable_bits(2)
+
+
+# ch_mode of the channel_mode codes 0b11111100, 0b11111101, 0b111111100
+# and 0b111111101 (7.0.4, 7.1.4, 9.0.4, 9.1.4): ac4_substream_info_chan
+# reads b_4_back_channels_present, b_centre_present and
+# top_channels_present for them (TS 103 190-2 6.2.1.8)
+CH_MODES_WITH_TOP = (11, 12, 13, 14)
+# ch_mode of 0b1111010..0b1111101 (7.0/7.1 5/2/0 and 3/2/2): add_ch_base
+CH_MODES_WITH_ADD_CH_BASE = (7, 8, 9, 10)
 
 
 def content_type(b):
@@ -190,17 +206,19 @@ def presentation_v1_info(b, fri, st):
 def substream_info_chan(b, present, frf, st):
     cm = channel_mode(b)
     st["channel_modes"].append(cm)
-    if cm in (0b11111100, 0b11111101, 0b111111100, 0b111111101):
-        b.u(1)
-        b.u(1)
-        b.u(2)
+    # the spec compares the channel_mode CODE with these bit patterns;
+    # channel_mode() returns ch_mode, so compare with their ch_mode
+    if cm in CH_MODES_WITH_TOP:
+        b.u(1)                            # b_4_back_channels_present
+        b.u(1)                            # b_centre_present
+        b.u(2)                            # top_channels_present
     if st["fs_index"] == 1:
         if b.u(1):                        # b_sf_multiplier
             b.u(1)
     if b.u(1):                            # b_bitrate_info
         if b.u(3) == 0b111:
             b.u(2)
-    if cm in (7, 8, 9, 10):               # ch_mode indices for 5/2/0 and 3/2/2
+    if cm in CH_MODES_WITH_ADD_CH_BASE:   # 7.0/7.1 5/2/0 and 3/2/2
         b.u(1)                            # add_ch_base
     for _ in range(frf):
         st["ndot_bits"].append(b.p)

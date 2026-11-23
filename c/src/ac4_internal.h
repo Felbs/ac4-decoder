@@ -160,6 +160,11 @@ typedef struct {
 /* Parse the TOC (TS 103 190-2 6.2.1, bitstream_version >= 2). Raises
    AC4E_TOC_PARSE through b->jb. */
 void ac4_toc_parse(ac4_bits *b, ac4_toc *t);
+/* channel_mode -> ch_mode (TS 103 190-2 table 56), and
+   ac4_substream_info_chan (6.2.1.8); exposed for the unit tests */
+long ac4_toc_channel_mode(ac4_bits *b);
+void ac4_toc_substream_info_chan(ac4_bits *b, int present, int frf,
+                                 ac4_toc *t);
 
 /* ------------------------------------------------------------ ASF */
 #define AC4_MAX_WIN 17

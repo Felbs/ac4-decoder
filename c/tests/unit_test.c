@@ -10,7 +10,9 @@
  *   and A-CPL codebook builds and round-trips; the QMF bank (through the
  *   A-SPX pair renderer with no A-SPX data) reconstructs its input 577
  *   samples late, with a negative control; the A-SPX tables obey the
- *   structural rules of clause 5.7.6.3.1.
+ *   structural rules of clause 5.7.6.3.1; channel_mode decodes every code
+ *   of TS 103 190-2 table 56 and ac4_substream_info_chan reads the
+ *   top-channel fields of 7.0.4 .. 9.1.4.
  *
  *   tests/unit_test --dump-aspx   prints the A-SPX tables for every
  *   aspx_config (c/tests/check_aspx_tables.py compares them with the
@@ -394,6 +396,66 @@ static void test_resampler(void)
     ac4_rs_filter_free(f);
 }
 
+/* TS 103 190-2 table 56 (channel_mode -> ch_mode) and the four
+   top-channel bits of ac4_substream_info_chan for 7.0.4 .. 9.1.4 */
+static int bits_from(const char *s, uint8_t *buf, size_t cap)
+{
+    size_t i, n = strlen(s);
+    memset(buf, 0, cap);
+    for (i = 0; i < n && i / 8 < cap; i++)
+        if (s[i] == '1')
+            buf[i / 8] |= (uint8_t)(0x80 >> (i & 7));
+    return (int)n;
+}
+
+static void test_channel_mode(void)
+{
+    static const struct { const char *code; long ch_mode; } T[] = {
+        {"0", 0}, {"10", 1}, {"1100", 2}, {"1101", 3}, {"1110", 4},
+        {"1111000", 5}, {"1111001", 6}, {"1111010", 7}, {"1111011", 8},
+        {"1111100", 9}, {"1111101", 10}, {"11111100", 11},
+        {"11111101", 12}, {"111111100", 13}, {"111111101", 14},
+        {"111111110", 15}, {"111111111" "000", 16},
+        {"111111111" "011" "100", 26},
+    };
+    uint8_t buf[8];
+    jmp_buf jb;
+    size_t i;
+    for (i = 0; i < sizeof(T) / sizeof(T[0]); i++) {
+        ac4_bits b;
+        int n = bits_from(T[i].code, buf, sizeof(buf));
+        long cm;
+        b.d = buf;
+        b.nbits = 64;
+        b.p = 0;
+        b.jb = &jb;
+        b.eof_code = AC4E_TOC_PARSE;
+        if (setjmp(jb)) {
+            CHECK(0, "channel_mode %s raised", T[i].code);
+            continue;
+        }
+        cm = ac4_toc_channel_mode(&b);
+        CHECK(cm == T[i].ch_mode && (int)b.p == n,
+              "channel_mode %s -> %ld after %d bits (want %ld, %d)",
+              T[i].code, cm, (int)b.p, T[i].ch_mode, n);
+        if (T[i].ch_mode >= 11 && T[i].ch_mode <= 14) {
+            /* code, 4 top-channel bits, b_bitrate_info 1 + 010,
+               b_audio_ndot; fs_index 0, frame_rate_factor 1 */
+            char s[64];
+            ac4_toc t;
+            memset(&t, 0, sizeof(t));
+            snprintf(s, sizeof(s), "%s" "1011" "1010" "1", T[i].code);
+            n = bits_from(s, buf, sizeof(buf));
+            b.p = 0;
+            ac4_toc_substream_info_chan(&b, 0, 1, &t);
+            CHECK((int)b.p == n && t.n_cmodes == 1
+                  && t.cmodes[0] == T[i].ch_mode,
+                  "substream_info_chan %s ended at bit %d (want %d)",
+                  T[i].code, (int)b.p, n);
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--dump-aspx")) {
@@ -401,6 +463,7 @@ int main(int argc, char **argv)
         return 0;
     }
     test_bits();
+    test_channel_mode();
     test_huffman();
     test_aspx_books();
     test_sfb();
