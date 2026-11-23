@@ -53,11 +53,10 @@ def test_decodes_every_frame(cut):
 
 @pytest.mark.xfail(strict=False, reason=(
     "KNOWN, inherited unchanged from the original: on some streams the "
-    "output depends on where decode passes are cut -- audio before the "
-    "first A-SPX config is delayed 577 samples only when a later frame of "
-    "the SAME pass carries the config, and the last frame of a pass "
-    "differs from a one-pass decode in its last 1279 samples. Measured on "
-    "a 4 s cut of a stereo-pair stream; see README 'Known issues'."))
+    "output depends on where decode passes are cut -- the last frame of a "
+    "pass differs from a one-pass decode in its last 1279 samples (the "
+    "A-SPX lead-in is 4 frames, not the whole past). Measured on a 4 s cut "
+    "of a stereo-pair stream; see README 'Known issues'."))
 def test_output_is_independent_of_pass_size(cut):
     frames = mp4.read_frames(cut)
     element = probe_element(frames)
@@ -80,8 +79,14 @@ def test_cli_wav_length(cut, tmp_path):
 @pytest.mark.parametrize("max_pass", [1800, 40])
 def test_identical_to_reference_worker(cut, tmp_path, max_pass):
     """The copy changed nothing: the receiver's production audio worker
-    and this package's CLI write byte-identical PCM for the same input,
-    with one decode pass and with many."""
+    and this package's CLI wrote byte-identical PCM for the same input,
+    with one decode pass and with many. RETIRED: the fixes of 2026-11-23
+    change the output on purpose on every stream (every channel 577
+    samples late, the A-SPX noise index and limiter groups per the
+    standard, no HF patch before the first aspx_config), so this
+    comparison no longer applies; it is kept, skipped, for the record."""
+    pytest.skip("output differs from the original receiver on purpose "
+                "since the 2026-11-23 fixes (see README)")
     repo = CU.reference_repo()
     if not repo:
         pytest.skip("set AC4_REFERENCE_REPO to compare with the original")
