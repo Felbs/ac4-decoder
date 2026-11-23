@@ -20,7 +20,7 @@ A-CPL upmix (acpl.py) runs on the core pair's A-SPX output in the QMF
 domain and gives L, R, C, Ls, Rs; the LFE is decoded from its own
 mono_data. With channels=2 such a stream gives its stereo core.
 
-What it does NOT do: A-SPX on the centre channel,
+What it does NOT do:
 companding, DRC / dialogue / loudness metadata,
 presentation or substream choice (substream 1 is always decoded), frame
 rates other than 29.97 and sample rates other than 48 kHz.
@@ -45,6 +45,7 @@ import numpy as np
 from . import aspx_render as R37
 from . import filterbank as FB
 from . import robust as RB
+from . import stream as SC
 from .stream import Ac4Stream
 
 FRAME = 1536                # internal samples per frame (29.97 fps, 48 kHz)
@@ -145,13 +146,13 @@ class Decoder:
         self.stream = Ac4Stream(element=element, presentation=presentation,
                                 language=language)
         self.fb_state = {k: None for k in self.chans}
-        self.lead_pcm = {k: np.zeros(0) for k in ("L", "R", "Ls", "Rs")}
-        self.lead_groups = {"lr": [], "sr": []}
+        self.lead_pcm = {k: np.zeros(0) for k in ("L", "R", "Ls", "Rs", "C")}
+        self.lead_groups = {"lr": [], "sr": [], "c": []}
         # the last HF_DELAY core samples of every channel: the delay line
         # of the channels that do not go through the QMF bank
         self.core_tail = {k: np.zeros(HF_DELAY) for k in self.chans}
-        self.hf_state = {"lr": [None], "sr": [None]}
-        self.hf_hot = {"lr": 0, "sr": 0}
+        self.hf_state = {"lr": [None], "sr": [None], "c": [None]}
+        self.hf_hot = {"lr": 0, "sr": 0, "c": 0}
         self.n_burst = 0
         self.n_hf_fail = 0
         self.acpl3 = False
@@ -197,6 +198,8 @@ class Decoder:
             return gkey == "lr" and mode[1] == 1
         if gkey == "lr":
             return True
+        if gkey == "c" and not SC.CENTRE_ASPX:
+            return False
         return not (self.acpl3 or self.stream.acpl3) and len(self.chans) == 6
 
     def decode_pass(self, frames):
@@ -298,10 +301,14 @@ class Decoder:
         upmix = ((self.acpl3 or dec.acpl3) and "C" in chans
                  and self.element == "5_X")
         ga = grp.get("acpl") or [None] * len(grp["lr"])
-        for (ka, kb), gkey in ((("L", "R"), "lr"), (("Ls", "Rs"), "sr")):
+        for (ka, kb), gkey in ((("L", "R"), "lr"), (("Ls", "Rs"), "sr"),
+                               (("C", "C"), "c")):
+            # the centre (aspx_data_1ch) goes through the pair renderer as
+            # the same channel twice: with balance 0 each half is decoded
+            # alone, so either half is the mono rendering
             if ka not in chans:
                 continue
-            gl = grp[gkey]
+            gl = grp.get(gkey) or [None] * len(grp["lr"])
             if self._pair_capable(gkey):
                 lead = min(len(self.lead_pcm[ka]), LEAD * FRAME)
                 pa = np.concatenate([self.lead_pcm[ka][-lead:], pcm[ka]])

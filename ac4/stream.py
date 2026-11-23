@@ -39,6 +39,11 @@ from . import acpl_parse as AP                                      # noqa: E402
 # leaves its envelope state untouched (hold).
 CONCEALED = RB.CONCEALED
 
+# A-SPX on the centre channel of a 5_X element in codec mode 1 (its
+# aspx_data_1ch; TS 103 190-1 Table 25). False restores the old core-band
+# centre.
+CENTRE_ASPX = True
+
 
 class Ac4Stream:
     def __init__(self, element="5_X", presentation=None, language=None):
@@ -129,7 +134,7 @@ class Ac4Stream:
         # window lists do not align positionally when framings diverge
         # "acpl": per frame the A-CPL parameters of an ASPX_ACPL_3 frame
         # (acpl.render's frame dict), None without, CONCEALED
-        groups = {"lr": [], "sr": [], "acpl": []}
+        groups = {"lr": [], "sr": [], "c": [], "acpl": []}
         self.status = []
         self.seq_break = []
         pending = []            # frames decoded before any aspx_config
@@ -230,7 +235,7 @@ class Ac4Stream:
                 # A-SPX: Table 25 / Table 22 put the A-SPX blocks right after
                 # the channel data; parse them all (the 5_X element: L/R,
                 # Ls/Rs and the centre) so the frame closes on audio_size
-                aspx_lr = aspx_sr = None
+                aspx_lr = aspx_sr = aspx_c = None
                 got_acpl = None
                 end = r["bits"]
                 acpl3 = bool(r.get("acpl3"))
@@ -249,9 +254,9 @@ class Ac4Stream:
                             aspx_sr = P.aspx_data(b, self.tabs, t, cfg,
                                                   self.nats, ifr, True,
                                                   self.fstate, 1)
-                            P.aspx_data(b, self.tabs, t, cfg,
-                                        self.nats, ifr, False,
-                                        self.fstate, 2)
+                            aspx_c = P.aspx_data(b, self.tabs, t, cfg,
+                                                 self.nats, ifr, False,
+                                                 self.fstate, 2)
                     except Exception as e:                     # noqa: BLE001
                         if on:
                             raise RB.Damaged("aspx.parse", str(e)[:60]) \
@@ -375,6 +380,26 @@ class Ac4Stream:
                     u[k], seq_l[k] = R.ungroup(pk[k], fm[k])
                 got_lr = aspx_lr
                 got_sr = aspx_sr if "Ls" in pk else None
+                # the centre's aspx_data_1ch, as a "pair" of the same
+                # channel twice (decoder.py renders it with the pair
+                # renderer; with balance 0 each half decodes alone)
+                got_c = ([aspx_c[0], aspx_c[0]]
+                         if aspx_c and "C" in pk and CENTRE_ASPX else None)
+                # companding_control (TS 103 190-1 Table 212 gives its
+                # channel order: L, R, C, Ls, Rs for 5_X codec mode 1; L, R
+                # for a channel pair and ASPX_ACPL_3): each A-SPX channel
+                # block carries its own flag
+                comp = r.get("compand")
+                if comp is not None:
+                    sync, on, avg = comp
+                    flag = (lambda i: on[0] if sync else
+                            (on[i] if i < len(on) else 0))
+                    for grp, idx in ((got_lr, (0, 1)), (got_sr, (3, 4)),
+                                     (got_c, (2, 2))):
+                        if isinstance(grp, list):
+                            for ch, i in zip(grp, idx):
+                                ch["compand"] = dict(on=flag(i), avg=avg,
+                                                     sync=sync)
                 if not acpl3:
                     got_acpl = None
                 self.n_ok += 1
@@ -393,7 +418,7 @@ class Ac4Stream:
                 reason = RB.reason_of(e)
                 u = {k: [np.zeros(1536)] for k in chans}
                 seq_l = {k: [1536] for k in chans}
-                got_lr = got_sr = got_acpl = CONCEALED
+                got_lr = got_sr = got_c = got_acpl = CONCEALED
                 self.n_bad += 1
                 self.damage.add(reason)
                 self.status.append(reason)
@@ -418,6 +443,7 @@ class Ac4Stream:
                 counts[k].append(len(seq_l[k]))
             groups["lr"].append(got_lr)
             groups["sr"].append(got_sr)
+            groups["c"].append(got_c)
             groups["acpl"].append(got_acpl)
         if pending and self.cfg and RB.CHECKS:
             self._late_closure(pending, wins, lengths, counts, groups)
@@ -485,7 +511,8 @@ class Ac4Stream:
                 wins[k][p0:p0 + c] = [np.zeros(1536)]
                 lengths[k][p0:p0 + c] = [1536]
                 counts[k][fi] = 1
-            groups["lr"][fi] = groups["sr"][fi] = CONCEALED
+            groups["lr"][fi] = groups["sr"][fi] = groups["c"][fi] = \
+                CONCEALED
             if "acpl" in groups:
                 groups["acpl"][fi] = CONCEALED
             self.status[fi] = "audio_size.late"
