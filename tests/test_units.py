@@ -510,3 +510,46 @@ def test_all_channels_time_aligned(monkeypatch, with_cfg):
     for k in (L, R, Ls, Rs):
         err = k[s] - C[s]
         assert 10 * np.log10(np.sum(C[s] ** 2) / np.sum(err ** 2)) > 60
+
+
+def test_aspx_noise_index_runs_on_across_envelopes(monkeypatch):
+    """Pseudocode 103: noise_idx = noise_idx_prev + num_sb_aspx * (ts -
+    atsg_sig[0]) + sb + 1, ts counted from the frame's FIRST envelope. A
+    frame with two envelopes (A-SPX slots 0-4 and 4-8): with the signal
+    gain 0 and noise level 1, the high band is the noise table itself, and
+    its index must run on from the first envelope into the second, and on
+    into the next frame. Before the fix it restarted at every envelope."""
+    from ac4 import aspx_render as R37
+    from ac4 import aspx_env as V
+    from ac4 import aspx_envadj as E
+    from ac4 import qmf as Q
+    cfg, t = _aspx_cfg()
+    n_sb, sbx = t["num_sb_aspx"], t["sbx"]
+    got = [{"fr": {"borders": [0, 4, 8]}, "balance": 1},
+           {"fr": {"borders": [0, 4, 8]}, "balance": 1}]
+    zeros = lambda *a, **k: np.zeros((n_sb, 2))             # noqa: E731
+    monkeypatch.setattr(V, "reconstruct", lambda d, t, m, p: (None, p))
+    monkeypatch.setattr(E, "noise_qscf", lambda d, t, p: (None, p))
+    monkeypatch.setattr(E, "map_scf_joint",
+                        lambda *a: (np.zeros((n_sb, 2)), np.zeros((n_sb, 2))))
+    monkeypatch.setattr(E, "map_noise_joint",
+                        lambda *a: (np.zeros((n_sb, 2)), np.zeros((n_sb, 2))))
+    monkeypatch.setattr(E, "estimate", zeros)
+    monkeypatch.setattr(E, "adjust", lambda *a: (np.zeros((n_sb, 2)),
+                                                 np.ones((n_sb, 2))))
+    seen = []
+    real = Q.synthesise
+    monkeypatch.setattr(Q, "synthesise",
+                        lambda Qm, *a: (seen.append(Qm.copy()),
+                                        real(Qm, *a))[1])
+    x = np.zeros(4 * 1536)
+    R37.apply_hf_pair(x, x, [None, got, got, None], cfg)
+    nt = E.noise_table()
+    Qh = seen[0]
+    # frame 1: slots 24 + 4 .. 24 + 4 + 16; frame 2 continues
+    for f in (1, 2):
+        t0 = 24 * f + R37.TS_OFFSET
+        for ts in range(t0, t0 + 16):
+            idx = (n_sb * 16 * (f - 1) + n_sb * (ts - t0)
+                   + np.arange(n_sb) + 1) % 512
+            assert np.allclose(Qh[sbx:sbx + n_sb, ts], nt[idx]), (f, ts)

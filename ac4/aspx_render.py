@@ -219,6 +219,7 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None):
                 ok = False
                 break
             g, nl = E.adjust(Qh[k], t, sig, est, lim, ns[:, :est.shape[1]])
+            t0 = slot + int(bd[0]) * 2 + TS_OFFSET     # atsg_sig[0], slots
             for e in range(est.shape[1]):
                 ta = slot + int(bd[e]) * 2 + TS_OFFSET
                 tz = slot + int(bd[e + 1]) * 2 + TS_OFFSET
@@ -226,9 +227,13 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None):
                 if tz <= ta:
                     continue
                 Qh[k][sbx:sbx + n_sb, ta:tz] *= g[:, e:e + 1]
-                base = idx_noise if k == "L" else idx_noise
+                # Pseudocode 103: noise_idx(sb, ts) = noise_idx_prev
+                # + num_sb_aspx * (ts - atsg_sig[0]) + sb + 1 -- counted
+                # from the start of the frame's first envelope, so the
+                # envelopes of one frame take successive noise samples
                 for ts in range(ta, tz):
-                    kk = (base + n_sb * (ts - ta) + np.arange(n_sb) + 1) % 512
+                    kk = (idx_noise + n_sb * (ts - t0) + np.arange(n_sb)
+                          + 1) % 512
                     Qh[k][sbx:sbx + n_sb, ts] += nl[:, e] * nt[kk]
         if ok:
             applied += 1

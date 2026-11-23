@@ -584,6 +584,7 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
     const ac4_aspx_chd *d0, *d1;
     const int *b0, *b1;
     int ne0, ne1, joint;
+    long long t0;
 
     if (!effective(f))
         return;
@@ -637,6 +638,9 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
         int ne = c ? ne1 : ne0;
         estimate(p, c, t, bd, ne, slot, nts, est);
         adjust(t, n_sb, ne, c ? sigB : sigA, est, c ? nsB : nsA, g, nl);
+        /* atsg_sig[0] in QMF slots: Pseudocode 103 counts the noise index
+           from the start of the frame's first envelope */
+        t0 = slot + (long long)bd[0] * 2 + TS_OFFSET;
         for (e = 0; e < ne; e++) {
             long long ta = slot + (long long)bd[e] * 2 + TS_OFFSET;
             long long tz = slot + (long long)bd[e + 1] * 2 + TS_OFFSET, ts;
@@ -658,7 +662,7 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
             for (ts = ta; ts < tz; ts++) {
                 double *qr = p->qre[c][QI(ts)], *qi = p->qim[c][QI(ts)];
                 long long base = (long long)p->idx_noise
-                                 + (long long)n_sb * (ts - ta);
+                                 + (long long)n_sb * (ts - t0);
                 for (k = 0; k < n_sb; k++) {
                     int kk = (int)((base + k + 1) % 512);
                     double lv = nl[k][e];
