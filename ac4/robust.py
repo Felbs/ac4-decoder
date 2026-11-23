@@ -421,7 +421,12 @@ class OutputGuard:
             seg = y[f * F:(f + 1) * F]
             ref = self.level()
             self.init *= self.INIT_RELEASE
-            near = bool(forced[max(0, f - self.NEAR):f + self.NEAR + 1].any())
+            # near damage: a frame concealed upstream within NEAR frames, or
+            # a frame this guard muted in the NEAR before it (every channel
+            # is 577 samples late, so a damaged frame's core still reaches
+            # into the second output frame after it)
+            near = bool(forced[max(0, f - self.NEAR):f + self.NEAR + 1].any()
+                        or fired[max(0, f - self.NEAR):f].any())
             if near:
                 loud = pk[f] > self.NEAR_RATIO * max(self.ref, self.floor)
             else:

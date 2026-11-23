@@ -129,6 +129,24 @@ def test_output_guard_mutes_a_burst_and_ramps():
         np.abs(y0[11 * FRAME:11 * FRAME + g.RAMP]).max()
 
 
+def test_output_guard_judges_the_frames_after_a_muted_frame_at_2x():
+    """Every channel is 577 samples late, so a damaged frame's core reaches
+    into the second output frame after it. A frame within 3 after one the
+    guard muted is judged like one near a concealed frame: at 2x the
+    stream level. Here frames 10-11 are far too loud (muted) and frame 12
+    peaks at 2.5x the stream: muted too (before: let through, under 3x)."""
+    rng = np.random.default_rng(2)
+    g = RB.OutputGuard(0.01)
+    y = np.clip(rng.standard_normal((40 * FRAME, 2)) * 0.2, -0.6, 0.6)
+    y[0, 0] = 1.0                               # the stream level, 1.0
+    for f in (10, 11, 30, 31):
+        y[f * FRAME + 50] = 50.0
+    y[12 * FRAME + 10] = 2.5
+    y[35 * FRAME + 10] = 1.5                    # within 2x: untouched
+    fired = g.process(y)
+    assert list(np.flatnonzero(fired)) == [10, 11, 12, 30, 31]
+
+
 def test_output_guard_does_not_lock_after_a_long_quiet_stretch():
     """Loud, then 6 minutes far quieter, then loud again: the return is
     programme, not damage (a guard that only releases slowly muted it for
