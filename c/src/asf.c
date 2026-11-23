@@ -519,56 +519,226 @@ static void chparam_info(ac4_bits *b, const ac4_books *bk,
     }
 }
 
-static void two_channel_data(ac4_bits *b, const ac4_books *bk, ac4_pair *p)
+/* Tables B.8 - B.19: max_sfb_master at the largest signalled transform
+   length -> the max_sfb of a block of another length */
+typedef struct {
+    int lmax, n_rows, n_cols, len[4];
+    uint8_t v[4][32];
+} msfb_master_t;
+
+static const msfb_master_t MSFB_MASTER[] = {
+    { 2048, 32, 4, { 1024, 512, 256, 128 },
+      {
+        { 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 11, 11, 12, 12,
+          13, 13, 14, 15, 15, 16, 17, 18, 19, 19, 20, 21 },
+        { 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+          9, 10, 10, 11, 12, 13, 14, 15, 16, 17 },
+        { 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4,
+          5, 5, 5, 6, 6, 7, 7, 8, 8, 8 },
+        { 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2,
+          3, 3, 3, 3, 3, 4, 4, 4, 5, 5 } } },
+    { 1024, 32, 3, { 512, 256, 128, 0 },
+      {
+        { 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15,
+          16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 },
+        { 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 7, 8, 8, 8,
+          9, 9, 10, 11, 11, 12, 12, 13, 13, 14 },
+        { 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5,
+          5, 6, 6, 6, 7, 7, 8, 8, 8, 9 } } },
+    { 512, 32, 2, { 256, 128, 0, 0 },
+      {
+        { 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10,
+          11, 11, 12, 12, 13, 13, 14, 15, 16, 17, 17 },
+        { 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 6, 6, 6, 6,
+          7, 7, 8, 8, 9, 9, 10, 10, 11, 12 } } },
+    { 256, 16, 1, { 128, 0, 0, 0 },
+      {
+        { 0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 6, 7, 8, 9, 9, 10 } } },
+    { 1920, 32, 4, { 960, 480, 240, 120 },
+      {
+        { 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 11, 11, 12, 12,
+          13, 13, 14, 15, 15, 16, 17, 18, 19, 19, 20, 21 },
+        { 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+          9, 10, 10, 11, 12, 13, 14, 15, 16, 17 },
+        { 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4,
+          5, 5, 5, 6, 6, 7, 7, 8, 8, 8 },
+        { 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2,
+          3, 3, 3, 3, 3, 4, 4, 4, 5, 5 } } },
+    { 960, 32, 3, { 480, 240, 120, 0 },
+      {
+        { 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15,
+          16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 },
+        { 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 7, 8, 8, 8,
+          9, 9, 10, 11, 11, 12, 12, 13, 13, 14 },
+        { 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5,
+          5, 6, 6, 6, 7, 7, 8, 8, 8, 9 } } },
+    { 480, 32, 2, { 240, 120, 0, 0 },
+      {
+        { 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10,
+          11, 11, 12, 12, 13, 13, 14, 15, 16, 17, 17 },
+        { 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 6, 6, 6, 6,
+          7, 7, 8, 8, 9, 9, 10, 10, 11, 12 } } },
+    { 240, 16, 1, { 120, 0, 0, 0 },
+      {
+        { 0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 6, 7, 8, 9, 9, 10 } } },
+    { 1536, 32, 4, { 768, 384, 192, 96 },
+      {
+        { 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 11, 11, 12, 12,
+          13, 13, 14, 15, 15, 16, 17, 18, 19, 19, 20, 21 },
+        { 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+          9, 10, 10, 11, 12, 13, 14, 15, 16, 17 },
+        { 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4,
+          5, 5, 5, 6, 6, 7, 7, 8, 8, 8 },
+        { 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2,
+          3, 3, 3, 3, 3, 4, 4, 4, 5, 5 } } },
+    { 768, 32, 3, { 384, 192, 96, 0 },
+      {
+        { 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15,
+          16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 },
+        { 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 6, 7, 8, 8, 8,
+          9, 9, 10, 11, 11, 12, 12, 13, 13, 14 },
+        { 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5,
+          5, 6, 6, 6, 7, 7, 8, 8, 8, 9 } } },
+    { 384, 16, 2, { 192, 96, 0, 0 },
+      {
+        { 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8 },
+        { 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4 } } },
+    { 192, 8, 1, { 96, 0, 0, 0 },
+      {
+        { 0, 1, 1, 2, 2, 3, 3, 4 } } },
+};
+
+enum { K_L, K_R, K_C, K_LFE, K_LS, K_RS };   /* decoder.c CH_* */
+
+static ac4_stereo *new_st(ac4_bits *b, ac4_element *e)
 {
-    p->st.sap_mode = -1;
-    if (ac4_bit(b)) {                     /* b_enable_mdct_stereo_proc */
-        ac4_framing_parse(b, &p->fr[0], bk->fl);
-        chparam_info(b, bk, &p->fr[0], &p->st);
-        p->fr[1] = p->fr[0];
-    } else {
-        ac4_framing_parse(b, &p->fr[0], bk->fl);
-        ac4_framing_parse(b, &p->fr[1], bk->fl);
-    }
-    sf_data(b, bk, &p->fr[0], &p->ch[0]);
-    sf_data(b, bk, &p->fr[1], &p->ch[1]);
+    ac4_stereo *st;
+    if (e->n_st >= AC4_MAX_ST)
+        ac4_fail(b, AC4E_ELEMENT_PARSE);
+    st = &e->st[e->n_st++];
+    st->sap_mode = -1;
+    return st;
 }
 
-/* stereo_data (TS 103 190-1 Table 23): two_channel_data plus, without
-   MDCT stereo processing, a spec_frontend bit before each channel's
-   sf_info (1 = SSF, not supported) */
-static void stereo_data(ac4_bits *b, const ac4_books *bk, ac4_pair *p)
+static void track(ac4_bits *b, const ac4_books *bk, ac4_element *e, int k)
 {
-    p->st.sap_mode = -1;
+    sf_data(b, bk, &e->fr[k], &e->ch[k]);
+    e->has_ch[k] = 1;
+    e->order[e->n_order++] = k;
+}
+
+static void add_step(ac4_element *e, int kind, int matsel, int st0, int nk,
+                     const int *keys)
+{
+    int i, s = e->n_steps++;
+    e->steps[s].kind = kind;
+    e->steps[s].nk = nk;
+    e->steps[s].matsel = matsel;
+    e->steps[s].st0 = st0;
+    for (i = 0; i < nk; i++)
+        e->steps[s].key[i] = keys[i];
+}
+
+/* two_channel_data (Table 26) onto channels k0, k1; stereo_data (Table
+   23, spec_frontend bits without stereo processing) when sd */
+static void two_ch(ac4_bits *b, const ac4_books *bk, ac4_element *e,
+                   int k0, int k1, int sd)
+{
+    int st0 = e->n_st, keys[2];
+    ac4_stereo *st = new_st(b, e);
+    keys[0] = k0;
+    keys[1] = k1;
     if (ac4_bit(b)) {                     /* b_enable_mdct_stereo_proc */
-        ac4_framing_parse(b, &p->fr[0], bk->fl);
-        chparam_info(b, bk, &p->fr[0], &p->st);
-        p->fr[1] = p->fr[0];
+        ac4_framing_parse(b, &e->fr[k0], bk->fl);
+        chparam_info(b, bk, &e->fr[k0], st);
+        e->fr[k1] = e->fr[k0];
     } else {
-        if (ac4_bit(b) != 0)              /* spec_frontend_l: SSF */
+        if (sd && ac4_bit(b) != 0)        /* spec_frontend_l: SSF */
             ac4_fail(b, AC4E_ELEMENT_PARSE);
-        ac4_framing_parse(b, &p->fr[0], bk->fl);
-        if (ac4_bit(b) != 0)              /* spec_frontend_r: SSF */
+        ac4_framing_parse(b, &e->fr[k0], bk->fl);
+        if (sd && ac4_bit(b) != 0)        /* spec_frontend_r: SSF */
             ac4_fail(b, AC4E_ELEMENT_PARSE);
-        ac4_framing_parse(b, &p->fr[1], bk->fl);
+        ac4_framing_parse(b, &e->fr[k1], bk->fl);
     }
-    sf_data(b, bk, &p->fr[0], &p->ch[0]);
-    sf_data(b, bk, &p->fr[1], &p->ch[1]);
+    track(b, bk, e, k0);
+    track(b, bk, e, k1);
+    add_step(e, 2, 0, st0, 2, keys);
+}
+
+/* three / four / five_channel_data (Tables 27 - 32) onto keys[0..n-1] */
+static void n_ch(ac4_bits *b, const ac4_books *bk, ac4_element *e, int n,
+                 const int *keys)
+{
+    int i, st0 = e->n_st, matsel = 0;
+    ac4_framing_parse(b, &e->fr[keys[0]], bk->fl);
+    for (i = 1; i < n; i++)
+        e->fr[keys[i]] = e->fr[keys[0]];
+    if (n != 4) {
+        matsel = (int)ac4_u(b, 4);        /* chel_matsel */
+        if (matsel > 11)
+            ac4_fail(b, AC4E_CHEL_MATSEL);
+    }
+    for (i = 0; i < (n == 3 ? 2 : n); i++)
+        chparam_info(b, bk, &e->fr[keys[0]], new_st(b, e));
+    for (i = 0; i < n; i++)
+        track(b, bk, e, keys[i]);
+    add_step(e, n, matsel, st0, n, keys);
 }
 
 static void mono_data(ac4_bits *b, const ac4_books *bk, int lfe,
-                      ac4_mono *m)
+                      ac4_element *e, int k)
 {
     if (lfe) {
-        framing_lfe(b, &m->fr, bk->fl);
+        framing_lfe(b, &e->fr[k], bk->fl);
     } else {
         if (ac4_bit(b) != 0)              /* spec_frontend: SSF */
             ac4_fail(b, AC4E_ELEMENT_PARSE);
-        ac4_framing_parse(b, &m->fr, bk->fl);
+        ac4_framing_parse(b, &e->fr[k], bk->fl);
     }
-    sf_data(b, bk, &m->fr, &m->ch);
+    track(b, bk, e, k);
 }
 
+/* the framing of a max_sfb_master track (4.3.5.13): src's transform
+   lengths and grouping, each block's max_sfb from max_sfb_master (Tables
+   B.8 - B.19) */
+static void master_framing(ac4_bits *b, const ac4_framing *src,
+                           ac4_framing *f, int master, int lmax)
+{
+    const msfb_master_t *t = NULL;
+    int i, h, nh = src->different ? 2 : 1;
+    *f = *src;
+    for (i = 0; i < (int)(sizeof(MSFB_MASTER) / sizeof(MSFB_MASTER[0]));
+         i++)
+        if (MSFB_MASTER[i].lmax == lmax)
+            t = &MSFB_MASTER[i];
+    f->n_max_sfb_side = nh;
+    for (h = 0; h < nh; h++) {
+        int len = src->lens[h], m = -1;
+        if (len == lmax) {
+            m = master;
+        } else if (t) {
+            for (i = 0; i < t->n_cols; i++)
+                if (t->len[i] == len && master < t->n_rows)
+                    m = t->v[i][master];
+        }
+        if (m < 0)
+            ac4_fail(b, AC4E_MAX_SFB);
+        if (m > sfb_for(len)->num_sfb)
+            ac4_fail(b, AC4E_MAX_SFB);
+        f->max_sfb_side[h] = m;
+    }
+    f->side = 1;
+    framing_derive(f);
+}
+
+static int largest_len(const ac4_framing *a, const ac4_framing *b)
+{
+    int m = a->lens[0];
+    if (a->lens[1] > m) m = a->lens[1];
+    if (b->lens[0] > m) m = b->lens[0];
+    if (b->lens[1] > m) m = b->lens[1];
+    return m;
+}
 /* Table 49 (aspx_render: flags per channel, sync_flag, b_compand_avg) */
 static void companding_control(ac4_bits *b, int num_chan, ac4_element *e)
 {
@@ -648,15 +818,26 @@ static void set_blocks(ac4_element *e, int n, int g0, int t0, int g1,
     e->blk_two[2] = t2;
 }
 
-void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
-                  ac4_element *e)
+static void element_reset(ac4_element *e)
 {
+    int k;
     e->acpl3 = 0;
     e->acpl1 = AC4_ACPL1_NONE;
     e->n_acpl1 = 0;
     e->r_silent = 0;
     e->comp_present = 0;
     e->has_aspx_cfg = e->has_acpl_cfg = 0;
+    e->n_st = e->n_steps = e->n_side = e->n_order = 0;
+    for (k = 0; k < AC4_NCH; k++)
+        e->has_ch[k] = 0;
+}
+
+/* 5_X_channel_element (Table 25): every codec mode and coding_config;
+   the track to channel mapping of Tables 180 / 181 */
+void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                  ac4_element *e)
+{
+    element_reset(e);
     audio_size(b, e);
     e->mode = (int)ac4_u(b, 3);
     if (e->mode == 4) {                   /* ASPX_ACPL_3: stereo core */
@@ -666,60 +847,107 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
             acpl_config_2ch(b, &e->acpl_cfg);   /* Table 60 */
             e->has_aspx_cfg = e->has_acpl_cfg = 1;
         }
-        mono_data(b, bk, 1, &e->lfe);
+        mono_data(b, bk, 1, e, K_LFE);
         companding_control(b, 2, e);
-        stereo_data(b, bk, &e->lr);
+        two_ch(b, bk, e, K_L, K_R, 1);    /* stereo_data */
         set_blocks(e, 1, 0, 1, 0, 0, 0, 0);
         e->bits_end = b->p;
         return;
     }
     if (e->mode == 2 || e->mode == 3) {   /* ASPX_ACPL_1 / _2 */
+        int cc;
         e->acpl1 = AC4_ACPL1_5X;
         if (b_iframe) {
             aspx_config(b, &e->aspx_cfg);
             acpl_config_1ch(b, e->mode == 2, &e->acpl1_cfg);
             e->has_aspx_cfg = e->has_acpl_cfg = 1;
         }
-        mono_data(b, bk, 1, &e->lfe);
+        mono_data(b, bk, 1, e, K_LFE);
         companding_control(b, 3, e);
-        if (ac4_bit(b))                   /* coding_config 1: not built */
-            ac4_fail(b, AC4E_ELEMENT_PARSE);
-        two_channel_data(b, bk, &e->lr);  /* A, B (Table 181) */
-        if (e->mode == 2)                 /* the residuals: not built */
-            ac4_fail(b, AC4E_ELEMENT_PARSE);
-        mono_data(b, bk, 0, &e->c);
+        cc = (int)ac4_bit(b);             /* coding_config */
+        if (cc) {
+            static const int K3[3] = { K_L, K_R, K_C };
+            n_ch(b, bk, e, 3, K3);        /* A, B, C (Table 181) */
+        } else {
+            two_ch(b, bk, e, K_L, K_R, 0);    /* A, B */
+        }
+        if (e->mode == 2) {
+            /* max_sfb_master, chparam_info x 2, sf_data x 2: the side
+               tracks of A and B (5.3.4.3.2), read with A's / B's framing;
+               their chparam_info with A's / B's max_sfb */
+            int lmax = largest_len(&e->fr[K_L], &e->fr[K_R]), master, s0;
+            master = (int)ac4_u(b, n_side_bits(lmax));
+            s0 = e->n_st;
+            chparam_info(b, bk, &e->fr[K_L], new_st(b, e));
+            chparam_info(b, bk, &e->fr[K_R], new_st(b, e));
+            master_framing(b, &e->fr[K_L], &e->fr[K_LS], master, lmax);
+            master_framing(b, &e->fr[K_R], &e->fr[K_RS], master, lmax);
+            track(b, bk, e, K_LS);
+            track(b, bk, e, K_RS);
+            e->n_side = 2;
+            e->side[0].ka = K_L;
+            e->side[0].kb = K_LS;
+            e->side[0].st = s0;
+            e->side[1].ka = K_R;
+            e->side[1].kb = K_RS;
+            e->side[1].st = s0 + 1;
+        }
+        if (!cc)
+            mono_data(b, bk, 0, e, K_C);
         set_blocks(e, 2, 0, 1, 2, 0, 0, 0);
         e->n_acpl1 = 2;
         e->bits_end = b->p;
         return;
     }
-    if (e->mode != 1)
+    if (e->mode > 1)
         ac4_fail(b, AC4E_ELEMENT_PARSE);
-    if (b_iframe) {
+    if (b_iframe && e->mode == 1) {
         aspx_config(b, &e->aspx_cfg);
         e->has_aspx_cfg = 1;
     }
-    mono_data(b, bk, 1, &e->lfe);
-    companding_control(b, 5, e);
-    if (ac4_u(b, 2) != 0)                 /* coding_config */
-        ac4_fail(b, AC4E_ELEMENT_PARSE);
-    ac4_bit(b);                           /* 2ch_mode */
-    two_channel_data(b, bk, &e->lr);
-    two_channel_data(b, bk, &e->sr);
-    mono_data(b, bk, 0, &e->c);
-    set_blocks(e, 3, 0, 1, 1, 1, 2, 0);
+    mono_data(b, bk, 1, e, K_LFE);
+    if (e->mode == 1)
+        companding_control(b, 5, e);
+    switch (ac4_u(b, 2)) {                /* coding_config */
+    case 0:
+        if (ac4_bit(b)) {                 /* 2ch_mode 1: (L, Ls), (R, Rs) */
+            two_ch(b, bk, e, K_L, K_LS, 0);
+            two_ch(b, bk, e, K_R, K_RS, 0);
+        } else {
+            two_ch(b, bk, e, K_L, K_R, 0);
+            two_ch(b, bk, e, K_LS, K_RS, 0);
+        }
+        mono_data(b, bk, 0, e, K_C);
+        break;
+    case 1: {
+        static const int K3[3] = { K_L, K_R, K_C };
+        n_ch(b, bk, e, 3, K3);
+        two_ch(b, bk, e, K_LS, K_RS, 0);
+        break;
+    }
+    case 2: {
+        static const int K4[4] = { K_L, K_R, K_LS, K_RS };
+        n_ch(b, bk, e, 4, K4);
+        mono_data(b, bk, 0, e, K_C);
+        break;
+    }
+    default: {
+        static const int K5[5] = { K_L, K_R, K_C, K_LS, K_RS };
+        n_ch(b, bk, e, 5, K5);
+        break;
+    }
+    }
+    if (e->mode == 1)
+        set_blocks(e, 3, 0, 1, 1, 1, 2, 0);
+    else
+        set_blocks(e, 0, 0, 0, 0, 0, 0, 0);
     e->bits_end = b->p;
 }
 
 void ac4_parse_pair(ac4_bits *b, const ac4_books *bk, int b_iframe,
                     ac4_element *e)
 {
-    e->acpl3 = 0;
-    e->acpl1 = AC4_ACPL1_NONE;
-    e->n_acpl1 = 0;
-    e->r_silent = 0;
-    e->comp_present = 0;
-    e->has_aspx_cfg = e->has_acpl_cfg = 0;
+    element_reset(e);
     audio_size(b, e);
     e->mode = (int)ac4_u(b, 2);           /* stereo_codec_mode */
     if (b_iframe && e->mode >= 1) {
@@ -735,38 +963,33 @@ void ac4_parse_pair(ac4_bits *b, const ac4_books *bk, int b_iframe,
     else if (e->mode >= 2)
         companding_control(b, 1, e);
     if (e->mode <= 1) {
-        stereo_data(b, bk, &e->lr);
+        two_ch(b, bk, e, K_L, K_R, 1);    /* stereo_data */
         set_blocks(e, e->mode == 1 ? 1 : 0, 0, 1, 0, 0, 0, 0);
     } else if (e->mode == 2) {
-        /* ASPX_ACPL_1 (Table 22): the "m" and "s" tracks */
-        ac4_pair *p = &e->lr;
-        p->st.sap_mode = -1;
+        /* ASPX_ACPL_1 (Table 22): the "m" and "s" tracks; their stereo
+           processing is done by the decoder (zero-padded, as the Python) */
+        ac4_stereo *st = new_st(b, e);
         if (ac4_bit(b)) {                 /* b_enable_mdct_stereo_proc */
-            ac4_framing_parse_ex(b, &p->fr[0], bk->fl, 1, 0);
-            chparam_info(b, bk, &p->fr[0], &p->st);
-            ac4_framing_side(&p->fr[0], &p->fr[1]);
+            ac4_framing_parse_ex(b, &e->fr[K_L], bk->fl, 1, 0);
+            chparam_info(b, bk, &e->fr[K_L], st);
+            ac4_framing_side(&e->fr[K_L], &e->fr[K_R]);
         } else {
             ac4_framing f;
             if (ac4_bit(b) != 0)          /* spec_frontend_m: SSF */
                 ac4_fail(b, AC4E_ELEMENT_PARSE);
-            ac4_framing_parse(b, &p->fr[0], bk->fl);
+            ac4_framing_parse(b, &e->fr[K_L], bk->fl);
             if (ac4_bit(b) != 0)          /* spec_frontend_s: SSF */
                 ac4_fail(b, AC4E_ELEMENT_PARSE);
             ac4_framing_parse_ex(b, &f, bk->fl, 0, 1);
-            ac4_framing_side(&f, &p->fr[1]);
+            ac4_framing_side(&f, &e->fr[K_R]);
         }
-        sf_data(b, bk, &p->fr[0], &p->ch[0]);
-        sf_data(b, bk, &p->fr[1], &p->ch[1]);
+        track(b, bk, e, K_L);
+        track(b, bk, e, K_R);
         set_blocks(e, 1, 0, 0, 0, 0, 0, 0);
         e->acpl1 = AC4_ACPL1_PAIR;
         e->n_acpl1 = 1;
     } else {                              /* ASPX_ACPL_2: one track */
-        ac4_mono m;
-        mono_data(b, bk, 0, &m);
-        e->lr.fr[0] = m.fr;
-        e->lr.ch[0] = m.ch;
-        e->lr.ch[0].fr = &e->lr.fr[0];
-        e->lr.st.sap_mode = -1;
+        mono_data(b, bk, 0, e, K_L);
         e->r_silent = 1;
         set_blocks(e, 1, 0, 0, 0, 0, 0, 0);
         e->acpl1 = AC4_ACPL1_PAIR;

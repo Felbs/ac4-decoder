@@ -46,6 +46,7 @@ enum {
     AC4E_TOC_PRESENTATION, /* toc.presentation (no decodable substream) */
     AC4E_TOC_UNSUPPORTED,  /* toc.unsupported_rate (rates.py) */
     AC4E_TRANSF_LEN,       /* asf.transf_length (Table 103: not defined) */
+    AC4E_CHEL_MATSEL,      /* asf.chel_matsel (reserved value) */
     AC4E_COUNT
 };
 const char *ac4_reason_name(int code);
@@ -308,6 +309,9 @@ typedef struct {                /* acpl_config_1ch(), Table 59 */
     int num_param_bands, param_band, qmf_band, quant_mode;
 } ac4_acpl1_cfg;
 
+#define AC4_NCH 6               /* L R C LFE Ls Rs */
+#define AC4_MAX_ST 9            /* chparam_info blocks of one element */
+
 /* The parsed element. */
 #define AC4_ACPL1_NONE 0
 #define AC4_ACPL1_5X 1          /* 5_X ASPX_ACPL_1 / _2 (two modules) */
@@ -329,9 +333,28 @@ typedef struct {
     int r_silent;               /* the pair's R not coded (ASPX_ACPL_2) */
     size_t audio_size, audio_start;
     size_t bits_end;            /* where the core parse ended */
-    ac4_mono lfe;
-    ac4_pair lr, sr;
-    ac4_mono c;
+    /* the tracks, by output channel (decoder.c CH_*: L R C LFE Ls Rs;
+       TS 103 190-1 5.3.4 maps tracks to channels): each channel's sf_data
+       and framing (ch[k].fr points into fr[]) */
+    ac4_framing fr[AC4_NCH];
+    ac4_chan ch[AC4_NCH];
+    int has_ch[AC4_NCH];
+    /* chparam_info blocks, in bitstream order */
+    ac4_stereo st[AC4_MAX_ST];
+    int n_st;
+    /* the processing of the channel data elements (5.3.3), in bitstream
+       order: kind 2 (two_channel_data / stereo_data), 3, 4, 5 (three /
+       four / five_channel_data, chel_matsel), on the channels key[] (the
+       track to channel mapping of Table 180 / 181), with the chparam_info
+       blocks st0 .. st0 + n - 1; on packed spectra (one framing) */
+    int n_steps;
+    struct { int kind, nk, matsel, st0, key[5]; } steps[2];
+    /* ASPX_ACPL_1 in 5_X (5.3.4.3.2): (A, side track) pairs, per window */
+    int n_side;
+    struct { int ka, kb, st; } side[2];
+    /* the sf_data blocks in bitstream order (the noise fill runs through
+       them) */
+    int order[AC4_NCH], n_order;
 } ac4_element;
 
 /* Element parse: 5_X (codec modes 1 and 4) and channel_pair_element
@@ -649,6 +672,14 @@ void ac4_framing_parse(ac4_bits *b, ac4_framing *f, int fl);
 void ac4_framing_parse_ex(ac4_bits *b, ac4_framing *f, int fl,
                           int dual_maxsfb, int side_limited);
 void ac4_framing_side(const ac4_framing *src, ac4_framing *f);
+/* 5.3.3.3 - 5.3.3.5: the matrix of a three / four / five_channel_data
+   element (kind 3, 4, 5) on packed spectra sharing framing f */
+void ac4_matrix(double **tr, int n, int kind, int matsel,
+                const ac4_stereo *st, const ac4_framing *f);
+/* the stereo operation per window (after ungrouping; f the framing the
+   chparam_info was read with) */
+void ac4_unmix_windows(double *wa, double *wb, const int *lens, int nwin,
+                       const ac4_stereo *st, const ac4_framing *f);
 void ac4_unmix(double *m, double *s, int n, const ac4_stereo *st,
                const ac4_framing *fr);
 /* Packed -> per-window spectra. win[w] (w < num_windows) must hold at

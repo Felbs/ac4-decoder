@@ -34,6 +34,7 @@ from . import aspx_render as R37                                      # noqa: E4
 from . import robust as RB                                          # noqa: E402
 from . import acpl_parse as AP                                      # noqa: E402
 from . import rates as RT                                           # noqa: E402
+from . import multichannel as MC                                    # noqa: E402
 
 # Marks a CONCEALED frame in the A-SPX group lists (where None means "no
 # A-SPX data for this frame"). The renderer mutes the high band for it and
@@ -372,9 +373,10 @@ class Ac4Stream:
                 # pair, Ls / Rs of a 5_X element; 5.3.4.1, Table 181): one
                 # silent long block each
                 silent = [k for k in ("R", "Ls", "Rs")
-                          if k in chans and r.get(k, 0) is None
-                          or (acpl1 == "5_X" and k in ("Ls", "Rs")
-                              and k in chans)]
+                          if k in chans and (
+                              r.get(k, 0) is None
+                              or (acpl1 == "5_X" and k in ("Ls", "Rs")
+                                  and r.get(k) is None))]
                 # ASPX_ACPL_3 (E77) carries the 5.1 programme as a TWO-channel
                 # core plus A-CPL; Ls/Rs/C do not exist as coded channels, so
                 # this frame has only a pair to give no matter what `chans`
@@ -396,8 +398,9 @@ class Ac4Stream:
                         if k not in chans:
                             wins.pop(k); lengths.pop(k); counts.pop(k)
                 elif acpl1 == "5_X":
-                    fm.update({"C": r["C"]["framing"],
-                               "lfe": r["lfe"]["framing"]})
+                    fm.update({k: r[k]["framing"]
+                               for k in ("C", "lfe", "Ls", "Rs")
+                               if r.get(k) is not None})
                 elif self.element != "pair":
                     fm.update({"Ls": r["Ls"]["framing"],
                                "Rs": r["Rs"]["framing"],
@@ -407,10 +410,19 @@ class Ac4Stream:
                                           else ("acpl3" if acpl3
                                                 else ("acpl12" if acpl1
                                                       else "5_X"))]
-                order = tuple(k for k in order if r.get(k) is not None)
+                order = tuple(k for k in r.get("order", order)
+                              if r.get(k) is not None)
+                # the tracks to dequantise: the channels asked for, and
+                # every track a processing step mixes into one of them
+                need = set(chans)
+                for keys in ([kk for kk, _s in r.get("steps") or ()]
+                             + [kk for kk, _s, _f in r.get("side_steps")
+                                or ()]):
+                    if need & set(keys):
+                        need |= set(keys)
                 pk = {}
                 for k in order:
-                    if k in chans:
+                    if k in need:
                         pk[k] = R.packed_spectrum(r[k], fm[k], rng)
                     else:           # not rendered: the generator runs on
                         R.noise_fill(None, r[k], r[k]["framing"], rng)
@@ -449,23 +461,36 @@ class Ac4Stream:
                 if self.toc_shape is None:
                     self.toc_shape = RB.toc_shape(st)
                 self.mode = r["mode"]
-                if "L" in pk and "R" in pk:
+                if r.get("steps") is not None:
+                    # the channel data elements' processing (5.3.3) and
+                    # the track to channel mapping (5.3.4, in the keys)
+                    for keys, step in r["steps"]:
+                        MC.apply_step(pk, keys, step)
+                elif "L" in pk and "R" in pk:
                     a, c = pk["L"], pk["R"]
                     if len(a) != len(c):        # max_sfb_side (ASPX_ACPL_1)
                         n = max(len(a), len(c))
                         a = np.concatenate([a, np.zeros(n - len(a))])
                         c = np.concatenate([c, np.zeros(n - len(c))])
                     pk["L"], pk["R"] = R.unmix(a, c, r["st_lr"], fm["L"])
-                if "Ls" in pk:
+                if "Ls" in pk and r.get("steps") is None:
                     pk["Ls"], pk["Rs"] = R.unmix(pk["Ls"], pk["Rs"],
                                                  r["st_sr"], fm["Ls"])
                 u, seq_l = {}, {}
                 fl_ = self.frame_len or RT.DEFAULT_FRAME
-                for k in chans:
+                side_keys = {k for kk, _s, _f in r.get("side_steps") or ()
+                             for k in kk if k in pk}
+                for k in list(chans) + sorted(side_keys - set(chans)):
                     if k in silent:
                         u[k], seq_l[k] = [np.zeros(fl_)], [fl_]
                     else:
                         u[k], seq_l[k] = R.ungroup(pk[k], fm[k])
+                # ASPX_ACPL_1 in 5_X: each side track with its A / B track
+                # (5.3.4.3.2), per window (their max_sfb differ)
+                for (ka, kb), st_, fr_ in r.get("side_steps") or ():
+                    if ka in u and kb in u and kb not in silent:
+                        u[ka], u[kb] = MC.unmix_windows(u[ka], u[kb], st_,
+                                                        fr_)
                 got_lr = aspx_lr
                 if acpl1 == "pair" and aspx_lr:
                     # the "m" track's aspx_data_1ch, rendered as the

@@ -890,8 +890,8 @@ static void test_stereo_data(void)
             continue;
         }
         ac4_parse_pair(&b, &bk, 0, &e);
-        CHECK((int)e.bits_end == P[i].end && e.lr.fr[0].is_long
-              && e.lr.fr[1].is_long,
+        CHECK((int)e.bits_end == P[i].end && e.fr[0].is_long
+              && e.fr[1].is_long,
               "stereo_data %d ended at %d (want %d)", i, (int)e.bits_end,
               P[i].end);
     }

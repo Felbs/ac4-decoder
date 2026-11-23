@@ -84,7 +84,7 @@ static const char *REASONS[AC4E_COUNT] = {
     "decoder.internal", "element.unknown", "seq.outlier", "aspx.config",
     "aspx.parse", "aspx.num_env", "aspx.borders", "acpl.parse",
     "audio_size.late", "guard.level", "aspx.level", "toc.presentation",
-    "toc.unsupported_rate", "asf.transf_length"
+    "toc.unsupported_rate", "asf.transf_length", "asf.chel_matsel"
 };
 
 const char *ac4_reason_name(int code)
@@ -573,21 +573,34 @@ static int silent_mask(const ac4_element *e, int mask)
     int m = 0;
     if (e->acpl1 == AC4_ACPL1_PAIR && e->r_silent)
         m = 1 << CH_R;
-    else if (e->acpl1 == AC4_ACPL1_5X)
-        m = (1 << CH_LS) | (1 << CH_RS);
+    else if (e->acpl1 == AC4_ACPL1_5X && !e->n_side)
+        m = (1 << CH_LS) | (1 << CH_RS);   /* ASPX_ACPL_2 */
     return m & mask;
 }
 
 static const ac4_chan *chan_src(const ac4_element *e, int k)
 {
-    switch (k) {
-    case CH_L: return &e->lr.ch[0];
-    case CH_R: return &e->lr.ch[1];
-    case CH_C: return &e->c.ch;
-    case CH_LFE: return &e->lfe.ch;
-    case CH_LS: return &e->sr.ch[0];
-    default: return &e->sr.ch[1];
+    return &e->ch[k];
+}
+
+/* the tracks to dequantise: the channels of the mask, and every track a
+   processing step (or an ASPX_ACPL_1 side step) mixes into one of them */
+static int need_mask(const ac4_element *e, int mask)
+{
+    int i, j, m = mask;
+    for (i = 0; i < e->n_steps; i++) {
+        int km = 0;
+        for (j = 0; j < e->steps[i].nk; j++)
+            km |= 1 << e->steps[i].key[j];
+        if (km & mask)
+            m |= km;
     }
+    for (i = 0; i < e->n_side; i++) {
+        int km = (1 << e->side[i].ka) | (1 << e->side[i].kb);
+        if (km & m)
+            m |= km;
+    }
+    return m;
 }
 
 /* ------------------------------------------------------------ state */
@@ -969,7 +982,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     ac4_acpl_qstate aq0 = d->aq;
     int aq10[2][2][AC4_ACPL_NB], aq1n0[2][2];
     int code = AC4E_NONE, k, ifr = 0, has_aspx, acpl3, acpl1, complete;
-    int silent;
+    int silent, need;
     size_t o, sub_len = 0;
     const uint8_t *sub = NULL;
     toc_shape sh;
@@ -1183,32 +1196,21 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     /* dequantise (with the level check) */
     r->mask = chan_mask(d, acpl3);
     silent = silent_mask(e, r->mask);
+    need = need_mask(e, r->mask) & ~silent;
     for (k = 0; k < 6; k++)
-        if ((r->mask & (1 << k)) && !(silent & (1 << k)))
+        if ((need & (1 << k)) && e->has_ch[k])
             d->spec_n[k] = ac4_packed_spectrum(chan_src(e, k), d->spec[k],
                                                &jb);
     /* spectral noise fill: one generator per frame, reset from
        sequence_counter, through the element's sf_data blocks in bitstream
-       order (pair: L R; 5_X: LFE L R Ls Rs C; ASPX_ACPL_3: LFE L R) */
+       order (e->order) */
     {
-        static const int ORDER_PAIR[] = { CH_L, CH_R };
-        static const int ORDER_5X[] = { CH_LFE, CH_L, CH_R, CH_LS, CH_RS,
-                                        CH_C };
-        static const int ORDER_A12[] = { CH_LFE, CH_L, CH_R, CH_C };
-        const int *ord = ORDER_5X;
-        int n_ord = acpl3 ? 3 : 6, i;
+        int i;
         ac4_snf_rng rng;
-        if (d->element == AC4DEC_ELEMENT_PAIR) {
-            ord = ORDER_PAIR;
-            n_ord = e->r_silent ? 1 : 2;
-        } else if (acpl1) {
-            ord = ORDER_A12;
-            n_ord = 4;
-        }
         ac4_snf_reset(&rng, t.sequence_counter);
-        for (i = 0; i < n_ord; i++) {
-            k = ord[i];
-            if (r->mask & (1 << k))
+        for (i = 0; i < e->n_order; i++) {
+            k = e->order[i];
+            if ((need & (1 << k)) && e->has_ch[k])
                 ac4_noise_fill(chan_src(e, k), d->spec[k], d->spec_n[k],
                                &rng, &jb);
             else
@@ -1269,29 +1271,53 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     /* stereo processing, ungroup (ASPX_ACPL_1's side track can be
        shorter (max_sfb_side): both are zero-padded to the longer, as the
        Python) */
-    if ((r->mask & 3) == 3 && !(silent & (1 << CH_R))) {
-        int nl = d->spec_n[CH_L], nr = d->spec_n[CH_R];
-        if (acpl1 == AC4_ACPL1_PAIR && nl != nr) {
-            int nm = nl > nr ? nl : nr;
-            for (k = nl; k < nm; k++)
-                d->spec[CH_L][k] = 0.0;
-            for (k = nr; k < nm; k++)
-                d->spec[CH_R][k] = 0.0;
-            d->spec_n[CH_L] = d->spec_n[CH_R] = nm;
-            nl = nr = nm;
+    if (acpl1 == AC4_ACPL1_PAIR) {
+        if ((r->mask & 3) == 3 && !(silent & (1 << CH_R))) {
+            int nl = d->spec_n[CH_L], nr = d->spec_n[CH_R];
+            if (nl != nr) {
+                int nm = nl > nr ? nl : nr;
+                for (k = nl; k < nm; k++)
+                    d->spec[CH_L][k] = 0.0;
+                for (k = nr; k < nm; k++)
+                    d->spec[CH_R][k] = 0.0;
+                d->spec_n[CH_L] = d->spec_n[CH_R] = nm;
+                nl = nr = nm;
+            }
+            ac4_unmix(d->spec[CH_L], d->spec[CH_R], nl, &e->st[0],
+                      &e->fr[CH_L]);
         }
-        ac4_unmix(d->spec[CH_L], d->spec[CH_R], nl < nr ? nl : nr,
-                  &e->lr.st, &e->lr.fr[0]);
+    } else {
+        /* the channel data elements' processing (5.3.3); the keys carry
+           the track to channel mapping (5.3.4) */
+        int i, j;
+        for (i = 0; i < e->n_steps; i++) {
+            double *tr[5];
+            int nk = e->steps[i].nk, n = 0, all = 1;
+            for (j = 0; j < nk; j++) {
+                k = e->steps[i].key[j];
+                if (!(need & (1 << k)))
+                    all = 0;
+                tr[j] = d->spec[k];
+                if (d->spec_n[k] > n)
+                    n = d->spec_n[k];
+            }
+            if (!all)
+                continue;
+            for (j = 0; j < nk; j++) {
+                int q;
+                k = e->steps[i].key[j];
+                for (q = d->spec_n[k]; q < n; q++)
+                    d->spec[k][q] = 0.0;
+                d->spec_n[k] = n;
+            }
+            ac4_matrix(tr, n, e->steps[i].kind, e->steps[i].matsel,
+                       &e->st[e->steps[i].st0], &e->fr[e->steps[i].key[0]]);
+        }
     }
-    if ((r->mask & 0x30) == 0x30)
-        ac4_unmix(d->spec[CH_LS], d->spec[CH_RS],
-                  d->spec_n[CH_LS] < d->spec_n[CH_RS] ? d->spec_n[CH_LS]
-                                                      : d->spec_n[CH_RS],
-                  &e->sr.st, &e->sr.fr[0]);
     for (k = 0; k < 6; k++) {
         const ac4_framing *fr;
         int w, sum = 0;
-        if (!(r->mask & (1 << k)))
+        if (!((r->mask | need) & (1 << k)))
             continue;
         if (silent & (1 << k)) {
             r->nwin[k] = 1;
@@ -1309,6 +1335,15 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
             code = AC4E_INTERNAL;
             goto fail;
         }
+    }
+    /* ASPX_ACPL_1 in 5_X (5.3.4.3.2): each side track with its A / B
+       track, per window (their max_sfb differ) */
+    for (k = 0; k < e->n_side; k++) {
+        int ka = e->side[k].ka, kb = e->side[k].kb;
+        if ((need & (1 << ka)) && (need & (1 << kb)))
+            ac4_unmix_windows(r->win + ka * FRAME, r->win + kb * FRAME,
+                              r->wlen[ka], r->nwin[ka], &e->st[e->side[k].st],
+                              &e->fr[ka]);
     }
     for (k = 0; k < NPAIR; k++)
         if (r->af[k].kind == AC4_GRP_DATA) {

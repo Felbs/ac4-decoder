@@ -93,7 +93,12 @@ class FrameWalker:
                 r = PAIR.decode_pair(sub, self.T, b_iframe=ifr)
             else:
                 r = C.decode_element(sub, self.T, b_iframe=ifr)
-            pairs = [r["st_lr"]] + ([r["st_sr"]] if "st_sr" in r else [])
+            if r.get("steps") is not None:
+                pairs = [st for _k, step in r["steps"]
+                         for st in step["st"]]
+            else:
+                pairs = [r["st_lr"]] + ([r["st_sr"]] if "st_sr" in r
+                                        else [])
             out["sap"] = [p["sap_mode"] for p in pairs]
             out["compand"] = r.get("compand")
             out["aspx_cfg"] = r.get("aspx")
@@ -114,17 +119,12 @@ class FrameWalker:
                 self.acpl_cfg = r["acpl_cfg"]
             b.p = r["bits"]
             mode = r.get("codec_mode")
-            if self.element == "pair":
-                blocks = [True] if mode == 1 else []
-            elif mode == 4:
-                blocks = [True]
-            else:
-                blocks = [True, True, False]
+            blocks = list(r.get("aspx_blocks", ()))
             if blocks and self.cfg is None:
                 out["status"] = "no_config"
                 return out
             t = R37.t_for(self.cfg) if blocks else None
-            for grp, two in enumerate(blocks):
+            for grp, two in blocks:
                 P.aspx_data(b, self.tabs, t, self.cfg, self.nats, ifr, two,
                             self.fstate, grp)
             if mode == 4 and self.element != "pair":

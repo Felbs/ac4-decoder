@@ -847,11 +847,16 @@ def _acpl3_core(b, T, b_iframe, sub):
 
 
 def _acpl12_5x(b, T, b_iframe, sub, codec_mode, has_lfe=True):
-    """5_X_codec_mode 2 / 3 = ASPX_ACPL_1 / ASPX_ACPL_2 (Table 25): a
-    three-track core (two_channel_data A, B and mono_data C, coding_config
-    0) plus, in ASPX_ACPL_1, two residual tracks; A-SPX on the A/B pair
-    and the centre; two acpl_data_1ch() (5.7.7.6.1)."""
+    """5_X_codec_mode 2 / 3 = ASPX_ACPL_1 / ASPX_ACPL_2 (Table 25): the
+    tracks A, B, C (two_channel_data and mono_data, coding_config 0, or
+    three_channel_data, coding_config 1; Table 181) plus, in ASPX_ACPL_1,
+    the two side tracks of A and B (max_sfb_master); A-SPX on the A/B pair
+    and the centre; two acpl_data_1ch() (5.7.7.6.1).
+
+    The keys: A -> "L", B -> "R"; the side tracks -> "Ls", "Rs" (after the
+    side processing of 5.3.4.3.2 they are the A-CPL modules' x3, x4)."""
     from .acpl_parse import acpl_config_1ch, PARTIAL, FULL
+    from . import multichannel as MC
     aspx = acpl = None
     if b_iframe:
         aspx = aspx_config(b)
@@ -859,27 +864,57 @@ def _acpl12_5x(b, T, b_iframe, sub, codec_mode, has_lfe=True):
     lfe = mono_data(b, T, b_lfe=True) if has_lfe else None
     comp = companding_control(b, 3)
     coding_config = b.u(1)
+    out = dict(lfe=lfe)
     if coding_config:
-        raise ValueError("ASPX_ACPL coding_config 1 (three_channel_data) "
-                         "not implemented")
-    l, r, st_lr = two_channel_data(b, T)            # A, B (Table 181)
+        tr, step = MC.three_channel_data(b, T)
+        out.update(L=tr[0], R=tr[1], C=tr[2])
+        steps = [(("L", "R", "C"), step)]
+        frs = [step["framing"]]
+        order = ["lfe", "L", "R", "C"]
+        st_lr = step["st"][0]
+    else:
+        l, r, st_lr = two_channel_data(b, T)        # A, B (Table 181)
+        out.update(L=l, R=r)
+        steps = [(("L", "R"), MC.two_channel_step(st_lr))]
+        frs = [l["framing"], r["framing"]]
+        order = ["lfe", "L", "R"]
+    side = None
     if codec_mode == 2:
-        raise ValueError("5_X ASPX_ACPL_1 residual tracks (max_sfb_master,"
-                         " Tables B.8-B.19) not implemented")
-    centre = mono_data(b, T, b_lfe=False)
-    return dict(lfe=lfe, L=l, R=r, C=centre, st_lr=st_lr, aspx=aspx,
-                acpl=acpl, acpl1="5_X", codec_mode=codec_mode, compand=comp,
-                bits=b.p, nbits=len(sub) * 8, coding_config=coding_config,
-                aspx_blocks=((0, True), (2, False)), acpl_blocks=2)
+        (sa, sta), (sb, stb), master = MC.residual_tracks(
+            b, T, out["L"]["framing"], out["R"]["framing"],
+            MC.largest_length(frs))
+        out.update(Ls=sa, Rs=sb)
+        order += ["Ls", "Rs"]
+        # 5.3.4.3.2: L = a0 A + b0 s3, Ls = c0 A + d0 s3 (R, Rs alike),
+        # on the per-window spectra (the side tracks have their own
+        # max_sfb, so their own packed layout)
+        side = [(("L", "Ls"), sta, out["L"]["framing"]),
+                (("R", "Rs"), stb, out["R"]["framing"])]
+    if coding_config == 0:
+        out["C"] = mono_data(b, T, b_lfe=False)
+        order.append("C")
+    out.update(st_lr=st_lr, aspx=aspx, acpl=acpl, acpl1="5_X",
+               codec_mode=codec_mode, compand=comp, bits=b.p,
+               nbits=len(sub) * 8, coding_config=coding_config,
+               steps=steps, side_steps=side, order=tuple(order),
+               aspx_blocks=((0, True), (2, False)), acpl_blocks=2)
+    return out
 
 
-def decode_element(sub, T, b_iframe=False):
-    """The whole 5.1 element.  -> dict of six channels + the bit position.
+def decode_element(sub, T, b_iframe=False, has_lfe=True):
+    """The whole 5_X element (Table 25).  -> dict of six channels + the bit
+    position.
 
     aspx_blocks: the (block group, two-channel) A-SPX blocks that follow
     the channel data, in bitstream order (group 0 the L/R pair, 1 Ls/Rs,
     2 the centre); acpl_blocks: how many acpl_data_1ch() follow them (the
-    ASPX_ACPL_3 acpl_data_2ch() is flagged by acpl3)."""
+    ASPX_ACPL_3 acpl_data_2ch() is flagged by acpl3).
+
+    steps: the processing of the channel data elements (clause 5.3.3), as
+    (channel keys, step) in bitstream order; the keys carry the track to
+    channel mapping of Table 180 (2ch_mode included); order: the sf_data
+    blocks in bitstream order (the noise fill runs through them)."""
+    from . import multichannel as MC
     b = Bits(sub)
     asz, a0 = audio_size(b)
     codec_mode = b.u(3)
@@ -889,28 +924,55 @@ def decode_element(sub, T, b_iframe=False):
                  aspx_blocks=((0, True),), acpl_blocks=0)
         return r
     if codec_mode in (2, 3):
-        r = _acpl12_5x(b, T, b_iframe, sub, codec_mode)
+        r = _acpl12_5x(b, T, b_iframe, sub, codec_mode, has_lfe)
         r.update(audio_size=asz, audio_start=a0, mode=("5_X", codec_mode))
         return r
-    if codec_mode != 1:
-        raise ValueError(f"5_X_codec_mode {codec_mode} is not ASPX")
-    aspx = aspx_config(b) if b_iframe else None
-    lfe = mono_data(b, T, b_lfe=True)
-    comp = companding_control(b, 5)
+    if codec_mode not in (0, 1):
+        raise Damaged("element.parse", f"5_X_codec_mode {codec_mode}")
+    aspx = aspx_config(b) if (b_iframe and codec_mode == 1) else None
+    lfe = mono_data(b, T, b_lfe=True) if has_lfe else None
+    comp = companding_control(b, 5) if codec_mode == 1 else None
     coding_config = b.u(2)
-    if coding_config != 0:
-        raise ValueError(f"coding_config {coding_config} not implemented")
-    b.u(1)                                           # 2ch_mode
-    l, r, st_lr = two_channel_data(b, T)            # L, R  (mid/side)
-    ls, rs, st_sr = two_channel_data(b, T)          # Ls, Rs
-    centre = mono_data(b, T, b_lfe=False)
-    return dict(lfe=lfe, L=l, R=r, Ls=ls, Rs=rs, C=centre,
-                st_lr=st_lr, st_sr=st_sr, aspx=aspx, codec_mode=codec_mode,
-                compand=comp,
-                bits=b.p, nbits=len(sub) * 8, coding_config=coding_config,
-                audio_size=asz, audio_start=a0, mode=("5_X", 1),
-                aspx_blocks=((0, True), (1, True), (2, False)),
-                acpl_blocks=0)
+    out = dict(lfe=lfe)
+    order = ["lfe"] if has_lfe else []
+    mode2ch = None
+    if coding_config == 0:
+        mode2ch = b.u(1)                             # 2ch_mode (Table 180)
+        k1, k2 = ((("L", "R"), ("Ls", "Rs")) if mode2ch == 0
+                  else (("L", "Ls"), ("R", "Rs")))
+        a, c, st1 = two_channel_data(b, T)
+        d, e, st2 = two_channel_data(b, T)
+        out.update({k1[0]: a, k1[1]: c, k2[0]: d, k2[1]: e})
+        out["C"] = mono_data(b, T, b_lfe=False)
+        steps = [(k1, MC.two_channel_step(st1)),
+                 (k2, MC.two_channel_step(st2))]
+        order += [*k1, *k2, "C"]
+    elif coding_config == 1:
+        tr, s3 = MC.three_channel_data(b, T)
+        d, e, st2 = two_channel_data(b, T)
+        out.update(L=tr[0], R=tr[1], C=tr[2], Ls=d, Rs=e)
+        steps = [(("L", "R", "C"), s3), (("Ls", "Rs"),
+                                         MC.two_channel_step(st2))]
+        order += ["L", "R", "C", "Ls", "Rs"]
+    elif coding_config == 2:
+        tr, s4 = MC.four_channel_data(b, T)
+        out.update(L=tr[0], R=tr[1], Ls=tr[2], Rs=tr[3])
+        out["C"] = mono_data(b, T, b_lfe=False)
+        steps = [(("L", "R", "Ls", "Rs"), s4)]
+        order += ["L", "R", "Ls", "Rs", "C"]
+    else:
+        tr, s5 = MC.five_channel_data(b, T)
+        out.update(L=tr[0], R=tr[1], C=tr[2], Ls=tr[3], Rs=tr[4])
+        steps = [(("L", "R", "C", "Ls", "Rs"), s5)]
+        order += ["L", "R", "C", "Ls", "Rs"]
+    out.update(aspx=aspx, codec_mode=codec_mode, compand=comp,
+               bits=b.p, nbits=len(sub) * 8, coding_config=coding_config,
+               two_ch_mode=mode2ch, steps=steps, order=tuple(order),
+               audio_size=asz, audio_start=a0, mode=("5_X", codec_mode),
+               aspx_blocks=(((0, True), (1, True), (2, False))
+                            if codec_mode == 1 else ()),
+               acpl_blocks=0)
+    return out
 
 
 def audio_size(b):

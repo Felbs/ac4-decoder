@@ -35,7 +35,7 @@ this repository.
 | Bitstream | version 2, channel-coded; every frame rate of TS 103 190-1 Table 83 at 48 kHz (frame lengths 2048 .. 384, internal rate resampled by the table's ratio) and 44,1 kHz (Table 84, index 13). frame_rate_factor / frame_rate_fraction above 1 and 96/192 kHz substreams are concealed (`toc.unsupported_rate`), not misdecoded. Checked on air at 29.97 fps and on public test streams at 25 and 29.97 fps; the other rates on synthetic streams only (unverified on real streams) |
 | Input | detected from the content: MP4 (fragmented: init segment + `moof`/`mdat` fragments, or bare fragments; or non-fragmented, from the sample table), AC-4 sync frames (TS 103 190-1 Annex G, CRC checked, ID3 tags skipped), MPEG-2 TS (ETSI TS 101 154). The `dac4` box is parsed (`--list`) |
 | Presentations | the table of contents is parsed in full (presentations, substream groups, substream indices, content type and language, object/A-JOC substream info); the decoded presentation is chosen per TS 103 190-2 4.8.2 (see Interpretations), or with `--presentation N`, `id:N`, `--language`; its audio substream is located by its `substream_index`, and is an I-frame when its own `b_audio_ndot` says so |
-| 5.1 (`5_X` channel element, coding_config 0) | codec mode 1 (A-SPX): all six channels. Codec mode 3 (ASPX_ACPL_2): all six channels, Ls/Rs from the one-channel A-CPL of L/R (the public 5.1 test streams). Codec mode 4 (ASPX_ACPL_3): all six channels, L/R/C/Ls/Rs from the A-CPL upmix of the two-channel core, the LFE from its own data (see A-CPL below). Codec mode 2 (ASPX_ACPL_1) is concealed (`element.parse`) |
+| 5.1 (`5_X` channel element) | codec mode 1 (A-SPX), coding_config 0: all six channels (both broadcasters). Codec mode 3 (ASPX_ACPL_2): all six channels, Ls/Rs from the one-channel A-CPL of L/R (the public 5.1 test streams). Codec mode 4 (ASPX_ACPL_3): all six channels, L/R/C/Ls/Rs from the A-CPL upmix of the two-channel core, the LFE from its own data (see A-CPL below). On synthetic streams only (unverified on real streams): codec mode 0 (SIMPLE); coding_config 0 with 2ch_mode 1 and coding_config 1 - 3 (three, four and five_channel_data, every chel_matsel; Tables 178 - 180); ASPX_ACPL_1 (codec mode 2: the two max_sfb_master side tracks, Tables B.8 - B.19, 5.3.4.3.2) and coding_config 1 of codec modes 2 and 3 |
 | Stereo (`channel_pair_element`) | stereo_codec_mode 0 (SIMPLE), 1 (A-SPX), 2 (ASPX_ACPL_1) and 3 (ASPX_ACPL_2); modes 2 and 3 on synthetic streams only (unverified on real streams) |
 | Core (ASF/MDCT) | Huffman spectral data, scale factors, long and short frames with block switching, KBD windows, stereo processing (sap_mode 1 and 2: M/S; sap_mode 3: full SAP with prediction coefficients, see below), spectral noise fill (clause 5.1.4, the standard's own noise generator; no capture here signals it), LFE |
 | A-SPX | parsed and rendered on the L/R and Ls/Rs pairs and the centre: 64-band complex QMF, envelope decoding (1.5 and 3 dB steps), HF generation with TNA and pre-flattening, envelope adjustment with the limiter, noise, additional harmonics (sinusoids), FIC/TIC (interleaved waveform coding), joint-balance rendering; companding (5.7.5) of the core |
@@ -348,6 +348,24 @@ Where TS 103 190-1 leaves room, these are the readings both decoders take
 (the A-SPX readings are under
 [Changes against the standard](#changes-against-the-standard)).
 
+**Phase B2**
+
+* **max_sfb_master side tracks** (ASPX_ACPL_1 in 5_X, Table 25; 4.3.5.13
+  names only the two sf_data elements): each side track takes the
+  transform lengths and window grouping of the track it is paired with
+  (A, B; with coding_config 1 the shared one of three_channel_data), and
+  each of the two chparam_info() is read with that track's own max_sfb, as
+  the channel_pair_element reads its chparam_info with max_sfb and not
+  max_sfb_side (Pseudocode 5, b_side_channel 0). The largest signalled
+  transform length (n_side_bits, Tables B.8 - B.19) is taken over the
+  sf_info of A and B. The side processing of 5.3.4.3.2 is applied per
+  transform window after ungrouping (the two tracks have different
+  max_sfb, so different packed layouts); the result is the same per tile.
+* **The matrices of Tables 178 and 179** are cascades of the 2 x 2 stereo
+  operation (one per chparam_info); `ac4/multichannel.py` builds them so,
+  and tests/test_phase_b2.py checks every chel_matsel of Table 178 and
+  five of Table 179 (and 5.3.3.4) entry by entry against the tables.
+
 **Phase A**
 
 * **The QMF tools' time grid: `TS_OFFSET` = 24 - `ts_offset_hfgen` = 18.**
@@ -553,8 +571,6 @@ are unchanged within the spread between runs.
 
 ## What it does not do yet
 
-* **ASPX_ACPL_1 in 5_X** (codec mode 2: residual coding in the 5_X
-  element) and **coding_config 1-3** of 5_X: concealed (`element.parse`).
 * **frame_rate_factor / frame_rate_fraction above 1** (high frame rates,
   efficient HFR) and 96/192 kHz substreams: concealed as
   `toc.unsupported_rate`.

@@ -302,3 +302,118 @@ void ac4_ungroup(const double *packed, int n, const ac4_framing *f,
         win += nw;
     }
 }
+
+/* ------------------------------------------- channel data elements */
+/* chel_matsel -> pair 0 inputs, pair 1 inputs, outputs O0..O2 (as
+   ac4/multichannel.py MATSEL3): 0..2 the input tracks, 3 P, 4 Q (pair
+   0's outputs), 5 R, 6 S (pair 1's) */
+enum { MP = 3, MQ = 4, MR = 5, MS = 6 };
+static const int MATSEL3[12][7] = {
+    { 0, 1, MP, 2, MR, MQ, MS }, { 1, 0, MP, 2, MQ, MR, MS },
+    { 0, 2, MP, 1, MR, MS, MQ }, { 1, 2, 0, MQ, MR, MP, MS },
+    { 0, 2, 1, MQ, MP, MR, MS }, { 2, 1, 0, MQ, MR, MS, MP },
+    { 1, 0, 2, MQ, MS, MP, MR }, { 0, 1, 2, MQ, MP, MS, MR },
+    { 2, 0, 1, MQ, MS, MR, MP }, { 2, 1, MP, 0, MS, MQ, MR },
+    { 2, 0, MP, 1, MQ, MS, MR }, { 1, 2, MP, 0, MS, MR, MQ },
+};
+
+/* the three-track matrix in place on tr[0..2] (Table 178): each pair
+   works in place, so a name is the buffer that holds it */
+static void matrix3(double **tr, int n, int matsel, const ac4_stereo *st,
+                    const ac4_framing *f, double *tmp)
+{
+    const int *m = MATSEL3[matsel];
+    double *buf[7];
+    int i;
+    buf[0] = tr[0];
+    buf[1] = tr[1];
+    buf[2] = tr[2];
+    ac4_unmix(buf[m[0]], buf[m[1]], n, &st[0], f);
+    buf[MP] = buf[m[0]];
+    buf[MQ] = buf[m[1]];
+    ac4_unmix(buf[m[2]], buf[m[3]], n, &st[1], f);
+    buf[MR] = buf[m[2]];
+    buf[MS] = buf[m[3]];
+    for (i = 0; i < 3; i++)
+        memcpy(tmp + (size_t)i * AC4_MAX_FRAME, buf[m[4 + i]],
+               sizeof(double) * (size_t)n);
+    for (i = 0; i < 3; i++)
+        memcpy(tr[i], tmp + (size_t)i * AC4_MAX_FRAME,
+               sizeof(double) * (size_t)n);
+}
+
+void ac4_matrix(double **tr, int n, int kind, int matsel,
+                const ac4_stereo *st, const ac4_framing *f)
+{
+    double tmp[3 * AC4_MAX_FRAME];
+    if (kind == 3) {
+        matrix3(tr, n, matsel, st, f, tmp);
+    } else if (kind == 4) {
+        /* (P0, Q0) = pair0(I0, I1), (P1, Q1) = pair1(I2, I3),
+           (O0, O2) = pair2(P0, P1), (O1, O3) = pair3(Q0, Q1) */
+        ac4_unmix(tr[0], tr[1], n, &st[0], f);
+        ac4_unmix(tr[2], tr[3], n, &st[1], f);
+        ac4_unmix(tr[0], tr[2], n, &st[2], f);
+        ac4_unmix(tr[1], tr[3], n, &st[3], f);
+    } else if (kind == 5) {
+        /* (X, Y, Z) = the three-track matrix, (U, V) = pair2(I3, I4),
+           (O0, O3) = pair3(X, U), (O1, O4) = pair4(Y, V), O2 = Z */
+        matrix3(tr, n, matsel, st, f, tmp);
+        ac4_unmix(tr[3], tr[4], n, &st[2], f);
+        ac4_unmix(tr[0], tr[3], n, &st[3], f);
+        ac4_unmix(tr[1], tr[4], n, &st[4], f);
+    } else {
+        ac4_unmix(tr[0], tr[1], n, &st[0], f);
+    }
+}
+
+void ac4_unmix_windows(double *wa, double *wb, const int *lens, int nwin,
+                       const ac4_stereo *st, const ac4_framing *f)
+{
+    int alpha[AC4_MAX_WIN][AC4_MAX_SFB];
+    int w, off = 0, k, sfb;
+    if (st->sap_mode <= 0)
+        return;
+    if (st->sap_mode == 3)
+        sap_alpha_q(st, f, alpha);
+    for (w = 0; w < nwin; off += lens[w], w++) {
+        double *x = wa + off, *y = wb + off;
+        int g = f->w2g[w];
+        const ac4t_sfb *t;
+        if (st->sap_mode == 2) {
+            for (k = 0; k < lens[w]; k++) {
+                double a = x[k], b = y[k];
+                x[k] = a + b;
+                y[k] = a - b;
+            }
+            continue;
+        }
+        if (g >= f->num_groups)
+            continue;
+        t = f->gtab[g];
+        for (sfb = 0; sfb < f->gmax[g] && sfb < t->num_sfb; sfb++) {
+            double a, b, c, d;
+            int lo = t->off[sfb], hi = t->off[sfb + 1];
+            if (st->sap_mode == 1) {
+                if (!st->ms_used[g][sfb])
+                    continue;
+                a = 1.0; b = 1.0; c = 1.0; d = -1.0;
+            } else {
+                int q = alpha[g][sfb];
+                if (q == AC4_SF_NONE)
+                    continue;
+                a = 1.0 + 0.1 * q;
+                b = 1.0;
+                c = 1.0 - 0.1 * q;
+                d = -1.0;
+            }
+            if (hi > lens[w])
+                hi = lens[w];
+            for (k = lo; k < hi; k++) {
+                double u = x[k], v = y[k];
+                x[k] = a * u + b * v;
+                y[k] = c * u + d * v;
+            }
+        }
+    }
+}
