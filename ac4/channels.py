@@ -603,9 +603,10 @@ def companding_control(b, num_chan):
     sync = b.u(1) if num_chan > 1 else 0
     nc = 1 if sync else num_chan
     on = [b.u(1) for _ in range(nc)]
+    avg = None
     if not all(on):
-        b.u(1)                                      # b_compand_avg
-    return sync, on
+        avg = b.u(1)                                # b_compand_avg
+    return sync, on, avg
 
 
 def two_channel_data(b, T):
@@ -746,9 +747,10 @@ def _acpl3_core(b, T, b_iframe, sub):
         from .acpl_parse import acpl_config_2ch
         acpl = acpl_config_2ch(b)                    # Table 60, four bits
     lfe = mono_data(b, T, b_lfe=True)                # b_has_lfe (5.1)
-    companding_control(b, 2)
+    comp = companding_control(b, 2)
     l, r, st_lr = stereo_data(b, T)                  # Table 23
     return dict(lfe=lfe, L=l, R=r, st_lr=st_lr, aspx=aspx, acpl3=True,
+                compand=comp,
                 acpl=acpl, acpl_cfg=acpl, codec_mode=4,
                 bits=b.p, nbits=len(sub) * 8, coding_config=None)
 
@@ -766,7 +768,7 @@ def decode_element(sub, T, b_iframe=False):
         raise ValueError(f"5_X_codec_mode {codec_mode} is not ASPX")
     aspx = aspx_config(b) if b_iframe else None
     lfe = mono_data(b, T, b_lfe=True)
-    companding_control(b, 5)
+    comp = companding_control(b, 5)
     coding_config = b.u(2)
     if coding_config != 0:
         raise ValueError(f"coding_config {coding_config} not implemented")
@@ -776,6 +778,7 @@ def decode_element(sub, T, b_iframe=False):
     centre = mono_data(b, T, b_lfe=False)
     return dict(lfe=lfe, L=l, R=r, Ls=ls, Rs=rs, C=centre,
                 st_lr=st_lr, st_sr=st_sr, aspx=aspx, codec_mode=codec_mode,
+                compand=comp,
                 bits=b.p, nbits=len(sub) * 8, coding_config=coding_config,
                 audio_size=asz, audio_start=a0, mode=("5_X", 1))
 

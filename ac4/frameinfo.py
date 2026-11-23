@@ -62,7 +62,6 @@ class FrameWalker:
         status "no_config": an A-SPX/A-CPL frame before the first i-frame
         (its side data cannot be parsed without the configuration).
         status "error": the parse raised (message in `error`)."""
-        out = dict(status="error", sap=[], iframe=None, slack=None)
         try:
             st = M.parse(frame)
             sel = M.audio_substream(st, M.choose(st))
@@ -70,7 +69,18 @@ class FrameWalker:
                 raise ValueError("no decodable audio substream")
             sub = M.substream_bytes(frame, st, sel["index"])
             ifr = bool(sel["ndot"][0])
-            out["iframe"] = ifr
+        except Exception as e:                                 # noqa: BLE001
+            return dict(status="error", sap=[], iframe=None, slack=None,
+                        error=f"{type(e).__name__}: {str(e)[:80]}")
+        return self.walk_sub(sub, ifr)
+
+    def walk_sub(self, sub, ifr):
+        """walk() on one audio substream; also reports compand (the
+        companding_control result), flags (short blocks, noise fill) and
+        aspx_cfg (this frame's aspx_config)."""
+        out = dict(status="error", sap=[], iframe=ifr, slack=None,
+                   flags=[])
+        try:
             b = Bits(sub)
             size = b.u(15)
             if b.u(1):
@@ -85,6 +95,17 @@ class FrameWalker:
                 r = C.decode_element(sub, self.T, b_iframe=ifr)
             pairs = [r["st_lr"]] + ([r["st_sr"]] if "st_sr" in r else [])
             out["sap"] = [p["sap_mode"] for p in pairs]
+            out["compand"] = r.get("compand")
+            out["aspx_cfg"] = r.get("aspx")
+            for k in ("L", "R", "C", "Ls", "Rs", "lfe"):
+                ch = r.get(k)
+                if not ch:
+                    continue
+                if not ch["framing"].long:
+                    out["flags"].append(f"short blocks ({k})")
+                if ch.get("snf") and any(any(v is not None for v in g)
+                                         for g in ch["snf"] if g):
+                    out["flags"].append(f"noise fill ({k})")
             out["stereo"] = pairs
             out["codec_mode"] = r.get("codec_mode")
             if r.get("aspx"):

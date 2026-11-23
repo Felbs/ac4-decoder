@@ -221,6 +221,17 @@ def delta_dir(b, fr):
             [b.u(1) for _ in range(fr["num_noise"])])
 
 
+# Optional counters (tools/survey.py): when a dict, hfgen_iwc counts the
+# channel-blocks that send TNA modes above 0, add-harmonic, FIC and TIC
+# flags. Never read by the decoder.
+STATS = None
+
+
+def _count(key, n=1):
+    if STATS is not None and n:
+        STATS[key] = STATS.get(key, 0) + 1
+
+
 def hfgen_iwc(b, t, nats, two_ch, balance=0):
     """Tables 55 and 56.  -> aspx_add_harmonic flags per channel.
 
@@ -230,17 +241,18 @@ def hfgen_iwc(b, t, nats, two_ch, balance=0):
     """
     n_noise, n_hi = t["n_noise"], t["n_hi"]
     ah = [[0] * n_hi, [0] * n_hi]
-    for _ in range(n_noise):
-        b.u(2)                                    # aspx_tna_mode ch0
+    _count("tna", sum(b.u(2) for _ in range(n_noise)))   # aspx_tna_mode ch0
     if two_ch:
         if balance == 0:
-            for _ in range(n_noise):
-                b.u(2)                            # aspx_tna_mode ch1
+            _count("tna", sum(b.u(2) for _ in range(n_noise)))   # ch1
         if b.u(1):                                # aspx_ah_left
             ah[0] = [b.u(1) for _ in range(n_hi)]
+            _count("ah", any(ah[0]))
         if b.u(1):                                # aspx_ah_right
             ah[1] = [b.u(1) for _ in range(n_hi)]
+            _count("ah", any(ah[1]))
         if b.u(1):                                # aspx_fic_present
+            _count("fic")
             if b.u(1):                            # aspx_fic_left
                 for _ in range(n_hi):
                     b.u(1)
@@ -248,6 +260,7 @@ def hfgen_iwc(b, t, nats, two_ch, balance=0):
                 for _ in range(n_hi):
                     b.u(1)
         if b.u(1):                                # aspx_tic_present
+            _count("tic")
             copy = b.u(1)
             left = right = 0
             if copy == 0:
@@ -261,10 +274,13 @@ def hfgen_iwc(b, t, nats, two_ch, balance=0):
     else:
         if b.u(1):                                # aspx_ah_present
             ah[0] = [b.u(1) for _ in range(n_hi)]
+            _count("ah", any(ah[0]))
         if b.u(1):                                # aspx_fic_present
+            _count("fic")
             for _ in range(n_hi):
                 b.u(1)
         if b.u(1):                                # aspx_tic_present
+            _count("tic")
             for _ in range(nats):
                 b.u(1)
     return ah

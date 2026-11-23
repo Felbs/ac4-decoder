@@ -45,9 +45,10 @@ def decode_pair(sub, T, b_iframe=False):
     aspx = None
     if b_iframe and mode == 1:
         aspx = aspx_config(b)
+    comp = None
     if mode == 1:
-        companding_control(b, 2)
+        comp = companding_control(b, 2)
     l, r, st = stereo_data(b, T)                     # Table 23
-    return dict(L=l, R=r, st_lr=st, aspx=aspx, codec_mode=mode,
+    return dict(L=l, R=r, st_lr=st, aspx=aspx, codec_mode=mode, compand=comp,
                 bits=b.p, nbits=len(sub) * 8,
                 audio_size=asz, audio_start=a0, mode=("pair", mode))
