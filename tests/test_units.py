@@ -270,6 +270,21 @@ def _framing(bits):
     return CH.Framing(_bits(bits))
 
 
+def fake_toc(channel_mode=1, ndot=1, **kw):
+    """A TOC dict as toc.parse gives it for one presentation with one
+    channel-coded audio substream at index 1 (the presentation substream
+    at 0), for tests that stub the parser."""
+    sub = dict(kind="chan", channel_mode=channel_mode, ndot=[ndot], index=1)
+    st = dict(presentations=[dict(config=None, version=1, md_compat=0,
+                                  presentation_id=None, enabled=True,
+                                  groups=[0], pres_substream=0)],
+              groups=[dict(substreams=[sub], channel_coded=1,
+                           content_classifier=None, language=None)],
+              channel_modes=[channel_mode])
+    st.update(kw)
+    return st
+
+
 def test_pair_without_stereo_processing_uses_each_channels_framing(
         monkeypatch):
     """b_enable_mdct_stereo_proc = 0: L and R carry separate sf_info, and
@@ -295,7 +310,7 @@ def test_pair_without_stereo_processing_uses_each_channels_framing(
                     audio_size=1, audio_start=0, mode=("pair", 0))
 
     monkeypatch.setattr(PAIR, "decode_pair", fake_pair)
-    monkeypatch.setattr(ST.M, "parse", lambda f: dict(
+    monkeypatch.setattr(ST.M, "parse", lambda f: fake_toc(
         sequence_counter=1, toc_bytes=0, payload_base=0,
         substream_sizes=[0, 8], b_iframe_global=1))
     monkeypatch.setattr(RB, "CHECKS", False)
@@ -408,7 +423,7 @@ def test_noise_fill_is_applied_by_the_stream(monkeypatch):
                     audio_size=1, audio_start=0, mode=("pair", 0))
 
     monkeypatch.setattr(PAIR, "decode_pair", fake_pair)
-    monkeypatch.setattr(ST.M, "parse", lambda f: dict(
+    monkeypatch.setattr(ST.M, "parse", lambda f: fake_toc(
         sequence_counter=9, toc_bytes=0, payload_base=0,
         substream_sizes=[0, 8], b_iframe_global=1))
     monkeypatch.setattr(RB, "CHECKS", False)

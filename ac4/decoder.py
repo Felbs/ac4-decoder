@@ -129,7 +129,7 @@ class Decoder:
     """
 
     def __init__(self, element="5_X", channels=None, burst_limit=None,
-                 guard=True):
+                 guard=True, presentation=None, language=None):
         if element not in ("5_X", "pair"):
             raise ValueError(f"element {element!r}: '5_X' or 'pair'")
         if channels is None:
@@ -142,7 +142,8 @@ class Decoder:
         self.chans = Ac4Stream.CHANS if channels == 6 else ("L", "R")
         self.burst_limit = (2.0 * REF_PEAK[element] if burst_limit is None
                             else float(burst_limit))
-        self.stream = Ac4Stream(element=element)
+        self.stream = Ac4Stream(element=element, presentation=presentation,
+                                language=language)
         self.fb_state = {k: None for k in self.chans}
         self.lead_pcm = {k: np.zeros(0) for k in ("L", "R", "Ls", "Rs")}
         self.lead_groups = {"lr": [], "sr": []}
@@ -384,8 +385,9 @@ class Decoder:
         return np.column_stack([pcm[k] for k in chans])
 
 
-def probe_element(frames, limit=64):
-    """Guess the element from the table of contents' channel_mode.
+def probe_element(frames, limit=64, presentation=None, language=None):
+    """Guess the element from the channel_mode of the audio substream of
+    the presentation that would be decoded (toc.choose).
     -> "5_X" for 5.1, "pair" for stereo, None if not recognised."""
     from . import toc as M
     for f in frames[:limit]:
@@ -393,10 +395,10 @@ def probe_element(frames, limit=64):
             st = M.parse(f)
         except Exception:                                      # noqa: BLE001
             continue
-        cms = st.get("channel_modes") or []
-        if not cms:
+        sel = M.audio_substream(st, M.choose(st, presentation, language))
+        if sel is None:
             continue
-        cm = cms[-1]
+        cm = sel["channel_mode"]
         if cm == 1:
             return "pair"
         if cm == 4:
@@ -405,16 +407,19 @@ def probe_element(frames, limit=64):
     return None
 
 
-def decode(frames, element=None, channels=None, max_pass=1800):
+def decode(frames, element=None, channels=None, max_pass=1800,
+           presentation=None, language=None):
     """Batch convenience: -> (pcm float64 (n, ch) at 48 kHz, decoder scale,
     Decoder). Decodes in passes of `max_pass` frames, exactly as a
-    streaming caller would."""
+    streaming caller would. presentation / language: see toc.choose."""
     from .resample import StreamResampler
-    element = element or probe_element(frames)
+    element = element or probe_element(frames, presentation=presentation,
+                                       language=language)
     if element is None:
         raise ValueError("cannot tell the element from the stream; pass "
                          "element='5_X' or 'pair'")
-    dec = Decoder(element, channels)
+    dec = Decoder(element, channels, presentation=presentation,
+                  language=language)
     rs = StreamResampler()
     out = []
     for i in range(0, len(frames), max(1, max_pass)):

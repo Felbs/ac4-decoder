@@ -84,14 +84,31 @@ CH_MODES_WITH_ADD_CH_BASE = (7, 8, 9, 10)
 
 
 def content_type(b):
-    b.u(3)                                # content_classifier
+    """TS 103 190-1 4.2.3.7 (Table 10) -> (content_classifier, language).
+
+    The language is the BCP 47 tag of n_language_tag_bytes bytes, or None.
+    A serialized tag (b_serialized_language_tag) comes in 16-bit chunks
+    spread over several frames; its chunk is returned as "~" + hex."""
+    cc = b.u(3)                           # content_classifier, Table 91
+    lang = None
     if b.u(1):                            # b_language_indicator
         if b.u(1):                        # b_serialized_language_tag
-            b.u(1)
-            b.u(16)
+            b.u(1)                        # b_start_tag
+            lang = "~%04x" % b.u(16)      # language_tag_chunk
         else:
-            for _ in range(b.u(6)):
-                b.u(8)
+            n = b.u(6)
+            lang = bytes(b.u(8) for _ in range(n)).decode("ascii", "replace")
+    return cc, lang
+
+
+# Table 91 (TS 103 190-1 4.3.3.8.1)
+CONTENT_CLASS = ("complete main", "music and effects", "visually impaired",
+                 "hearing impaired", "dialogue", "commentary", "emergency",
+                 "voice over")
+# presentation_config, TS 103 190-2 6.2.1.3
+PRES_CONFIG = {0: "M&E + dialogue", 1: "main + DE", 2: "main + associated",
+               3: "M&E + dialogue + associated", 4: "main + DE + associated",
+               5: "arbitrary", 6: "EMDF only"}
 
 
 def emdf_info(b, st):
@@ -101,9 +118,11 @@ def emdf_info(b, st):
     k = b.u(3)
     if k == 7:
         k += b.vb(3)
+    sidx = None
     if b.u(1):                            # b_emdf_payloads_substream_info
-        if b.u(2) == 3:
-            b.vb(2)
+        sidx = b.u(2)
+        if sidx == 3:
+            sidx += b.vb(2)
     prim, sec = b.u(2), b.u(2)
     if PROT_PRIMARY[prim] is None:
         raise ValueError("protection_length_primary == 0 (Reserved)")
@@ -111,6 +130,7 @@ def emdf_info(b, st):
     if PROT_SECOND[sec]:
         b.u(PROT_SECOND[sec])
     st["emdf"] += 1
+    return dict(version=v, key_id=k, substream_index=sidx)
 
 
 def frame_rate_multiply_info(b, fri, st):
@@ -126,11 +146,14 @@ def frame_rate_multiply_info(b, fri, st):
 
 
 def frame_rate_fractions_info(b, fri, frf):
-    if fri in (5, 6, 7, 8, 9) and frf == 1:
-        b.u(1)
+    """TS 103 190-2 6.2.1.4 -> frame_rate_fraction."""
+    if fri in (5, 6, 7, 8, 9):
+        if frf == 1 and b.u(1):
+            return 2
     elif fri in (10, 11, 12):
         if b.u(1):
-            b.u(1)
+            return 4 if b.u(1) else 2
+    return 1
 
 
 def sgi_specifier(b):
@@ -140,101 +163,227 @@ def sgi_specifier(b):
     return g
 
 
+def substream_index(b):
+    i = b.u(2)
+    if i == 3:
+        i += b.vb(2)
+    return i
+
+
 def presentation_substream_info(b):
-    b.u(1)                                # b_alternative
-    b.u(1)                                # b_pres_ndot
-    if b.u(2) == 3:                       # substream_index
-        b.vb(2)
+    """6.2.1.12 -> (b_alternative, b_pres_ndot, substream_index)."""
+    alt = b.u(1)
+    ndot = b.u(1)
+    return alt, ndot, substream_index(b)
+
+
+def presentation_config_ext_info(b, st):
+    """6.2.1.5 (bitstream_version 2: the payload is skipped)."""
+    n = b.u(5)
+    if b.u(1):
+        n += b.vb(2) << 5
+    b.u(8 * n) if n <= 64 else [b.u(8) for _ in range(n)]
 
 
 def presentation_v1_info(b, fri, st):
-    """-> n_substream_groups this presentation references."""
+    """6.2.1.3 -> dict describing the presentation. Its "groups" are the
+    ac4_sgi_specifier group indices it references, in order."""
     single = b.u(1)                       # b_single_substream_group
     cfg = 0
     if not single:
         cfg = b.u(3)
         if cfg == 7:
             cfg += b.vb(2)
+    ver = 0
     while b.u(1):                         # presentation_version, unary
-        pass
-    n_sg = 0
+        ver += 1
+    p = dict(config=None if single else cfg, version=ver, md_compat=None,
+             presentation_id=None, frame_rate_factor=1,
+             frame_rate_fraction=1, enabled=True, groups=[],
+             n_substream_groups=0, multi_pid=0, pre_virtualized=0,
+             pres_substream=None, b_alternative=0, b_pres_ndot=0,
+             emdf=[])
     add_emdf = 0
     if (not single) and cfg == 6:
         add_emdf = 1
     else:
-        b.u(3)                            # mdcompat
-        if b.u(1):                        # b_presentation_group_index
-            b.vb(2)
+        p["md_compat"] = b.u(3)
+        if b.u(1):                        # b_presentation_id
+            p["presentation_id"] = b.vb(2)
         frf = frame_rate_multiply_info(b, fri, st)
-        frame_rate_fractions_info(b, fri, frf)
-        emdf_info(b, st)
+        p["frame_rate_factor"] = frf
+        p["frame_rate_fraction"] = frame_rate_fractions_info(b, fri, frf)
+        p["emdf"].append(emdf_info(b, st))
         if b.u(1):                        # b_presentation_filter
-            b.u(1)                        # b_enable_presentation
+            p["enabled"] = bool(b.u(1))   # b_enable_presentation
         if single:
-            sgi_specifier(b)
-            n_sg = 1
+            p["groups"] = [sgi_specifier(b)]
+            p["n_substream_groups"] = 1
         else:
-            b.u(1)                        # b_multi_pid
+            p["multi_pid"] = b.u(1)
             table = {0: (2, 2), 1: (2, 1), 2: (2, 2), 3: (3, 3), 4: (3, 2)}
             if cfg in table:
-                n_spec, n_sg = table[cfg]
-                for _ in range(n_spec):
-                    sgi_specifier(b)
+                n_spec, p["n_substream_groups"] = table[cfg]
+                p["groups"] = [sgi_specifier(b) for _ in range(n_spec)]
             elif cfg == 5:
                 n_sg = b.u(2) + 2
                 if n_sg == 5:
                     n_sg += b.vb(2)
-                for _ in range(n_sg):
-                    sgi_specifier(b)
+                p["n_substream_groups"] = n_sg
+                p["groups"] = [sgi_specifier(b) for _ in range(n_sg)]
             else:
-                raise ValueError(f"presentation_config {cfg} needs "
-                                 "presentation_config_ext_info")
-        b.u(1)                            # b_pre_virtualized
+                presentation_config_ext_info(b, st)
+        p["pre_virtualized"] = b.u(1)
         add_emdf = b.u(1)
-        presentation_substream_info(b)
+        alt, ndot, sidx = presentation_substream_info(b)
+        p.update(b_alternative=alt, b_pres_ndot=ndot, pres_substream=sidx)
     if add_emdf:
         n = b.u(2)
         if n == 0:
             n = b.vb(2) + 4
         for _ in range(n):
-            emdf_info(b, st)
+            p["emdf"].append(emdf_info(b, st))
     st["presentation_config"] = cfg
     st["single_group"] = single
-    return n_sg
+    return p
+
+
+def _sf_bitrate_ndot_index(b, present, frf, st, s):
+    """The tail shared by the three substream info elements: b_sf_multiplier,
+    b_bitrate_info, (add_ch_base for chan), b_audio_ndot x frame_rate_factor,
+    substream_index."""
+    s["sf_multiplier"] = None
+    if st["fs_index"] == 1:
+        if b.u(1):                        # b_sf_multiplier
+            s["sf_multiplier"] = b.u(1)   # 0: 96 kHz, 1: 192 kHz
+    if b.u(1):                            # b_bitrate_info
+        if b.u(3) == 0b111:
+            b.u(2)
+    if s.get("channel_mode") in CH_MODES_WITH_ADD_CH_BASE:
+        s["add_ch_base"] = b.u(1)
+    s["ndot"] = []
+    for _ in range(frf):
+        st["ndot_bits"].append(b.p)
+        s["ndot"].append(b.u(1))          # b_audio_ndot  (NOT b_iframe)
+    s["index"] = substream_index(b) if present else None
 
 
 def substream_info_chan(b, present, frf, st):
     cm = channel_mode(b)
     st["channel_modes"].append(cm)
+    s = dict(kind="chan", channel_mode=cm)
     # the spec compares the channel_mode CODE with these bit patterns;
     # channel_mode() returns ch_mode, so compare with their ch_mode
     if cm in CH_MODES_WITH_TOP:
-        b.u(1)                            # b_4_back_channels_present
-        b.u(1)                            # b_centre_present
-        b.u(2)                            # top_channels_present
-    if st["fs_index"] == 1:
-        if b.u(1):                        # b_sf_multiplier
-            b.u(1)
-    if b.u(1):                            # b_bitrate_info
-        if b.u(3) == 0b111:
-            b.u(2)
-    if cm in CH_MODES_WITH_ADD_CH_BASE:   # 7.0/7.1 5/2/0 and 3/2/2
-        b.u(1)                            # add_ch_base
-    for _ in range(frf):
-        st["ndot_bits"].append(b.p)
-        b.u(1)                            # b_audio_ndot  (NOT b_iframe)
-    if present:
-        if b.u(2) == 3:
-            b.vb(2)
+        s["b_4_back_channels_present"] = b.u(1)
+        s["b_centre_present"] = b.u(1)
+        s["top_channels_present"] = b.u(2)
+    _sf_bitrate_ndot_index(b, present, frf, st, s)
+    return s
+
+
+# bed_dyn_obj_assignment / ac4_substream_info_obj tables (6.2.1.10, 6.2.1.11)
+ISF_N = (4, 8, 10, 14, 15, 30)
+BED_AJOC_N = (2, 3, 5, 7, 9, 7, 9, 11)
+BED_OBJ_N = (2, 3, 6, 8, 10, 8, 10, 12)
+STD_BED_N = (2, 1, 1, 2, 2, 2, 2, 2, 2, 1)
+
+
+def _isf_n(b):
+    c = b.u(3)
+    if c >= len(ISF_N):
+        raise ValueError(f"isf_config {c} reserved")
+    return ISF_N[c]
+
+
+def bed_dyn_obj_assignment(b, n_signals):
+    """6.2.1.10 -> number of bed/ISF objects it assigns (the rest of the
+    n_signals are dynamic)."""
+    if b.u(1):                            # b_dyn_objects_only
+        return 0
+    if b.u(1):                            # b_isf
+        return _isf_n(b)
+    if b.u(1):                            # b_ch_assign_code
+        return BED_AJOC_N[b.u(3)]
+    if b.u(1):                            # b_channel_assignment_flags_present
+        if b.u(1):                        # b_nonstd_..._flags_present
+            fl = b.u(17)
+            return sum(1 for i in range(17)
+                       if (fl >> i) & 1 and i not in (3, 16))
+        fl = b.u(10)
+        return sum(STD_BED_N[i] for i in range(10)
+                   if (fl >> (9 - i)) & 1 and i not in (2, 9))
+    n_bed = 1
+    if n_signals > 1:
+        n_bed = b.u(max(1, (n_signals - 1).bit_length())) + 1
+    return sum(1 for _ in range(n_bed) if b.u(4) != 3)
+
+
+def oamd_common_data(b):
+    """6.2.2.x: skipped by its own size fields."""
+    if b.u(1) == 0:                       # b_default_screen_size_ratio
+        b.u(5)
+    b.u(1)                                # b_bed_object_chan_distribute
+    if b.u(1):                            # b_additional_data
+        n = b.u(1) + 1
+        if n == 2:
+            n += b.vb(2)
+        for _ in range(n):
+            b.u(8)
+
+
+def substream_info_ajoc(b, present, frf, st):
+    s = dict(kind="ajoc", b_lfe=b.u(1))
+    if b.u(1):                            # b_static_dmx
+        s["n_dmx"] = 5
+    else:
+        s["n_dmx"] = b.u(4) + 1
+        bed_dyn_obj_assignment(b, s["n_dmx"])
+    if b.u(1):                            # b_oamd_common_data_present
+        oamd_common_data(b)
+    n = b.u(4) + 1
+    if n == 16:
+        n += b.vb(3)
+    s["n_upmix"] = n
+    s["n_bed_isf"] = bed_dyn_obj_assignment(b, n)
+    _sf_bitrate_ndot_index(b, present, frf, st, s)
+    return s
+
+
+def substream_info_obj(b, present, frf, st):
+    code = b.u(3)
+    if code > 5:
+        raise ValueError(f"n_objects_code {code} reserved")
+    s = dict(kind="obj", n_objects=(0, 1, 2, 3, 5, 7)[code])
+    if b.u(1):                            # b_dynamic_objects
+        s["b_lfe"] = b.u(1)
+        s["objects"] = "dynamic"
+    elif b.u(1):                          # b_bed_objects
+        s["objects"] = "bed"
+        if b.u(1):                        # b_bed_start
+            if b.u(1):                    # b_ch_assign_code
+                b.u(3)
+            elif b.u(1):                  # nonstd flags present
+                b.u(17)
+            else:
+                b.u(10)
+    elif b.u(1):                          # b_isf
+        s["objects"] = "isf"
+        if b.u(1):                        # b_isf_start
+            _isf_n(b)
+    else:
+        s["objects"] = "reserved"
+        b.u(8 * b.u(4))
+    _sf_bitrate_ndot_index(b, present, frf, st, s)
+    return s
 
 
 def hsf_ext_substream_info(b, present):
-    if present:
-        if b.u(2) == 3:
-            b.vb(2)
+    return substream_index(b) if present else None
 
 
 def substream_group_info(b, st):
+    """6.2.1.6 -> dict for one substream group."""
     present = b.u(1)                      # b_substreams_present
     hsf = b.u(1)                          # b_hsf_ext
     single = b.u(1)                       # b_single_substream
@@ -245,20 +394,45 @@ def substream_group_info(b, st):
         if n_lf == 5:
             n_lf += b.vb(2)
     st["n_lf_substreams"] += n_lf
-    if b.u(1):                            # b_channel_coded
+    frf = st["frame_rate_factor"]
+    g = dict(substreams_present=present, hsf_ext=hsf, substreams=[],
+             channel_coded=b.u(1), oamd=None, content_classifier=None,
+             language=None)
+    if g["channel_coded"]:
         st["channel_coded"] += 1
         for _ in range(n_lf):
-            substream_info_chan(b, present, st["frame_rate_factor"], st)
+            s = substream_info_chan(b, present, frf, st)
             if hsf:
-                hsf_ext_substream_info(b, present)
+                s["hsf_index"] = hsf_ext_substream_info(b, present)
+            g["substreams"].append(s)
     else:
         st["object_coded"] += 1
-        raise ValueError("object/A-JOC coding not implemented")
+        if b.u(1):                        # b_oamd_substream
+            ndot = b.u(1)                 # b_oamd_ndot
+            g["oamd"] = dict(ndot=ndot, index=(substream_index(b)
+                                              if present else None))
+        for _ in range(n_lf):
+            if b.u(1):                    # b_ajoc
+                s = substream_info_ajoc(b, present, frf, st)
+            else:
+                s = substream_info_obj(b, present, frf, st)
+            if hsf:
+                s["hsf_index"] = hsf_ext_substream_info(b, present)
+            g["substreams"].append(s)
     if b.u(1):                            # b_content_type
-        content_type(b)
+        g["content_classifier"], g["language"] = content_type(b)
+    return g
 
 
 def parse(frame):
+    """ac4_toc() of TS 103 190-2 6.2.1.1 -> dict.
+
+    Besides the flat fields the damaged-input rules use, it holds
+    "presentations" (a dict per ac4_presentation_v1_info, with the indices
+    of the substream groups it references) and "groups" (a dict per
+    ac4_substream_group_info, each with its substreams: channel_mode or
+    object info, b_audio_ndot per frame_rate_factor, and the
+    substream_index into substream_index_table)."""
     b = Bits(frame)
     st = collections.defaultdict(int)
     st["channel_modes"] = []
@@ -269,7 +443,8 @@ def parse(frame):
     st["bitstream_version"] = bv
     st["sequence_counter"] = b.u(10)
     if b.u(1):                            # b_wait_frames
-        if b.u(3) > 0:
+        st["wait_frames"] = b.u(3)
+        if st["wait_frames"] > 0:
             b.u(2)                        # br_code
     st["fs_index"] = b.u(1)
     fri = b.u(4)
@@ -293,12 +468,10 @@ def parse(frame):
         if b.u(1):                        # b_program_uuid_present
             b.u(128)
             st["uuid"] += 1
-    total_sg = 0
-    for _ in range(n_pres):
-        total_sg += presentation_v1_info(b, fri, st)
+    pres = [presentation_v1_info(b, fri, st) for _ in range(n_pres)]
+    total_sg = 1 + max((g for p in pres for g in p["groups"]), default=-1)
     st["total_n_substream_groups"] = total_sg
-    for _ in range(total_sg):
-        substream_group_info(b, st)
+    groups = [substream_group_info(b, st) for _ in range(total_sg)]
     n_sub = b.u(2)                        # substream_index_table
     if n_sub == 0:
         n_sub = b.vb(2) + 4
@@ -315,4 +488,111 @@ def parse(frame):
     st["n_substreams"] = n_sub
     st["substream_sizes"] = sizes
     st["toc_bytes"] = b.p // 8
+    st["presentations"] = pres
+    st["groups"] = groups
     return st
+
+
+def substream_offset(st, index):
+    """Byte offset of substream `index` in the raw frame (TS 103 190-1
+    4.3.3.12.4, Pseudocode 1: from the end of the byte-aligned ac4_toc,
+    starting at payload_base)."""
+    return (st["toc_bytes"] + st.get("payload_base", 0)
+            + sum(st["substream_sizes"][:index]))
+
+
+def substream_bytes(frame, st, index):
+    o = substream_offset(st, index)
+    return frame[o:o + st["substream_sizes"][index]]
+
+
+# ---------------------------------------------------------------- selection
+# TS 103 190-2 4.8.2: the decoder lists the presentations, picks one that
+# is enabled and matches it, and decodes the substreams of every substream
+# group the presentation references (substream_index into
+# substream_index_table).
+
+def presentation_substreams(st, pi):
+    """-> [(group_index, group, substream)] of presentation pi, in the
+    order its ac4_sgi_specifier elements reference the groups."""
+    p = st["presentations"][pi]
+    out = []
+    for gi in p["groups"]:
+        if gi < len(st["groups"]):
+            g = st["groups"][gi]
+            for s in g["substreams"]:
+                out.append((gi, g, s))
+    return out
+
+
+def describe(st):
+    """-> one dict per presentation: index, presentation_id, config (name),
+    enabled, md_compat, version, language, content (classifiers of its
+    groups), channel_modes, object_coded, and decodable (has a
+    channel-coded audio substream this decoder can take)."""
+    out = []
+    for pi, p in enumerate(st.get("presentations") or []):
+        subs = presentation_substreams(st, pi)
+        langs = [g["language"] for _, g, _ in subs if g["language"]]
+        cls = []
+        for _, g, _ in subs:
+            c = g["content_classifier"]
+            if c is not None and CONTENT_CLASS[c] not in cls:
+                cls.append(CONTENT_CLASS[c])
+        cms = [s.get("channel_mode") for _, _, s in subs
+               if s["kind"] == "chan"]
+        cfg = p["config"]
+        out.append(dict(
+            index=pi, presentation_id=p["presentation_id"],
+            config=("single" if cfg is None else PRES_CONFIG.get(cfg, cfg)),
+            enabled=p["enabled"], md_compat=p["md_compat"],
+            version=p["version"], language=langs[0] if langs else None,
+            content=cls, channel_modes=cms,
+            object_coded=any(s["kind"] != "chan" for _, _, s in subs),
+            decodable=audio_substream(st, pi) is not None))
+    return out
+
+
+def audio_substream(st, pi):
+    """-> the substream dict of the first channel-coded substream of
+    presentation pi that has a substream_index (the one this decoder
+    decodes), or None."""
+    if pi is None or not (0 <= pi < len(st.get("presentations") or [])):
+        return None
+    for _, g, s in presentation_substreams(st, pi):
+        if (s["kind"] == "chan" and s.get("index") is not None
+                and s["index"] < len(st["substream_sizes"])):
+            return s
+    return None
+
+
+def choose(st, presentation=None, language=None):
+    """-> the index of the presentation to decode, or None.
+
+    presentation: an int selects by position in the TOC; "id:N" selects the
+    presentation whose presentation_id is N. Otherwise the first enabled,
+    decodable presentation, preferring one whose language matches
+    `language` (a BCP 47 prefix, e.g. "fr"), then one whose content is
+    "complete main" (not audio description, commentary, ...)."""
+    pres = st.get("presentations") or []
+    if presentation is not None:
+        if isinstance(presentation, str) and presentation.startswith("id:"):
+            want = int(presentation[3:])
+            for pi, p in enumerate(pres):
+                if p["presentation_id"] == want:
+                    return pi
+            return None
+        pi = int(presentation)
+        return pi if 0 <= pi < len(pres) else None
+    cands = [d for d in describe(st) if d["enabled"] and d["decodable"]]
+    if not cands:
+        return None
+    if language:
+        lw = language.lower()
+        hit = [d for d in cands if d["language"]
+               and d["language"].lower().split("-")[0] == lw.split("-")[0]]
+        if hit:
+            cands = hit
+    main = [d for d in cands if not d["content"]
+            or "complete main" in d["content"]]
+    return (main or cands)[0]["index"]

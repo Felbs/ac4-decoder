@@ -41,10 +41,17 @@ CONCEALED = RB.CONCEALED
 
 
 class Ac4Stream:
-    def __init__(self, element="5_X"):
+    def __init__(self, element="5_X", presentation=None, language=None):
         # "5_X" = the 5.1 programme element. "pair" = the stereo
         # channel_pair_element (Table 22).
         self.element = element
+        # presentation choice (toc.choose): None = the first enabled,
+        # decodable one (preferring `language`, then complete main); an int
+        # = by position in the TOC; "id:N" = by presentation_id
+        self.presentation = presentation
+        self.language = language
+        self.selected = None        # index of the presentation decoded last
+        self.last_toc = None
         self.acpl3 = False      # 13.25: set once the stream shows a 2-ch core + A-CPL
         self.T = C.load_tables()
         arrays = H.parse_c(H.DEFAULT_C)
@@ -181,10 +188,21 @@ class Ac4Stream:
                 # b_payload_base = false; the second signals payload_base
                 # = 1 on every frame, so the element
                 # was read one byte early and decoded as noise (E77).
-                o = (st["toc_bytes"] + st.get("payload_base", 0)
-                     + st["substream_sizes"][0])
-                sub = f[o:o + st["substream_sizes"][1]]
-                ifr = bool(st["b_iframe_global"])
+                # the audio substream of the selected presentation
+                # (TS 103 190-2 4.8.2): its substream_index locates it in
+                # substream_index_table, and ITS b_audio_ndot says whether
+                # it is an I-frame (carries aspx_config etc.). A substream
+                # can be an I-frame when b_iframe_global is not: the kit
+                # streams send one halfway between global I-frames.
+                pi = M.choose(st, self.presentation, self.language)
+                sel = M.audio_substream(st, pi)
+                if sel is None:
+                    raise RB.Damaged("toc.presentation",
+                                     "no decodable audio substream")
+                self.selected = pi
+                self.last_toc = st
+                sub = M.substream_bytes(f, st, sel["index"])
+                ifr = bool(sel["ndot"][0])
                 if self.element == "pair":
                     from . import pair as PAIR
                     r = PAIR.decode_pair(sub, self.T, b_iframe=ifr)

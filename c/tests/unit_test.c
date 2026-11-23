@@ -717,6 +717,121 @@ static void dump_snf(void)
     }
 }
 
+/* ------------------------------------------------------------ phase A */
+/* the same bitstreams as tests/test_phase_a.py (written there from the
+   syntax with a bit writer) */
+static const uint8_t TOC_TWO[] =
+    "\x80\x54\xe8\x30\xb8\x01\x00\x00\x4c\x2f\x00\x40\x01\x12\xf8\xb1"
+    "\x04\xca\xdd\x70\xb6\x09\x99\xcb\x00\x60\x14\x03\x80"
+    "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+static const uint8_t TOC_SHARED[] =
+    "\x80\x54\xe8\x30\x00\x40\x00\x13\x00\x04\x00\x01\x2e\x2a\x00\x40\x10";
+static const uint8_t TOC_NDOT[] =
+    "\x80\x54\xd3\x00\x04\x00\x01\x2e\x2a\x00\x40\x10";
+
+static int toc_of(const uint8_t *d, size_t n, ac4_toc *t)
+{
+    jmp_buf jb;
+    ac4_bits b;
+    b.d = d;
+    b.nbits = n * 8;
+    b.p = 0;
+    b.jb = &jb;
+    b.eof_code = AC4E_TOC_PARSE;
+    if (setjmp(jb))
+        return -1;
+    ac4_toc_parse(&b, t);
+    return 0;
+}
+
+static void test_toc_presentations(void)
+{
+    ac4_toc t;
+    const ac4_toc_sub *s;
+    ac4dec_presentation p[4];
+    int n;
+    CHECK(toc_of(TOC_TWO, 29, &t) == 0, "two-presentation TOC parses");
+    CHECK(t.n_pres == 2 && t.n_groups == 2 && t.n_groups_all == 2,
+          "presentations %d groups %d", t.n_pres, t.n_groups);
+    CHECK(t.pres[0].presentation_id == 10 && t.pres[1].presentation_id == 11,
+          "presentation_id");
+    CHECK(t.groups[0].subs[0].channel_mode == 4
+          && t.groups[0].subs[0].index == 1
+          && t.groups[1].subs[0].channel_mode == 1
+          && t.groups[1].subs[0].index == 2
+          && t.groups[1].subs[0].ndot == 0, "substreams");
+    CHECK(!strcmp(t.groups[0].language, "en")
+          && !strcmp(t.groups[1].language, "fr")
+          && t.groups[1].content_classifier == 5, "content_type");
+    CHECK(t.n_sizes == 3 && t.sizes[0] == 3 && t.sizes[1] == 5
+          && t.sizes[2] == 7, "sizes");
+    CHECK(ac4_toc_choose(&t, -1, -1, NULL) == 0, "default choice");
+    CHECK(ac4_toc_choose(&t, -1, -1, "fr") == 1, "language fr");
+    CHECK(ac4_toc_choose(&t, -1, -1, "FR-ca") == 1, "language FR-ca");
+    CHECK(ac4_toc_choose(&t, -1, -1, "de") == 0, "language de");
+    CHECK(ac4_toc_choose(&t, 1, -1, NULL) == 1, "by index");
+    CHECK(ac4_toc_choose(&t, 2, -1, NULL) == -1, "index out of range");
+    CHECK(ac4_toc_choose(&t, -1, 11, NULL) == 1, "by id");
+    CHECK(ac4_toc_choose(&t, -1, 12, NULL) == -1, "unknown id");
+    s = ac4_toc_audio_substream(&t, 1);
+    CHECK(s && s->index == 2, "audio substream of presentation 1");
+    n = ac4dec_presentations(TOC_TWO, 29, p, 4);
+    CHECK(n == 2 && p[0].is_default && !p[1].is_default
+          && !strcmp(p[1].language, "fr") && !strcmp(p[1].content, "commentary")
+          && p[0].channel_mode == 4 && p[1].channel_mode == 1,
+          "ac4dec_presentations");
+    /* two presentations sharing group 0: one group info is read */
+    CHECK(toc_of(TOC_SHARED, sizeof(TOC_SHARED) - 1, &t) == 0
+          && t.n_groups_all == 1 && t.n_sizes == 2 && t.sizes[0] == 2
+          && t.sizes[1] == 4, "shared group read once");
+    /* b_iframe_global 0, b_audio_ndot 1 */
+    CHECK(toc_of(TOC_NDOT, sizeof(TOC_NDOT) - 1, &t) == 0
+          && t.b_iframe_global == 0 && t.groups[0].subs[0].ndot == 1,
+          "b_audio_ndot");
+}
+
+static void test_stereo_data(void)
+{
+    static const struct { const char *d; int n, end; } P[] = {
+        { "\x00\x00\x30\x06\x43\x23\x59\xc0", 8, 46 },          /* proc on */
+        { "\x00\x00\x08\x08\x0c\x86\x46\xb3\x80", 9, 53 },      /* proc off */
+        { "\x00\x00\x0c\x00\x00\x00\x00", 7, -1 },              /* SSF */
+    };
+    ac4_huff huff[AC4T_N_BOOKS];
+    ac4_books bk;
+    static ac4_element e;
+    jmp_buf jb;
+    volatile int i;
+    memset(&bk, 0, sizeof(bk));
+    for (i = 0; i < AC4T_N_BOOKS; i++)
+        ac4_huff_build(&huff[i], &AC4T_BOOKS[i]);
+    for (i = 1; i <= 11; i++)
+        bk.cb[i] = &huff[i - 1];
+    bk.sf = &huff[AC4T_BOOK_SF];
+    bk.snf = &huff[AC4T_BOOK_SNF];
+    for (i = 0; i < 3; i++) {
+        ac4_bits b;
+        int code;
+        b.d = (const uint8_t *)P[i].d;
+        b.nbits = (size_t)P[i].n * 8;
+        b.p = 0;
+        b.jb = &jb;
+        b.eof_code = AC4E_ELEMENT_PARSE;
+        code = setjmp(jb);
+        if (code) {
+            CHECK(P[i].end < 0, "stereo_data %d raised %d", i, code);
+            continue;
+        }
+        ac4_parse_pair(&b, &bk, 0, &e);
+        CHECK((int)e.bits_end == P[i].end && e.lr.fr[0].is_long
+              && e.lr.fr[1].is_long,
+              "stereo_data %d ended at %d (want %d)", i, (int)e.bits_end,
+              P[i].end);
+    }
+    for (i = 0; i < AC4T_N_BOOKS; i++)
+        ac4_huff_free(&huff[i]);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--dump-aspx")) {
@@ -738,6 +853,8 @@ int main(int argc, char **argv)
     test_resampler();
     test_qmf();
     test_aspx_tables();
+    test_toc_presentations();
+    test_stereo_data();
     if (fails) {
         printf("UNIT TESTS FAILED (%d)\n", fails);
         return 1;

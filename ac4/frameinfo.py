@@ -65,10 +65,11 @@ class FrameWalker:
         out = dict(status="error", sap=[], iframe=None, slack=None)
         try:
             st = M.parse(frame)
-            o = (st["toc_bytes"] + st.get("payload_base", 0)
-                 + st["substream_sizes"][0])
-            sub = frame[o:o + st["substream_sizes"][1]]
-            ifr = bool(st["b_iframe_global"])
+            sel = M.audio_substream(st, M.choose(st))
+            if sel is None:
+                raise ValueError("no decodable audio substream")
+            sub = M.substream_bytes(frame, st, sel["index"])
+            ifr = bool(sel["ndot"][0])
             out["iframe"] = ifr
             b = Bits(sub)
             size = b.u(15)

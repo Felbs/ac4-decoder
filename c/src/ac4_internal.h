@@ -43,6 +43,7 @@ enum {
     AC4E_AUDIO_LATE,       /* audio_size.late */
     AC4E_GUARD_LEVEL,      /* guard.level (output guard) */
     AC4E_ASPX_LEVEL,       /* aspx.level (A-SPX level check) */
+    AC4E_TOC_PRESENTATION, /* toc.presentation (no decodable substream) */
     AC4E_COUNT
 };
 const char *ac4_reason_name(int code);
@@ -139,6 +140,39 @@ static inline int ac4_huff_decode(const ac4_huff *h, ac4_bits *b)
 
 /* ------------------------------------------------------------ TOC */
 #define AC4_MAX_CMODES 32
+#define AC4_MAX_PRES 8         /* presentations kept (more are parsed) */
+#define AC4_MAX_PGROUPS 8      /* group references kept per presentation */
+#define AC4_MAX_GROUPS 16      /* substream groups kept */
+#define AC4_MAX_GSUBS 8        /* substreams kept per group */
+#define AC4_MAX_SIZES 32       /* substream sizes kept */
+
+typedef struct {
+    int kind;              /* 0 channel-coded, 1 A-JOC, 2 objects */
+    long channel_mode;     /* ch_mode (kind 0), else -1 */
+    int ndot;              /* the first b_audio_ndot */
+    long index;            /* substream_index, -1 when not present */
+    int sf_multiplier;     /* -1: none; 0: 96 kHz; 1: 192 kHz */
+} ac4_toc_sub;
+
+typedef struct {
+    int substreams_present, hsf_ext, channel_coded;
+    int n_subs;            /* kept (at most AC4_MAX_GSUBS) */
+    long n_subs_all;
+    ac4_toc_sub subs[AC4_MAX_GSUBS];
+    int content_classifier;   /* -1 when no content_type */
+    char language[16];        /* "" when none */
+} ac4_toc_group;
+
+typedef struct {
+    int config;            /* -1: b_single_substream_group */
+    int version, md_compat;
+    long presentation_id;  /* -1 when none */
+    int enabled;
+    int n_groups;          /* kept references */
+    long groups[AC4_MAX_PGROUPS];
+    long pres_substream;   /* -1 when none */
+} ac4_toc_pres;
+
 typedef struct {
     int bitstream_version;
     int sequence_counter;
@@ -151,11 +185,27 @@ typedef struct {
     long cmodes[AC4_MAX_CMODES];
     long n_substreams;
     int n_sizes;           /* 0 when the sizes are not present */
-    long sizes[8];         /* first 8 substream sizes */
+    long sizes[AC4_MAX_SIZES]; /* first AC4_MAX_SIZES substream sizes */
     double sizes_sum;      /* sum of all sizes */
     long sizes_min;
     size_t toc_bytes;
+    int n_pres;            /* kept presentations */
+    ac4_toc_pres pres[AC4_MAX_PRES];
+    int n_groups;          /* kept substream groups */
+    long n_groups_all;     /* total_n_substream_groups */
+    ac4_toc_group groups[AC4_MAX_GROUPS];
 } ac4_toc;
+
+/* Presentation choice (TS 103 190-2 4.8.2), the rule of ac4/toc.py
+   choose(): index >= 0 selects by position, id >= 0 by presentation_id;
+   otherwise the first enabled presentation with a decodable audio
+   substream, preferring language (a BCP 47 prefix, NULL/"" for none),
+   then "complete main" content. -> presentation index or -1. */
+int ac4_toc_choose(const ac4_toc *t, int index, long id, const char *language);
+/* The audio substream decoded for presentation pi (the first
+   channel-coded one with a substream_index inside the size table), or
+   NULL. */
+const ac4_toc_sub *ac4_toc_audio_substream(const ac4_toc *t, int pi);
 
 /* Parse the TOC (TS 103 190-2 6.2.1, bitstream_version >= 2). Raises
    AC4E_TOC_PARSE through b->jb. */

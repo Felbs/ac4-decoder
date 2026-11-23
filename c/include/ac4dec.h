@@ -98,7 +98,40 @@ typedef struct {
                               at least AC4DEC_MIN_LOOKAHEAD (see above) */
     int no_guard;          /* 1 = output guard off (Python guard=False;
                               non-finite samples are then zeroed) */
+    int presentation;      /* 0 = automatic (see below); n > 0 = the n-th
+                              presentation of the TOC (index n - 1) */
+    long presentation_id;  /* n > 0: the presentation whose
+                              presentation_id is n - 1 (if presentation
+                              is 0) */
+    char language[16];     /* the automatic choice prefers this language
+                              (BCP 47, e.g. "fr"; "" = none) */
 } ac4dec_config;
+
+/* PRESENTATIONS (TS 103 190-2 4.8.2). The automatic choice is, per frame,
+   the first enabled presentation that has a channel-coded audio substream,
+   preferring the configured language, then "complete main" content (not
+   audio description, commentary, ...). Of that presentation the first
+   channel-coded substream is decoded (several substream groups are not
+   mixed). */
+typedef struct {
+    int index;             /* position in the TOC (0-based) */
+    long presentation_id;  /* -1 when not signalled */
+    int config;            /* presentation_config, -1 = single group */
+    int enabled;           /* b_enable_presentation (1 when not sent) */
+    int md_compat, version;
+    char language[16];     /* first language of its groups, "" if none */
+    const char *content;   /* first content_classifier name, "" if none */
+    int channel_mode;      /* ch_mode of the decoded substream, -1 if none */
+    int decodable;         /* has a channel-coded audio substream */
+    int object_coded;      /* references object / A-JOC substreams */
+    int is_default;        /* the automatic choice */
+} ac4dec_presentation;
+
+/* The presentations of one frame (one TOC): fills out[0..max) and returns
+   how many the TOC has (may exceed max), or -1 when the TOC does not
+   parse. */
+int ac4dec_presentations(const uint8_t *data, size_t len,
+                         ac4dec_presentation *out, int max);
 
 typedef struct {
     ac4dec_status status;

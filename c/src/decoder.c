@@ -76,7 +76,7 @@ static const char *REASONS[AC4E_COUNT] = {
     "asf.sect_len", "asf.max_sfb", "asf.quant", "asf.sf_range", "asf.level",
     "decoder.internal", "element.unknown", "seq.outlier", "aspx.config",
     "aspx.parse", "aspx.num_env", "aspx.borders", "acpl.parse",
-    "audio_size.late", "guard.level", "aspx.level"
+    "audio_size.late", "guard.level", "aspx.level", "toc.presentation"
 };
 
 const char *ac4_reason_name(int code)
@@ -319,13 +319,21 @@ static int relearn_accept(relearn_t *r, int reason, const toc_shape *s,
     return 0;
 }
 
-static ac4dec_element element_of_toc(const ac4_toc *t)
+/* the presentation this decoder takes (config; TS 103 190-2 4.8.2) */
+static int choose_pres(const ac4dec_config *c, const ac4_toc *t)
 {
+    return ac4_toc_choose(t, c->presentation - 1, c->presentation_id - 1,
+                          c->language);
+}
+
+/* the element of the audio substream of the chosen presentation */
+static ac4dec_element element_of_toc(const ac4dec_config *c, const ac4_toc *t)
+{
+    const ac4_toc_sub *s = ac4_toc_audio_substream(t, choose_pres(c, t));
     long cm;
-    if (t->n_cmodes < 1)
+    if (!s)
         return AC4DEC_ELEMENT_AUTO;
-    cm = t->n_cmodes <= AC4_MAX_CMODES ? t->cmodes[t->n_cmodes - 1]
-                                       : t->cmodes[AC4_MAX_CMODES - 1];
+    cm = s->channel_mode;
     if (cm == 1)
         return AC4DEC_ELEMENT_PAIR;
     if (cm == 4)
@@ -354,9 +362,65 @@ static int toc_try(const uint8_t *data, size_t len, ac4_toc *t)
 ac4dec_element ac4dec_probe(const uint8_t *data, size_t len)
 {
     ac4_toc t;
+    ac4dec_config c;
+    memset(&c, 0, sizeof(c));
     if (len > MAX_FRAME_BYTES || toc_try(data, len, &t) != 0)
         return AC4DEC_ELEMENT_AUTO;
-    return element_of_toc(&t);
+    return element_of_toc(&c, &t);
+}
+
+static const char *const CONTENT[8] = {
+    "complete main", "music and effects", "visually impaired",
+    "hearing impaired", "dialogue", "commentary", "emergency", "voice over"
+};
+
+int ac4dec_presentations(const uint8_t *data, size_t len,
+                         ac4dec_presentation *out, int max)
+{
+    ac4_toc t;
+    ac4dec_config c;
+    int pi, k, n = 0, chosen;
+    memset(&c, 0, sizeof(c));
+    if (len > MAX_FRAME_BYTES || toc_try(data, len, &t) != 0)
+        return -1;
+    chosen = choose_pres(&c, &t);
+    for (pi = 0; pi < t.n_pres; pi++) {
+        const ac4_toc_pres *p = &t.pres[pi];
+        const ac4_toc_sub *s = ac4_toc_audio_substream(&t, pi);
+        ac4dec_presentation *o;
+        if (n >= max || !out) {
+            n++;
+            continue;
+        }
+        o = &out[n++];
+        memset(o, 0, sizeof(*o));
+        o->index = pi;
+        o->presentation_id = p->presentation_id;
+        o->config = p->config;
+        o->enabled = p->enabled;
+        o->md_compat = p->md_compat;
+        o->version = p->version;
+        o->channel_mode = s ? (int)s->channel_mode : -1;
+        o->decodable = s != NULL;
+        o->is_default = pi == chosen;
+        o->content = "";
+        for (k = 0; k < p->n_groups; k++) {
+            long gi = p->groups[k];
+            const ac4_toc_group *g;
+            int j;
+            if (gi < 0 || gi >= t.n_groups)
+                continue;
+            g = &t.groups[gi];
+            if (!o->language[0] && g->language[0])
+                memcpy(o->language, g->language, sizeof(o->language));
+            if (!o->content[0] && g->content_classifier >= 0)
+                o->content = CONTENT[g->content_classifier & 7];
+            for (j = 0; j < g->n_subs; j++)
+                if (g->subs[j].kind != 0)
+                    o->object_coded = 1;
+        }
+    }
+    return n;
 }
 
 double ac4dec_ref_peak(ac4dec_element e)
@@ -796,15 +860,28 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
             goto fail;
         }
     }
-    /* the audio substream (substream 1) */
-    o = t.toc_bytes + (size_t)t.payload_base + (size_t)t.sizes[0];
-    if (o > len)
-        o = len;
-    sub_len = (size_t)t.sizes[1];
-    if (sub_len > len - o)
-        sub_len = len - o;
-    sub = data + o;
-    ifr = t.b_iframe_global;
+    /* the audio substream of the chosen presentation (TS 103 190-2
+       4.8.2), located by its substream_index; ITS b_audio_ndot says
+       whether it is an I-frame */
+    {
+        const ac4_toc_sub *s = ac4_toc_audio_substream(&t,
+                                                      choose_pres(&d->cfg, &t));
+        long i;
+        if (!s) {
+            code = AC4E_TOC_PRESENTATION;
+            goto fail;
+        }
+        o = t.toc_bytes + (size_t)t.payload_base;
+        for (i = 0; i < s->index; i++)
+            o += (size_t)t.sizes[i];
+        if (o > len)
+            o = len;
+        sub_len = (size_t)t.sizes[s->index];
+        if (sub_len > len - o)
+            sub_len = len - o;
+        sub = data + o;
+        ifr = s->ndot;
+    }
     b.d = sub;
     b.nbits = sub_len * 8;
     b.p = 0;
@@ -1019,8 +1096,11 @@ static void parse_held(ac4dec *d, const uint8_t *nx, size_t nx_len,
     rec_t *r = rec_new(d, index);
     const uint8_t *data = d->raw_null ? NULL : d->raw;
     if (!d->element) {
-        ac4dec_element el = (data && d->raw_len)
-                            ? ac4dec_probe(data, d->raw_len)
+        ac4_toc tt;
+        ac4dec_element el = (data && d->raw_len
+                             && d->raw_len <= MAX_FRAME_BYTES
+                             && toc_try(data, d->raw_len, &tt) == 0)
+                            ? element_of_toc(&d->cfg, &tt)
                             : AC4DEC_ELEMENT_AUTO;
         if (el != AC4DEC_ELEMENT_AUTO)
             set_element(d, el);
