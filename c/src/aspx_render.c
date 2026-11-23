@@ -923,6 +923,96 @@ static void sines(const ac4_aspx_pair *p, int c, const ac4_aspx_tab *t,
     }
 }
 
+/* aspx_render.compand_frame: the companding tool (5.7.5.2) on frame f's
+   interval of the analysed core, subbands below sbx, before its HF
+   generation; the companded low band is copied into the output ring */
+#define COMPAND_ALPHA 0.65
+static void compand_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
+                          long long slot, long long nts)
+{
+    const ac4_aspx_tab *t = &f->tab;
+    const double scale = sqrt(2.0 * 1536.0) * pow(2.0, 16.5);
+    const double G = pow(2.0, 1.0 / COMPAND_ALPHA);
+    const double expo = (1.0 - COMPAND_ALPHA) / COMPAND_ALPHA;
+    static double L[2][AC4_QRING];
+    long long ta[2], tz[2], ts;
+    int n[2], c, sb, sbx = t->sbx;
+    const ac4_aspx_chd *d[2];
+    d[0] = &f->g.c[0];
+    d[1] = &f->g.c[1];
+    if (!d[0]->comp_set || !d[1]->comp_set)
+        return;
+    for (c = 0; c < 2; c++) {
+        const int *bd = d[c]->fr.borders;
+        int ne = d[c]->fr.num_env;
+        ta[c] = slot + (long long)bd[0] * p->tia + p->tso;
+        tz[c] = slot + (long long)bd[ne] * p->tia + p->tso;
+        if (ta[c] < 0)
+            ta[c] = 0;
+        if (tz[c] > nts)
+            tz[c] = nts;
+        n[c] = tz[c] > ta[c] ? (int)(tz[c] - ta[c]) : 0;
+        for (ts = ta[c]; ts < tz[c]; ts++) {
+            double acc = 0.0;
+            for (sb = 0; sb < sbx; sb++) {
+                double re = fabs(p->are[c][QI(ts)][sb]);
+                double im = fabs(p->aim[c][QI(ts)][sb]);
+                acc += np_max(re, im) + 0.5 * np_min(re, im);
+            }
+            L[c][ts - ta[c]] = 0.9105 * (acc / (double)sbx) / scale;
+        }
+    }
+    if (d[0]->comp_sync) {
+        int m = n[0] < n[1] ? n[0] : n[1], i;
+        double gs[AC4_QRING], gv = 0.0;
+        if (m == 0)
+            return;
+        for (i = 0; i < m; i++)
+            gs[i] = (pow(L[0][i], expo) + pow(L[1][i], expo)) / 2.0;
+        if (d[0]->comp_on) {
+            /* per slot */
+        } else if (d[0]->comp_avg) {
+            gv = ac4_np_sum(gs, m) / (double)m;
+            for (i = 0; i < m; i++)
+                gs[i] = gv;
+        } else {
+            return;
+        }
+        for (c = 0; c < 2; c++)
+            for (i = 0; i < m; i++) {
+                long long s0 = ta[c] + i;
+                double g = gs[i] * G;
+                for (sb = 0; sb < sbx; sb++) {
+                    p->are[c][QI(s0)][sb] *= g;
+                    p->aim[c][QI(s0)][sb] *= g;
+                    p->qre[c][QI(s0)][sb] = p->are[c][QI(s0)][sb];
+                    p->qim[c][QI(s0)][sb] = p->aim[c][QI(s0)][sb];
+                }
+            }
+        return;
+    }
+    for (c = 0; c < 2; c++) {
+        int i;
+        double gv = 0.0;
+        if (n[c] == 0)
+            continue;
+        if (!d[c]->comp_on && !d[c]->comp_avg)
+            continue;
+        if (!d[c]->comp_on)
+            gv = pow(ac4_np_sum(L[c], n[c]) / (double)n[c], expo);
+        for (i = 0; i < n[c]; i++) {
+            long long s0 = ta[c] + i;
+            double g = (d[c]->comp_on ? pow(L[c][i], expo) : gv) * G;
+            for (sb = 0; sb < sbx; sb++) {
+                p->are[c][QI(s0)][sb] *= g;
+                p->aim[c][QI(s0)][sb] *= g;
+                p->qre[c][QI(s0)][sb] = p->are[c][QI(s0)][sb];
+                p->qim[c][QI(s0)][sb] = p->aim[c][QI(s0)][sb];
+            }
+        }
+    }
+}
+
 /* the body of apply_hf_pair's loop for one frame at QMF slot `slot`;
    nts = slots analysed (the Python's Qh.shape[1]) */
 static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
@@ -989,6 +1079,7 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
     }
     b0 = d0->fr.borders;
     b1 = joint ? b0 : d1->fr.borders;
+    compand_frame(p, f, slot, nts);
     for (c = 0; c < 2; c++) {
         const int *bd = c ? b1 : b0;
         int ne = c ? ne1 : ne0, si, sbase, last_si;

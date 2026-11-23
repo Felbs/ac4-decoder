@@ -323,6 +323,8 @@ typedef struct {
        group (0 L/R, 1 Ls/Rs, 2 C) and two-channel flag; then n_acpl1
        acpl_data_1ch() (acpl1) or one acpl_data_2ch() (acpl3) */
     int n_blocks, blk_grp[3], blk_two[3], n_acpl1;
+    /* companding_control: present, sync_flag, b_compand_on[], avg */
+    int comp_present, comp_sync, comp_n, comp_on[5], comp_avg;
     int r_silent;               /* the pair's R not coded (ASPX_ACPL_2) */
     size_t audio_size, audio_start;
     size_t bits_end;            /* where the core parse ended */
@@ -385,6 +387,9 @@ typedef struct {                /* one channel of aspx_data_1ch/2ch */
     uint8_t tna[AC4_ASPX_MAX_NOISE], ah[AC4_ASPX_MAX_SBG];
     int has_fic, has_tic;
     uint8_t fic[AC4_ASPX_MAX_SBG], tic[AC4_ASPX_MAX_NATS];
+    /* companding_control (Table 49) for this channel: set, b_compand_on,
+       b_compand_avg, sync_flag */
+    int comp_set, comp_on, comp_avg, comp_sync;
     int qmode;                  /* aspx_qmode_env: 0 = 1.5 dB, 1 = 3 dB */
     int dir_sig[AC4_ASPX_MAX_ENV], dir_noise[2];
     int n_sig[AC4_ASPX_MAX_ENV];

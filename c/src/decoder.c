@@ -1112,6 +1112,31 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
             if (!e->blk_two[i])
                 r->af[g].g.c[1] = r->af[g].g.c[0];
             r->af[g].kind = AC4_GRP_DATA;
+            /* companding_control, per channel (stream.py): L R C Ls Rs
+               for 5_X codec mode 1; L R C for ASPX_ACPL_1 / _2; L R for
+               a pair and ASPX_ACPL_3; the "m" track of a pair in
+               ASPX_ACPL_1 / _2 */
+            if (e->comp_present) {
+                int ch, idx[2];
+                if (g == 0) {
+                    idx[0] = 0;
+                    idx[1] = acpl1 == AC4_ACPL1_PAIR ? 0 : 1;
+                } else if (g == 1) {
+                    idx[0] = 3;
+                    idx[1] = 4;
+                } else {
+                    idx[0] = idx[1] = 2;
+                }
+                for (ch = 0; ch < 2; ch++) {
+                    ac4_aspx_chd *cd = &r->af[g].g.c[ch];
+                    cd->comp_set = 1;
+                    cd->comp_sync = e->comp_sync;
+                    cd->comp_avg = e->comp_avg;
+                    cd->comp_on = e->comp_sync ? e->comp_on[0]
+                                  : (idx[ch] < e->comp_n
+                                     ? e->comp_on[idx[ch]] : 0);
+                }
+            }
         }
         end = b.p;
         if (acpl3 && pc) {

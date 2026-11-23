@@ -569,15 +569,22 @@ static void mono_data(ac4_bits *b, const ac4_books *bk, int lfe,
     sf_data(b, bk, &m->fr, &m->ch);
 }
 
-static void companding_control(ac4_bits *b, int num_chan)
+/* Table 49 (aspx_render: flags per channel, sync_flag, b_compand_avg) */
+static void companding_control(ac4_bits *b, int num_chan, ac4_element *e)
 {
     int sync = num_chan > 1 ? (int)ac4_bit(b) : 0;
     int nc = sync ? 1 : num_chan, i, all = 1;
-    for (i = 0; i < nc; i++)
-        if (!ac4_bit(b))
+    e->comp_present = 1;
+    e->comp_sync = sync;
+    e->comp_n = nc;
+    e->comp_avg = 0;
+    for (i = 0; i < nc; i++) {
+        e->comp_on[i] = (int)ac4_bit(b);
+        if (!e->comp_on[i])
             all = 0;
+    }
     if (!all)
-        ac4_bit(b);                       /* b_compand_avg */
+        e->comp_avg = (int)ac4_bit(b);    /* b_compand_avg */
 }
 
 static void audio_size(ac4_bits *b, ac4_element *e)
@@ -648,6 +655,7 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
     e->acpl1 = AC4_ACPL1_NONE;
     e->n_acpl1 = 0;
     e->r_silent = 0;
+    e->comp_present = 0;
     e->has_aspx_cfg = e->has_acpl_cfg = 0;
     audio_size(b, e);
     e->mode = (int)ac4_u(b, 3);
@@ -659,7 +667,7 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
             e->has_aspx_cfg = e->has_acpl_cfg = 1;
         }
         mono_data(b, bk, 1, &e->lfe);
-        companding_control(b, 2);
+        companding_control(b, 2, e);
         stereo_data(b, bk, &e->lr);
         set_blocks(e, 1, 0, 1, 0, 0, 0, 0);
         e->bits_end = b->p;
@@ -673,7 +681,7 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
             e->has_aspx_cfg = e->has_acpl_cfg = 1;
         }
         mono_data(b, bk, 1, &e->lfe);
-        companding_control(b, 3);
+        companding_control(b, 3, e);
         if (ac4_bit(b))                   /* coding_config 1: not built */
             ac4_fail(b, AC4E_ELEMENT_PARSE);
         two_channel_data(b, bk, &e->lr);  /* A, B (Table 181) */
@@ -692,7 +700,7 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
         e->has_aspx_cfg = 1;
     }
     mono_data(b, bk, 1, &e->lfe);
-    companding_control(b, 5);
+    companding_control(b, 5, e);
     if (ac4_u(b, 2) != 0)                 /* coding_config */
         ac4_fail(b, AC4E_ELEMENT_PARSE);
     ac4_bit(b);                           /* 2ch_mode */
@@ -710,6 +718,7 @@ void ac4_parse_pair(ac4_bits *b, const ac4_books *bk, int b_iframe,
     e->acpl1 = AC4_ACPL1_NONE;
     e->n_acpl1 = 0;
     e->r_silent = 0;
+    e->comp_present = 0;
     e->has_aspx_cfg = e->has_acpl_cfg = 0;
     audio_size(b, e);
     e->mode = (int)ac4_u(b, 2);           /* stereo_codec_mode */
@@ -722,9 +731,9 @@ void ac4_parse_pair(ac4_bits *b, const ac4_books *bk, int b_iframe,
         }
     }
     if (e->mode == 1)
-        companding_control(b, 2);
+        companding_control(b, 2, e);
     else if (e->mode >= 2)
-        companding_control(b, 1);
+        companding_control(b, 1, e);
     if (e->mode <= 1) {
         stereo_data(b, bk, &e->lr);
         set_blocks(e, e->mode == 1 ? 1 : 0, 0, 1, 0, 0, 0, 0);
