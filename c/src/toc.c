@@ -102,14 +102,17 @@ static int frame_rate_multiply_info(ac4_bits *b, int fri)
     return frf;
 }
 
-static void frame_rate_fractions_info(ac4_bits *b, int fri, int frf)
+/* TS 103 190-2 6.2.1.4 -> frame_rate_fraction */
+static int frame_rate_fractions_info(ac4_bits *b, int fri, int frf)
 {
     if (fri >= 5 && fri <= 9 && frf == 1) {
-        ac4_bit(b);
+        if (ac4_bit(b))
+            return 2;
     } else if (fri >= 10 && fri <= 12) {
         if (ac4_bit(b))
-            ac4_bit(b);
+            return ac4_bit(b) ? 4 : 2;
     }
+    return 1;
 }
 
 static long sgi_specifier(ac4_bits *b)
@@ -138,9 +141,11 @@ static void presentation_config_ext_info(ac4_bits *b)
     ac4_skip(b, (int)(8 * n));
 }
 
-/* 6.2.1.3; *frf_out receives frame_rate_factor */
+/* 6.2.1.3; *frf_out receives frame_rate_factor, *multi is set when
+   frame_rate_factor or frame_rate_fraction is not 1 */
 static void presentation_v1_info(ac4_bits *b, int fri, int *frf_out,
-                                 ac4_toc_pres *p, long *max_group)
+                                 int *multi, ac4_toc_pres *p,
+                                 long *max_group)
 {
     int single = (int)ac4_bit(b);
     uint64_t cfg = 0;
@@ -169,7 +174,8 @@ static void presentation_v1_info(ac4_bits *b, int fri, int *frf_out,
             p->presentation_id = (long)ac4_vb(b, 2);
         frf = frame_rate_multiply_info(b, fri);
         *frf_out = frf;
-        frame_rate_fractions_info(b, fri, frf);
+        if (frame_rate_fractions_info(b, fri, frf) != 1 || frf != 1)
+            *multi = 1;
         emdf_info(b);
         if (ac4_bit(b))                 /* b_presentation_filter */
             p->enabled = (int)ac4_bit(b);   /* b_enable_presentation */
@@ -456,7 +462,7 @@ void ac4_toc_parse(ac4_bits *b, ac4_toc *t)
     }
     for (i = 0; i < n_pres; i++) {
         ac4_toc_pres p;
-        presentation_v1_info(b, fri, &frf, &p, &max_group);
+        presentation_v1_info(b, fri, &frf, &t->rate_multi, &p, &max_group);
         if (t->n_pres < AC4_MAX_PRES)
             t->pres[t->n_pres++] = p;
     }

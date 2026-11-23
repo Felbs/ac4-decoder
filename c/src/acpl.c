@@ -14,7 +14,7 @@
 #include "ac4_internal.h"
 
 #define NSB 64
-#define NTS 24
+#define NTS AC4_MAX_NTS     /* array room; the frame's own count is nts */
 #define HIST 14
 #define MAXL 7
 
@@ -156,7 +156,8 @@ static void band_values(const ac4_acpl_frame *f, int ps,
 
 /* Pseudocode 109 for one quantity, every subband */
 static void interpolate(const double *prev, double sets[2][NSB], int n_sets,
-                        int interp, const int *tsl, int n, double ip[][NSB])
+                        int interp, const int *tsl, int n, int nts,
+                        double ip[][NSB])
 {
     int t, sb;
     for (t = 0; t < n; t++)
@@ -165,14 +166,14 @@ static void interpolate(const double *prev, double sets[2][NSB], int n_sets,
             if (interp == 0) {
                 if (n_sets == 1) {
                     double delta = sets[0][sb] - prev[sb];
-                    v = prev[sb] + (double)(t + 1) * delta / (double)NTS;
-                } else if (t < NTS / 2) {
+                    v = prev[sb] + (double)(t + 1) * delta / (double)nts;
+                } else if (t < nts / 2) {
                     v = prev[sb] + (double)(t + 1) * (sets[0][sb] - prev[sb])
-                        / (double)(NTS / 2);
+                        / (double)(nts / 2);
                 } else {
-                    v = sets[0][sb] + (double)(t - NTS / 2 + 1)
+                    v = sets[0][sb] + (double)(t - nts / 2 + 1)
                         * (sets[1][sb] - sets[0][sb])
-                        / (double)(NTS - NTS / 2);
+                        / (double)(nts - nts / 2);
                 }
             } else if (n_sets == 1) {
                 v = t < tsl[0] ? prev[sb] : sets[0][sb];
@@ -192,7 +193,7 @@ static double abs2(double re, double im)
 }
 
 void ac4_acpl_run(ac4_acpl_state *s, ac4_acpl_work *w,
-                  const ac4_acpl_frame *f, int n,
+                  const ac4_acpl_frame *f, int n, int nts,
                   const double (*xr[2])[64], const double (*xi[2])[64],
                   double (*zr[5])[64], double (*zi[5])[64])
 {
@@ -243,7 +244,7 @@ void ac4_acpl_run(ac4_acpl_state *s, ac4_acpl_work *w,
     }
     s->warm = 1;
     for (k = 0; k < AC4_ACPL_NQ; k++)
-        interpolate(s->prev[k], sets[k], n_sets, interp, tsl, n, ip[k]);
+        interpolate(s->prev[k], sets[k], n_sets, interp, tsl, n, nts, ip[k]);
     if (f->kind == AC4_GRP_DATA)            /* Pseudocode 110 */
         for (k = 0; k < AC4_ACPL_NQ; k++)
             memcpy(s->prev[k], sets[k][n_sets - 1], sizeof(s->prev[k]));

@@ -13,7 +13,9 @@
  * IN is detected from its content (include/ac4dec_input.h): MP4
  * (fragmented or not), AC-4 sync frames, or an MPEG-2 transport stream.
  *
- * OUT is 16-bit PCM at 48 kHz, written with the Python CLI's level rule:
+ * OUT is 16-bit PCM at the stream's external rate (48 kHz, or 44,1 kHz for
+ * fs_index 0) through the resampler of TS 103 190-1 Table 83 for its frame
+ * rate, written with the Python CLI's level rule:
  * samples times 0.9 / ref_peak, ref_peak starting at the element's fixed
  * reference (9e5 for 5.1, 2e5 stereo), rising to the loudest sample of a
  * pass, capped at twice the start (anything above it is clipped), applied
@@ -25,8 +27,8 @@
  * 1 concealed, 2 bad) and the reason.
  *
  * --f64 RAW also writes the decoder-scale samples (before the level rule)
- * as interleaved little-endian float64 at 48 kHz (or the internal rate
- * with --internal): the comparison output.
+ * as interleaved little-endian float64 at the external rate (or the
+ * internal rate with --internal): the comparison output.
  */
 #include <math.h>
 #include <stdio.h>
@@ -37,7 +39,6 @@
 #include "ac4dec.h"
 #include "ac4dec_input.h"
 
-#define FPS (30000.0 / 1001.0)
 
 static void usage(void)
 {
@@ -120,10 +121,10 @@ static void put16(unsigned char *p, unsigned v)
     p[1] = (unsigned char)(v >> 8);
 }
 
-static int wav_header(FILE *f, int ch, unsigned long long data_bytes)
+static int wav_header(FILE *f, int ch, unsigned rate,
+                      unsigned long long data_bytes)
 {
     unsigned char h[44];
-    unsigned rate = 48000;
     if (data_bytes > 0xFFFFFFFFull - 36)
         data_bytes = 0xFFFFFFFFull - 36;
     memcpy(h, "RIFF", 4);
@@ -218,7 +219,7 @@ static unsigned char *read_file(const char *path, size_t *len)
 /* the output of one pass (planar), level rule + resampler + writers */
 typedef struct {
     int n_ch, internal, quiet;
-    long max_pass, nf;
+    long max_pass, nf, ns;
     double *pass, *ibuf, *rout[AC4DEC_MAX_CHANNELS];
     short *pcm16;
     ac4dec_resampler *rs_wav, *rs_raw;
@@ -230,12 +231,13 @@ typedef struct {
 static void sink_flush(sink_t *k)
 {
     double *planar[AC4DEC_MAX_CHANNELS];
-    long ns = k->nf * 1536, s;
+    long ns = k->ns, s;
     int c, no;
     if (k->nf == 0)
         return;
     for (c = 0; c < k->n_ch; c++)
-        planar[c] = k->pass + (size_t)c * (size_t)k->max_pass * 1536;
+        planar[c] = k->pass + (size_t)c * (size_t)k->max_pass
+                              * AC4DEC_MAX_FRAME;
     if (k->fr) {
         /* decoder-scale comparison output */
         if (k->internal) {
@@ -277,19 +279,24 @@ static void sink_flush(sink_t *k)
     fwrite(k->pcm16, 2, (size_t)no * (size_t)k->n_ch, k->fw);
     k->n_out += (unsigned long long)no;
     k->nf = 0;
+    k->ns = 0;
 }
 
 static void sink_frame(sink_t *k, const ac4dec_frame *fo, FILE *st)
 {
-    int c;
-    long off = k->nf * 1536;
+    int c, n = fo->n_samples;
+    long off = k->ns;
+    if (n < 0 || n > AC4DEC_MAX_FRAME)
+        n = 0;
     for (c = 0; c < k->n_ch; c++) {
-        double *dst = k->pass + (size_t)c * (size_t)k->max_pass * 1536 + off;
-        if (c < fo->n_channels && fo->n_samples == 1536)
-            memcpy(dst, fo->pcm[c], sizeof(double) * 1536);
+        double *dst = k->pass + (size_t)c * (size_t)k->max_pass
+                                * AC4DEC_MAX_FRAME + off;
+        if (c < fo->n_channels)
+            memcpy(dst, fo->pcm[c], sizeof(double) * (size_t)n);
         else
-            memset(dst, 0, sizeof(double) * 1536);
+            memset(dst, 0, sizeof(double) * (size_t)n);
     }
+    k->ns += n;
     if (st)
         fprintf(st, "%lld %d %s\n", fo->index, (int)fo->status,
                 fo->reason ? fo->reason : "-");
@@ -315,7 +322,9 @@ int main(int argc, char **argv)
     ac4dec_stats stats;
     FILE *fst = NULL;
     sink_t k;
-    int n_ch;
+    int n_ch, r_fs = 1, r_fri = 3, r_fl = 1536, r_up = 1001, r_down = 960;
+    int out_fs = 48000;
+    double fps = 30000.0 / 1001.0;
 
     memset(&k, 0, sizeof(k));
     for (i = 1; i < argc; i++) {
@@ -401,8 +410,34 @@ int main(int argc, char **argv)
         strncpy(cfg.language, lang, sizeof(cfg.language) - 1);
         cfg.language[sizeof(cfg.language) - 1] = 0;
     }
+    {
+        /* the stream's rate, as the Python probe_rate: the first frame
+           whose TOC parses and whose next frame agrees (Table 83 / 84;
+           29.97 fps at 48 kHz when none or not decodable) */
+        int pf = -1, pr = -1, have = 0;
+        for (f0 = 0; f0 < n_frames && f0 < 64; f0++) {
+            int fs, fri;
+            if (!smp[f0].len
+                || ac4dec_probe_rate(smp[f0].p, smp[f0].len, &fs, &fri)) {
+                pf = pr = -1;
+                continue;
+            }
+            if (fs == pf && fri == pr) {
+                have = 1;
+                break;
+            }
+            pf = fs;
+            pr = fri;
+        }
+        if ((have || pf >= 0)
+            && ac4dec_rate_info(pf, pr, &r_fl, &r_up, &r_down, &out_fs,
+                                &fps) == 0) {
+            r_fs = pf;
+            r_fri = pr;
+        }
+    }
     if (seconds >= 0.0) {
-        long lim = (long)floor(seconds * FPS + 0.5);
+        long lim = (long)floor(seconds * fps + 0.5);
         if (lim < n_frames)
             n_frames = lim < 0 ? 0 : lim;
     }
@@ -450,17 +485,22 @@ int main(int argc, char **argv)
     k.lv.burst = 2.0 * k.lv.ref_peak;
     if (k.lv.ref_peak > k.lv.burst)
         k.lv.ref_peak = k.lv.burst;
-    k.rs_wav = ac4dec_resampler_open(n_ch);
+    (void)r_fs;
+    (void)r_fri;
+    (void)r_fl;
+    k.rs_wav = ac4dec_resampler_open_ratio(n_ch, r_up, r_down);
     if (f64 && !internal)
-        k.rs_raw = ac4dec_resampler_open(n_ch);
-    k.pass = (double *)malloc(sizeof(double) * (size_t)max_pass * 1536
-                              * (size_t)n_ch);
-    k.ibuf = (double *)malloc(sizeof(double) * (size_t)max_pass * 1602
-                              * (size_t)n_ch);
+        k.rs_raw = ac4dec_resampler_open_ratio(n_ch, r_up, r_down);
+    k.pass = (double *)malloc(sizeof(double) * (size_t)max_pass
+                              * AC4DEC_MAX_FRAME * (size_t)n_ch);
+    k.ibuf = (double *)malloc(sizeof(double) * (size_t)max_pass
+                              * AC4DEC_MAX_OUT * (size_t)n_ch);
     for (c = 0; c < n_ch; c++)
         k.rout[c] = (double *)malloc(sizeof(double)
-                                     * ((size_t)max_pass * 1602 + 8));
-    k.pcm16 = (short *)malloc(sizeof(short) * ((size_t)max_pass * 1602 + 8)
+                                     * ((size_t)max_pass * AC4DEC_MAX_OUT
+                                        + 8));
+    k.pcm16 = (short *)malloc(sizeof(short)
+                              * ((size_t)max_pass * AC4DEC_MAX_OUT + 8)
                               * (size_t)n_ch);
     if (!k.rs_wav || (f64 && !internal && !k.rs_raw) || !k.pass || !k.ibuf
         || !k.pcm16) {
@@ -473,7 +513,7 @@ int main(int argc, char **argv)
             return 1;
         }
     k.fw = fopen(dst, "wb");
-    if (!k.fw || wav_header(k.fw, n_ch, 0) != 0) {
+    if (!k.fw || wav_header(k.fw, n_ch, (unsigned)out_fs, 0) != 0) {
         fprintf(stderr, "cannot write %s\n", dst);
         return 1;
     }
@@ -505,7 +545,8 @@ int main(int argc, char **argv)
     }
     sink_flush(&k);
     fseek(k.fw, 0, SEEK_SET);
-    wav_header(k.fw, n_ch, k.n_out * 2ull * (unsigned long long)n_ch);
+    wav_header(k.fw, n_ch, (unsigned)out_fs,
+               k.n_out * 2ull * (unsigned long long)n_ch);
     fclose(k.fw);
     if (k.fr)
         fclose(k.fr);
@@ -526,9 +567,10 @@ int main(int argc, char **argv)
             printf("\n");
         for (i = 0; (r = ac4dec_reason(dec, i, &cnt)) != NULL; i++)
             if (!strcmp(r, "toc.unsupported_rate"))
-                printf("  this decoder renders 48 kHz-family streams at "
-                       "29.97 fps only (TS 103 190-1 frame_rate_index 3); "
-                       "the frames at other rates are silent\n");
+                printf("  frames with frame_rate_factor or "
+                       "frame_rate_fraction above 1, 96/192 kHz substreams "
+                       "or reserved rates are not decoded; they are "
+                       "silent\n");
         if (stats.acpl3)
             printf("  stream is ASPX_ACPL_3 (2-ch core + A-CPL): %s\n",
                    n_ch == 6 ? "5.1 from the A-CPL upmix"
@@ -538,8 +580,8 @@ int main(int argc, char **argv)
                "A-SPX bursts %ld]\n",
                n_frames, stats.n_bad, stats.n_concealed, stats.n_seq_jumps,
                element == AC4DEC_ELEMENT_PAIR ? "pair" : "5_X", n_ch,
-               (double)k.n_out / 48000.0, dst, dt,
-               dt > 0 ? ((double)k.n_out / 48000.0) / dt : 0.0,
+               (double)k.n_out / out_fs, dst, dt,
+               dt > 0 ? ((double)k.n_out / out_fs) / dt : 0.0,
                stats.n_burst);
     }
     ac4dec_close(dec);

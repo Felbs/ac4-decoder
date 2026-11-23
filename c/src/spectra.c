@@ -109,7 +109,7 @@ double ac4_snf_next(ac4_snf_rng *r)
    the squares, as the Python computes it */
 static int band_level(const double *spec, int lo, int hi, double *lev)
 {
-    double sq[1536], e;
+    double sq[AC4_MAX_FRAME], e;
     int k;
     for (k = lo; k < hi; k++)
         sq[k - lo] = spec[k] * spec[k];

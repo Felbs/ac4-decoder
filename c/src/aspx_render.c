@@ -7,16 +7,20 @@
  * ac4/aspx_render.apply_hf_pair; TS 103 190-1 5.7.3, 5.7.4, 5.7.6.
  *
  * The Python renders a whole decode pass at once; this renders frame by
- * frame with the same arithmetic. A frame's envelopes cover QMF slots
- * [24 j + 18 + 2 b0, 24 j + 18 + 2 bn) with 0 <= b0 and bn <= 15 (the
- * aspx.borders rule; TS_OFFSET 18, see aspx_render.TS_OFFSET), i.e. at
- * most to the end of frame j + 1, so frame j is adjusted and synthesised
- * once core frame j + 1 has been analysed.
+ * frame with the same arithmetic. With nts = num_qmf_timeslots, tia =
+ * num_ts_in_ats and TS_OFFSET = nts - ts_offset_hfgen (aspx_bands.
+ * geometry; 24, 2 and 18 at frame length 1536), a frame's envelopes cover
+ * QMF slots [nts j + TS_OFFSET + tia b0, nts j + TS_OFFSET + tia bn) with
+ * 0 <= b0 and bn <= num_aspx_timeslots + 3 (the aspx.borders rule), i.e.
+ * at most to the end of frame j + 1 at every frame length of Table 192,
+ * so frame j is adjusted and synthesised once core frame j + 1 has been
+ * analysed.
  *
  * A slot is HF-generated only when the frame its envelope belongs to
- * (frame floor((slot - 18) / 24)) has A-SPX data or was concealed with a
- * configuration known: the slots of frames from before the stream's first
- * aspx_config keep the core alone (the Python does the same). */
+ * (frame floor((slot - TS_OFFSET) / nts)) has A-SPX data or was concealed
+ * with a configuration known: the slots of frames from before the
+ * stream's first aspx_config keep the core alone (the Python does the
+ * same). */
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,7 +30,6 @@
 #define NSB 64
 #define AC4_PI 3.14159265358979323846   /* np.pi */
 #define NWIN 640
-#define TS_OFFSET 18            /* 24 - ts_offset_hfgen: aspx_render.py */
 #define NOISE_FLOOR_OFFSET 6
 #define PAN_OFFSET 12
 #define EPSILON 1.0
@@ -193,7 +196,19 @@ static void qmf_synth_slot(const ac4_qmf_tables *q, double *filt,
 /* ------------------------------------------------------------ state */
 void ac4_aspx_pair_reset(ac4_aspx_pair *p)
 {
+    ac4_aspx_pair_init(p, AC4_DEFAULT_FRAME);
+}
+
+/* Table 192 / Pseudocode 75a: the time grid at frame length fl */
+void ac4_aspx_pair_init(ac4_aspx_pair *p, int fl)
+{
+    int hf = fl >= 1536 ? 6 : 3;
     memset(p, 0, sizeof(*p));
+    p->fl = fl;
+    p->nts = fl / 64;
+    p->tia = fl >= 1536 ? 2 : 1;
+    p->nats = p->nts / p->tia;
+    p->tso = p->nts - hf;
 }
 
 #define QI(ts) ((int)((ts) % AC4_QRING))
@@ -475,8 +490,8 @@ static void estimate(const ac4_aspx_pair *p, int c, const ac4_aspx_tab *t,
         for (e = 0; e < n_env; e++)
             est[k][e] = 0.0;
     for (e = 0; e < n_env; e++) {
-        long long ta = (long long)bd[e] * 2 + TS_OFFSET + slot;
-        long long tz = (long long)bd[e + 1] * 2 + TS_OFFSET + slot, ts;
+        long long ta = (long long)bd[e] * p->tia + p->tso + slot;
+        long long tz = (long long)bd[e + 1] * p->tia + p->tso + slot, ts;
         int L;
         if (ta < 0)
             ta = 0;
@@ -613,7 +628,7 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
     if (!effective(f))
         return;
     if (f->kind == AC4_GRP_CONCEALED) {
-        long long ta = slot + TS_OFFSET, tz = slot + 24 + TS_OFFSET, ts;
+        long long ta = slot + p->tso, tz = slot + p->nts + p->tso, ts;
         if (ta < 0)
             ta = 0;
         if (tz > nts)
@@ -624,7 +639,7 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
                     p->qre[c][QI(ts)][k] = 0.0;
                     p->qim[c][QI(ts)][k] = 0.0;
                 }
-        p->idx_noise = (p->idx_noise + n_sb * 24) % 512;
+        p->idx_noise = (p->idx_noise + n_sb * p->nts) % 512;
         return;
     }
     d0 = &f->g.c[0];
@@ -667,10 +682,10 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
                c ? &d1->fr : &d0->fr, g, nl);
         /* atsg_sig[0] in QMF slots: Pseudocode 103 counts the noise index
            from the start of the frame's first envelope */
-        t0 = slot + (long long)bd[0] * 2 + TS_OFFSET;
+        t0 = slot + (long long)bd[0] * p->tia + p->tso;
         for (e = 0; e < ne; e++) {
-            long long ta = slot + (long long)bd[e] * 2 + TS_OFFSET;
-            long long tz = slot + (long long)bd[e + 1] * 2 + TS_OFFSET, ts;
+            long long ta = slot + (long long)bd[e] * p->tia + p->tso;
+            long long tz = slot + (long long)bd[e + 1] * p->tia + p->tso, ts;
             if (ta < 0)
                 ta = 0;
             if (tz > nts)
@@ -705,8 +720,8 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
     {
         long long span = 0;
         for (e = 0; e < d0->fr.num_env; e++) {
-            long long a = slot + (long long)b0[e] * 2 + TS_OFFSET;
-            long long z = slot + (long long)b0[e + 1] * 2 + TS_OFFSET;
+            long long a = slot + (long long)b0[e] * p->tia + p->tso;
+            long long z = slot + (long long)b0[e + 1] * p->tia + p->tso;
             if (z > nts)
                 z = nts;
             if (a < 0)
@@ -721,13 +736,13 @@ static void apply_frame(ac4_aspx_pair *p, const ac4_aspx_frame *f,
 
 /* ------------------------------------------------------------ A-CPL */
 /* acpl.render for one frame: the A-CPL of frame f (its parameters in
-   fr->acpl, or none) on slots [24 f + TS_OFFSET, + 24) clipped to nts,
+   fr->acpl, or none) on slots [nts f + TS_OFFSET, + nts) clipped to nts,
    from the pair's A-SPX output into the upmix ring */
 static void acpl_frame(ac4_aspx_pair *p, const ac4_aspx_frame *fr,
                        long long f, long long nts)
 {
     ac4_acpl_work *w = &p->acpl_work;
-    long long a = 24 * f + TS_OFFSET, z = a + 24, ts;
+    long long a = (long long)p->nts * f + p->tso, z = a + p->nts, ts;
     const double (*xr[2])[64], (*xi[2])[64];
     double (*zr[5])[64], (*zi[5])[64];
     int c, n, i;
@@ -750,7 +765,7 @@ static void acpl_frame(ac4_aspx_pair *p, const ac4_aspx_frame *fr,
         zi[c] = w->zi[c];
     }
     ac4_acpl_run(&p->acpl, w, fr && fr->acpl.kind != AC4_GRP_NONE
-                              ? &fr->acpl : NULL, n, xr, xi, zr, zi);
+                              ? &fr->acpl : NULL, n, p->nts, xr, xi, zr, zi);
     for (c = 0; c < 5; c++)
         for (i = 0; i < n; i++) {
             ts = a + i;
@@ -765,7 +780,7 @@ static void acpl_lead(ac4_aspx_pair *p)
 {
     long long ts;
     int c;
-    for (ts = 0; ts < TS_OFFSET; ts++)
+    for (ts = 0; ts < p->tso; ts++)
         for (c = 0; c < 5; c++) {
             if (c < 2) {
                 memcpy(p->ure[c][QI(ts)], p->qre[c][QI(ts)],
@@ -785,14 +800,14 @@ static void synth_frame(ac4_aspx_pair *p, const ac4_qmf_tables *q,
 {
     int c, i;
     for (c = 0; c < 2; c++)
-        for (i = 0; i < 24; i++) {
+        for (i = 0; i < p->nts; i++) {
             long long ts = slot0 + i;
             qmf_synth_slot(q, p->syn[c], p->qre[c][QI(ts)],
                            p->qim[c][QI(ts)], y[c] + 64 * i);
         }
     if (p->acpl_on)
         for (c = 0; c < 5; c++)
-            for (i = 0; i < 24; i++) {
+            for (i = 0; i < p->nts; i++) {
                 long long ts = slot0 + i;
                 qmf_synth_slot(q, p->usyn[c], p->ure[c][QI(ts)],
                                p->uim[c][QI(ts)], p->upout[c] + 64 * i);
@@ -806,43 +821,45 @@ static void delayed_core(const ac4_aspx_pair *p, double *const dc[2])
         return;
     for (c = 0; c < 2; c++)
         if (dc[c])
-            memcpy(dc[c], p->core[c] + 1536 - 577, sizeof(double) * 1536);
+            memcpy(dc[c], p->core[c], sizeof(double) * (size_t)p->fl);
 }
 
 int ac4_aspx_pair_push(ac4_aspx_pair *p, const ac4_qmf_tables *q,
                        const double *const x[2], const ac4_aspx_frame *f,
                        double *const y[2], double *const dc[2])
 {
-    long long j = p->n_in, s0 = j * 24;
-    int c, i, out = 0;
+    long long j = p->n_in, s0 = j * p->nts;
+    int c, i, out = 0, nt = p->nts, fl = p->fl;
     /* analyse core frame j, HF-generating the slots whose frame has
-       A-SPX (slots s0 .. s0+17 belong to frame j - 1's envelopes) */
+       A-SPX (slots s0 .. s0 + TS_OFFSET - 1 belong to frame j - 1's
+       envelopes) */
     for (c = 0; c < 2; c++)
-        for (i = 0; i < 24; i++) {
+        for (i = 0; i < nt; i++) {
             long long ts = s0 + i;
-            const ac4_aspx_frame *own = i < TS_OFFSET ? &p->prev : f;
+            const ac4_aspx_frame *own = i < p->tso ? &p->prev : f;
             double *re = p->qre[c][QI(ts)], *im = p->qim[c][QI(ts)];
             qmf_analyse_slot(q, p->ana[c], x[c] + 64 * i, re, im);
-            if (j == 0 && i < TS_OFFSET)
+            if (j == 0 && i < p->tso)
                 own = NULL;               /* no frame before the first */
             if (own && effective(own))
                 hf_generate(&own->tab, re, im);
         }
     if (j >= 1) {
-        apply_frame(p, &p->prev, s0 - 24, s0 + 24);
+        apply_frame(p, &p->prev, s0 - nt, s0 + nt);
         if (p->acpl_on) {
             if (j == 1)
                 acpl_lead(p);
-            acpl_frame(p, &p->prev, j - 1, s0 + 24);
+            acpl_frame(p, &p->prev, j - 1, s0 + nt);
         }
-        synth_frame(p, q, s0 - 24, y);
+        synth_frame(p, q, s0 - nt, y);
         delayed_core(p, dc);
         out = 1;
     }
-    /* keep the last two core frames */
+    /* keep the last fl + 577 core samples (the delayed core of the next
+       output frame starts 577 samples before this frame's end) */
     for (c = 0; c < 2; c++) {
-        memmove(p->core[c], p->core[c] + 1536, sizeof(double) * 1536);
-        memcpy(p->core[c] + 1536, x[c], sizeof(double) * 1536);
+        memmove(p->core[c], p->core[c] + fl, sizeof(double) * 577);
+        memcpy(p->core[c] + 577, x[c], sizeof(double) * (size_t)fl);
     }
     p->prev = *f;
     p->n_in++;
@@ -852,16 +869,16 @@ int ac4_aspx_pair_push(ac4_aspx_pair *p, const ac4_qmf_tables *q,
 int ac4_aspx_pair_finish(ac4_aspx_pair *p, const ac4_qmf_tables *q,
                          double *const y[2], double *const dc[2])
 {
-    long long s0 = p->n_in * 24;
+    long long s0 = p->n_in * p->nts;
     if (p->n_in < 1)
         return 0;
-    apply_frame(p, &p->prev, s0 - 24, s0);
+    apply_frame(p, &p->prev, s0 - p->nts, s0);
     if (p->acpl_on) {
         if (p->n_in == 1)
             acpl_lead(p);
         acpl_frame(p, &p->prev, p->n_in - 1, s0);
     }
-    synth_frame(p, q, s0 - 24, y);
+    synth_frame(p, q, s0 - p->nts, y);
     delayed_core(p, dc);
     return 1;
 }

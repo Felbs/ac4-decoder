@@ -39,8 +39,9 @@ extern const double AC4T_ASPX_NOISE[512][2];
 /* Table C.10 RANDOM_NOISE_TABLE (float32): spectral noise fill */
 extern const float AC4T_RANDOM_NOISE[256];
 
-/* Index 0..4 = transform length 1536, 768, 384, 192, 96. */
-#define AC4T_N_SFB 5
+/* Table B.4 - B.7 (44,1 / 48 kHz): every transform length, 2048, 1920,
+   1536, 1024, 960, 768, 512, 480, 384, 256, 240, 192, 128, 120, 96. */
+#define AC4T_N_SFB 15
 extern const ac4t_sfb AC4T_SFB[AC4T_N_SFB];
 
 #endif

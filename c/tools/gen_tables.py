@@ -21,7 +21,8 @@ TAB = os.path.join(HERE, "..", "..", "ac4", "tables")
 
 BOOKS = ["ASF_HCB_%d" % i for i in range(1, 12)] + \
     ["ASF_HCB_SCALEFAC", "ASF_HCB_SNF"]
-LENGTHS = (1536, 768, 384, 192, 96)
+LENGTHS = (2048, 1920, 1536, 1024, 960, 768, 512, 480, 384, 256, 240, 192,
+           128, 120, 96)
 # A-SPX books: [ENV_LEVEL_15, ENV_LEVEL_30, ENV_BALANCE_15, ENV_BALANCE_30,
 # NOISE_LEVEL, NOISE_BALANCE] x [F0, DF, DT]
 ASPX = ["ASPX_HCB_%s_%s" % (k, h)

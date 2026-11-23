@@ -101,7 +101,7 @@ static int in_list(const int *v, int n, int x)
 
 
 
-int ac4_aspx_tables(const ac4_aspx_cfg *c, ac4_aspx_tab *t)
+int ac4_aspx_tables(const ac4_aspx_cfg *c, int xover, ac4_aspx_tab *t)
 {
     const int *tpl = c->master_freq_scale == 1 ? TPL_HI : TPL_LO;
     int tpl_len = c->master_freq_scale == 1 ? 23 : 21;
@@ -118,10 +118,14 @@ int ac4_aspx_tables(const ac4_aspx_cfg *c, ac4_aspx_tab *t)
     for (i = 0; i <= n; i++)
         t->master[i] = tpl[base + i];
     t->n_master = n;
-    /* Pseudocode 68, xover 0 */
-    t->n_hi = n;
-    for (s = 0; s <= n; s++)
-        t->hi[s] = t->master[s];
+    /* Pseudocode 68: aspx_xover_subband_offset groups into the master
+       table (fewer than one group left: no usable table, the Python's
+       aspx.config) */
+    t->n_hi = n - xover;
+    if (xover < 0 || t->n_hi < 1)
+        return -1;
+    for (s = 0; s <= t->n_hi; s++)
+        t->hi[s] = t->master[s + xover];
     t->sbx = t->hi[0];
     t->num_sb = t->hi[t->n_hi] - t->sbx;
     /* Pseudocode 69 */
@@ -129,11 +133,11 @@ int ac4_aspx_tables(const ac4_aspx_cfg *c, ac4_aspx_tab *t)
     t->lo[0] = t->hi[0];
     for (s = 1; s <= t->n_lo; s++)
         t->lo[s] = t->n_hi % 2 == 0 ? t->hi[2 * s] : t->hi[2 * s - 1];
-    /* Pseudocode 70 */
+    /* Pseudocode 70: log2(sbz / sbx), from the crossover */
     t->sba = t->master[0];
     t->sbz = t->master[n];
     n_noise = (int)floor((double)c->noise_sbg
-                         * log2((double)t->sbz / (double)t->sba) + 0.5);
+                         * log2((double)t->sbz / (double)t->sbx) + 0.5);
     if (n_noise < 1)
         n_noise = 1;
     if (n_noise > AC4_ASPX_MAX_NOISE)
@@ -242,9 +246,9 @@ static int int_class(ac4_bits *b)
     return ac4_bit(b) ? VARVAR : VARFIX;
 }
 
-static int freq_res(const int *borders, int atsg, int tsg_ptr, int mode)
+static int freq_res(const int *borders, int atsg, int tsg_ptr, int mode,
+                    int nats)
 {
-    const int nats = AC4_ASPX_NATS;
     if (mode == 1)
         return 0;
     if (mode == 3)
@@ -269,11 +273,40 @@ static int sine_at_end(ac4_aspx_state *st, int grp, int ch, int tsg_ptr,
     return r;
 }
 
-static void aspx_framing(ac4_bits *b, const ac4_aspx_cfg *cfg, int b_iframe,
-                         ac4_aspx_state *st, int grp, int ch,
+/* Table 194: tab_border for num_aspx_timeslots 6, 8, 12, 15, 16 and
+   1, 2, 4 envelopes -> 0, or -1 when the table has no entry */
+static int tab_border(int nats, int n, int *a)
+{
+    static const int T6[3][5] = { { 0, 6 }, { 0, 3, 6 }, { 0, 2, 3, 4, 6 } };
+    static const int T8[3][5] = { { 0, 8 }, { 0, 4, 8 }, { 0, 2, 4, 6, 8 } };
+    static const int T12[3][5] = { { 0, 12 }, { 0, 6, 12 },
+                                   { 0, 3, 6, 9, 12 } };
+    static const int T15[3][5] = { { 0, 15 }, { 0, 8, 15 },
+                                   { 0, 4, 8, 12, 15 } };
+    static const int T16[3][5] = { { 0, 16 }, { 0, 8, 16 },
+                                   { 0, 4, 8, 12, 16 } };
+    const int (*tb)[5];
+    int i, k = n == 1 ? 0 : n == 2 ? 1 : n == 4 ? 2 : -1;
+    switch (nats) {
+    case 6: tb = T6; break;
+    case 8: tb = T8; break;
+    case 12: tb = T12; break;
+    case 15: tb = T15; break;
+    case 16: tb = T16; break;
+    default: return -1;
+    }
+    if (k < 0)
+        return -1;
+    for (i = 0; i <= n; i++)
+        a[i] = tb[k][i];
+    return 0;
+}
+
+static void aspx_framing(ac4_bits *b, const ac4_aspx_cfg *cfg, int nats,
+                         int b_iframe, ac4_aspx_state *st, int grp, int ch,
                          ac4_aspx_framing *f)
 {
-    const int nats = AC4_ASPX_NATS, n_rel_bits = 2;
+    const int n_rel_bits = nats > 8 ? 2 : 1;
     int ic = int_class(b), num_env, tsg_ptr, e;
     int rel_l[8], rel_r[8], n_l = 0, n_r = 0, var_l = 0, var_r = 0, i;
     int *a = f->borders;
@@ -282,9 +315,8 @@ static void aspx_framing(ac4_bits *b, const ac4_aspx_cfg *cfg, int b_iframe,
         int envbits = cfg->num_env_bits_fixfix + 1;
         num_env = 1 << ac4_u(b, envbits);
         tsg_ptr = -1;                     /* FIXFIX: no aspx_tsg_ptr */
-        for (i = 0; i < num_env; i++)       /* Python round(): half even */
-            a[i] = (int)nearbyint((double)(i * nats) / (double)num_env);
-        a[num_env] = nats;
+        if (tab_border(nats, num_env, a) != 0)   /* Tables 194, 127 */
+            ac4_fail(b, AC4E_ASPX_NUM_ENV);
     } else {
         int k;
         if (ic == FIXVAR) {
@@ -354,7 +386,7 @@ static void aspx_framing(ac4_bits *b, const ac4_aspx_cfg *cfg, int b_iframe,
     } else {
         for (e = 0; e < num_env; e++)
             f->freq_res[e] = freq_res(a, e, tsg_ptr < 0 ? 0 : tsg_ptr,
-                                      cfg->freq_res_mode);
+                                      cfg->freq_res_mode, nats);
     }
     st->stop[grp][ch] = a[num_env];
     st->has[grp][ch] = 1;
@@ -385,9 +417,8 @@ static void skip_bits(ac4_bits *b, int n)
 /* Tables 55 and 56 (add-harmonic flags read, not used: the Python keeps
    them but never renders them) */
 static void hfgen_iwc(ac4_bits *b, const ac4_aspx_tab *t, int two_ch,
-                      int balance)
+                      int balance, int nats)
 {
-    const int nats = AC4_ASPX_NATS;
     int n_noise = t->n_noise, n_hi = t->n_hi, i;
     for (i = 0; i < n_noise; i++)
         ac4_u(b, 2);                          /* aspx_tna_mode ch0 */
@@ -491,11 +522,13 @@ static void ec_noise(ac4_bits *b, const ac4_aspx_books *bk,
 }
 
 void ac4_aspx_data(ac4_bits *b, const ac4_aspx_books *bk,
-                   const ac4_aspx_tab *t, const ac4_aspx_cfg *cfg,
-                   int b_iframe, int two_ch, ac4_aspx_state *st, int grp,
-                   ac4_aspx_grp *out)
+                   const ac4_aspx_cfg *cfg, int nats, int b_iframe,
+                   int two_ch, ac4_aspx_state *st, int grp,
+                   ac4_aspx_grp *out, ac4_aspx_tab *tab_out)
 {
     ac4_aspx_grp tmp;
+    ac4_aspx_tab tab;
+    const ac4_aspx_tab *t = &tab;
     ac4_aspx_chd *c0, *c1;
     int q0, q1, balance, sm1;
     if (!out)
@@ -503,15 +536,22 @@ void ac4_aspx_data(ac4_bits *b, const ac4_aspx_books *bk,
     memset(out, 0, sizeof(*out));
     c0 = &out->c[0];
     c1 = &out->c[1];
+    /* aspx_xover_subband_offset (I-frames; held per block up to the next
+       one) selects this block's tables (Pseudocode 68) */
     if (b_iframe)
-        ac4_u(b, 3);                          /* aspx_xover_subband_offset */
-    aspx_framing(b, cfg, b_iframe, st, grp, 0, &c0->fr);
+        st->xover[grp] = (int)ac4_u(b, 3);
+    out->xover = st->xover[grp];
+    if (ac4_aspx_tables(cfg, out->xover, &tab) != 0)
+        ac4_fail(b, AC4E_ASPX_CONFIG);
+    if (tab_out)
+        *tab_out = tab;
+    aspx_framing(b, cfg, nats, b_iframe, st, grp, 0, &c0->fr);
     q0 = cfg->quant_mode_env;
     if (c0->fr.int_class == FIXFIX && c0->fr.num_env == 1)
         q0 = 0;
     if (!two_ch) {
         delta_dir(b, &c0->fr, c0->dir_sig, c0->dir_noise);
-        hfgen_iwc(b, t, 0, 0);
+        hfgen_iwc(b, t, 0, 0, nats);
         ec_sig(b, bk, t, c0, q0, 0);
         ec_noise(b, bk, t, c0, 0);
         c0->balance = 0;
@@ -532,14 +572,14 @@ void ac4_aspx_data(ac4_bits *b, const ac4_aspx_books *bk,
         st->stop[grp][1] = st->stop[grp][0];
         st->has[grp][1] = st->has[grp][0];
     } else {
-        aspx_framing(b, cfg, b_iframe, st, grp, 1, &c1->fr);
+        aspx_framing(b, cfg, nats, b_iframe, st, grp, 1, &c1->fr);
         q1 = cfg->quant_mode_env;
         if (c1->fr.int_class == FIXFIX && c1->fr.num_env == 1)
             q1 = 0;
     }
     delta_dir(b, &c0->fr, c0->dir_sig, c0->dir_noise);
     delta_dir(b, &c1->fr, c1->dir_sig, c1->dir_noise);
-    hfgen_iwc(b, t, 1, balance);
+    hfgen_iwc(b, t, 1, balance, nats);
     sm1 = balance ? 1 : 0;
     ec_sig(b, bk, t, c0, q0, 0);
     ec_sig(b, bk, t, c1, q1, sm1);

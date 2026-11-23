@@ -44,7 +44,8 @@ enum {
     AC4E_GUARD_LEVEL,      /* guard.level (output guard) */
     AC4E_ASPX_LEVEL,       /* aspx.level (A-SPX level check) */
     AC4E_TOC_PRESENTATION, /* toc.presentation (no decodable substream) */
-    AC4E_TOC_UNSUPPORTED,  /* toc.unsupported_rate (not 48 kHz, 29.97) */
+    AC4E_TOC_UNSUPPORTED,  /* toc.unsupported_rate (rates.py) */
+    AC4E_TRANSF_LEN,       /* asf.transf_length (Table 103: not defined) */
     AC4E_COUNT
 };
 const char *ac4_reason_name(int code);
@@ -179,6 +180,8 @@ typedef struct {
     int sequence_counter;
     int fs_index;
     int frame_rate_index;
+    int rate_multi;        /* a presentation with frame_rate_factor or
+                              frame_rate_fraction other than 1 */
     int b_iframe_global;
     long n_presentations;
     long payload_base;
@@ -220,13 +223,26 @@ void ac4_toc_substream_info_chan(ac4_bits *b, int present, int frf,
 /* ------------------------------------------------------------ ASF */
 #define AC4_MAX_WIN 17
 #define AC4_MAX_SFB 64
+#define AC4_MAX_FRAME 2048      /* the longest frame_len_base (Table 83) */
+#define AC4_DEFAULT_FRAME 1536  /* frames before the stream's rate is known */
+
+/* rates.py: Table 83 / 84. -> frame_len_base, or 0 when not defined */
+int ac4_frame_len_base(int fs_index, int frame_rate_index);
+/* the decoder resampling ratio (up, down); 1, 1 for frame_rate_index 13 */
+void ac4_rate_ratio(int fs_index, int frame_rate_index, int *up, int *down);
 
 typedef struct {
+    int fl;                     /* frame_len_base */
     int is_long;
     int tl[2];
+    int lens[2];                /* transform length of each half */
     int different;
     int max_sfb[2];
     int n_max_sfb;
+    int max_sfb_side[2];        /* ASPX_ACPL_1 (b_dual_maxsfb /
+                                   b_side_limited) */
+    int n_max_sfb_side;
+    int side;                   /* the groups use max_sfb_side */
     int num_windows, num_groups;
     int w2g[AC4_MAX_WIN];
     int nwin[AC4_MAX_WIN];
@@ -241,7 +257,7 @@ typedef struct {
 
 typedef struct {
     const ac4_framing *fr;
-    int32_t lines[1536];
+    int32_t lines[AC4_MAX_FRAME];
     int n_lines;                /* packed length ("total") */
     int16_t sfs[AC4_MAX_WIN][AC4_MAX_SFB];   /* AC4_SF_NONE = not sent */
     int has_snf;
@@ -273,6 +289,7 @@ typedef struct {
     const ac4_huff *cb[12];     /* 1..11 */
     const ac4_huff *sf;
     const ac4_huff *snf;
+    int fl;                     /* the stream's frame_len_base */
 } ac4_books;
 
 /* ------------------------------------------------------------ A-SPX config */
@@ -310,7 +327,8 @@ void ac4_parse_pair(ac4_bits *b, const ac4_books *bk, int b_iframe,
 /* ------------------------------------------------------------ A-SPX
  * Port of ac4/aspx_bands.py, aspx_parse.py, aspx_env.py, aspx_envadj.py,
  * aspx_hfgen.py, aspx_render.py, qmf.py and acpl_parse.py. */
-#define AC4_ASPX_NATS 12        /* num_aspx_timeslots (1536 / 64 / 2) */
+#define AC4_ASPX_MAX_NATS 16    /* num_aspx_timeslots (Pseudocode 75a) */
+#define AC4_MAX_NTS 32          /* num_qmf_timeslots at frame length 2048 */
 #define AC4_ASPX_MAX_ENV 8      /* FIXFIX: 1 << u(2) */
 #define AC4_ASPX_MAX_SBG 24
 #define AC4_ASPX_MAX_NOISE 16
@@ -334,7 +352,7 @@ typedef struct {                /* Pseudocodes 67-72 (aspx_bands.sbg_tables) */
 /* -> 0, or -1 when the configuration gives no usable tables (the
    Python's aspx.config rule, plus patches that would index outside the
    64 QMF subbands, which the Python would fail on later). */
-int ac4_aspx_tables(const ac4_aspx_cfg *c, ac4_aspx_tab *t);
+int ac4_aspx_tables(const ac4_aspx_cfg *c, int xover, ac4_aspx_tab *t);
 
 typedef struct {
     int int_class, num_env, num_noise;
@@ -357,6 +375,7 @@ typedef struct {                /* one channel of aspx_data_1ch/2ch */
 
 typedef struct {
     ac4_aspx_chd c[2];
+    int xover;                  /* aspx_xover_subband_offset in force */
 } ac4_aspx_grp;
 
 /* previous_stop_pos per (channel group 0..2, channel 0..1) */
@@ -368,6 +387,7 @@ typedef struct {
        (Pseudocode 92), and whether there was one */
     int ptr[3][2], nenv[3][2];
     uint8_t has_ptr[3][2];
+    int xover[3];               /* aspx_xover_subband_offset per block */
 } ac4_aspx_state;
 
 typedef struct {
@@ -379,13 +399,15 @@ typedef struct {
 int ac4_aspx_books_init(ac4_aspx_books *bk);
 void ac4_aspx_books_free(ac4_aspx_books *bk);
 
-/* aspx_data_2ch (two_ch) or aspx_data_1ch into *out (may be NULL).
-   Raises AC4E_ASPX_PARSE (out of bits, no codeword), AC4E_ASPX_NUM_ENV,
-   AC4E_ASPX_BORDERS. */
+/* aspx_data_2ch (two_ch) or aspx_data_1ch into *out (may be NULL), for
+   num_aspx_timeslots nats; tab_out (may be NULL) receives the block's
+   tables (cfg at its aspx_xover_subband_offset). Raises AC4E_ASPX_PARSE
+   (out of bits, no codeword), AC4E_ASPX_NUM_ENV, AC4E_ASPX_BORDERS,
+   AC4E_ASPX_CONFIG. */
 void ac4_aspx_data(ac4_bits *b, const ac4_aspx_books *bk,
-                   const ac4_aspx_tab *t, const ac4_aspx_cfg *cfg,
-                   int b_iframe, int two_ch, ac4_aspx_state *st, int grp,
-                   ac4_aspx_grp *out);
+                   const ac4_aspx_cfg *cfg, int nats, int b_iframe,
+                   int two_ch, ac4_aspx_state *st, int grp,
+                   ac4_aspx_grp *out, ac4_aspx_tab *tab_out);
 /* ------------------------------------------------------------ A-CPL
  * Port of ac4/acpl_parse.py (quantised_2ch) and ac4/acpl.py: the upmix
  * of 5_X_codec_mode ASPX_ACPL_3, TS 103 190-1 5.7.7. */
@@ -424,20 +446,21 @@ typedef struct {
 
 /* scratch space of ac4_acpl_run (no state) */
 typedef struct {
-    double ip[AC4_ACPL_NQ][24][64];
+    double ip[AC4_ACPL_NQ][AC4_MAX_NTS][64];
     double sets[AC4_ACPL_NQ][2][64];
-    double vr[3][14 + 24][64], vi[3][14 + 24][64];
-    double ur[3][7 + 24][64], ui[3][7 + 24][64];
+    double vr[3][14 + AC4_MAX_NTS][64], vi[3][14 + AC4_MAX_NTS][64];
+    double ur[3][7 + AC4_MAX_NTS][64], ui[3][7 + AC4_MAX_NTS][64];
     /* the renderer's gather / scatter buffers */
-    double xr[2][24][64], xi[2][24][64];
-    double zr[5][24][64], zi[5][24][64];
+    double xr[2][AC4_MAX_NTS][64], xi[2][AC4_MAX_NTS][64];
+    double zr[5][AC4_MAX_NTS][64], zi[5][AC4_MAX_NTS][64];
 } ac4_acpl_work;
 
-/* acpl.upmix_frame / render for one frame of n (<= 24) slots: x[c] the
-   pair's QMF slots (re, im: [n][64]); z[ch] receives L, R, C, Ls, Rs.
-   f NULL = no A-CPL data (passthrough, state cleared). */
+/* acpl.upmix_frame / render for one frame of n (<= nts) slots, nts =
+   num_qmf_timeslots: x[c] the pair's QMF slots (re, im: [n][64]); z[ch]
+   receives L, R, C, Ls, Rs. f NULL = no A-CPL data (passthrough, state
+   cleared). */
 void ac4_acpl_run(ac4_acpl_state *s, ac4_acpl_work *w,
-                  const ac4_acpl_frame *f, int n,
+                  const ac4_acpl_frame *f, int n, int nts,
                   const double (*xr[2])[64], const double (*xi[2])[64],
                   double (*zr[5])[64], double (*zi[5])[64]);
 
@@ -448,7 +471,7 @@ void ac4_acpl_run(ac4_acpl_state *s, ac4_acpl_work *w,
  * delays the pair by 577 samples. */
 enum { AC4_GRP_NONE = 0, AC4_GRP_CONCEALED, AC4_GRP_DATA };
 
-#define AC4_QRING 96            /* QMF slots kept (4 frames) */
+#define AC4_QRING 128           /* QMF slots kept (4 frames of 2048) */
 
 typedef struct {
     int kind;                   /* AC4_GRP_* */
@@ -463,6 +486,7 @@ ac4_qmf_tables *ac4_qmf_tables_new(void);
 void ac4_qmf_tables_free(ac4_qmf_tables *q);
 
 typedef struct {
+    int fl, nts, tia, nats, tso;    /* the time grid (Table 192) */
     long long n_in;             /* core frames taken */
     double ana[2][640];
     double syn[2][1280];
@@ -477,7 +501,8 @@ typedef struct {
     ac4_aspx_frame prev;
     ac4_aspx_tab tab;           /* tables of the frame being analysed */
     int has_tab;
-    double core[2][2 * 1536];   /* the last two core frames */
+    double core[2][AC4_MAX_FRAME + 577];    /* the last fl + 577 core
+                                               samples */
     int hot_left;               /* burst guard: frames still owed */
     long n_applied;
     /* A-CPL (ASPX_ACPL_3 decoded to 5.1): on, its state, the upmixed
@@ -487,11 +512,13 @@ typedef struct {
     ac4_acpl_work acpl_work;
     double ure[5][AC4_QRING][64], uim[5][AC4_QRING][64];
     double usyn[5][1280];
-    double upout[5][1536];      /* the last output frame's upmix */
+    double upout[5][AC4_MAX_FRAME];   /* the last output frame's upmix */
 } ac4_aspx_pair;
 
+/* reset to the time grid of frame length 1536 / fl */
 void ac4_aspx_pair_reset(ac4_aspx_pair *p);
-/* Take core frame j (x[0], x[1]: 1536 samples each) with its A-SPX
+void ac4_aspx_pair_init(ac4_aspx_pair *p, int fl);
+/* Take core frame j (x[0], x[1]: p->fl samples each) with its A-SPX
    frame f. When j >= 1, writes the pair's output frame j - 1 to y[0],
    y[1], and (dc not NULL) the core delayed by the QMF bank's 577 samples
    aligned with it to dc[0], dc[1]; returns 1. Else returns 0. */
@@ -529,8 +556,11 @@ void ac4_snf_reset(ac4_snf_rng *r, int sequence_counter);
 double ac4_snf_next(ac4_snf_rng *r);
 void ac4_noise_fill(const ac4_chan *ch, double *spec, int n,
                     ac4_snf_rng *r, jmp_buf *jb);
-/* sf_info (asf_transform_info + asf_psy_info), for the unit tests */
-void ac4_framing_parse(ac4_bits *b, ac4_framing *f);
+/* sf_info (asf_transform_info + asf_psy_info) at frame length fl */
+void ac4_framing_parse(ac4_bits *b, ac4_framing *f, int fl);
+void ac4_framing_parse_ex(ac4_bits *b, ac4_framing *f, int fl,
+                          int dual_maxsfb, int side_limited);
+void ac4_framing_side(const ac4_framing *src, ac4_framing *f);
 void ac4_unmix(double *m, double *s, int n, const ac4_stereo *st,
                const ac4_framing *fr);
 /* Packed -> per-window spectra. win[w] (w < num_windows) must hold at
@@ -544,17 +574,22 @@ ac4_fb_tables *ac4_fb_tables_new(void);
 void ac4_fb_tables_free(ac4_fb_tables *t);
 
 typedef struct {
-    double overlap[1536];
+    double overlap[AC4_MAX_FRAME];
     int n_prev;                 /* 0 = no block yet */
+    int n_full;                 /* the frame length (0: 1536) */
 } ac4_fb_state;
 
-/* One block of n spectral lines -> n output samples. tmp: >= 3*1536. */
+/* One block of n spectral lines -> n output samples. tmp: >= 3 *
+   AC4_MAX_FRAME. */
 void ac4_fb_block(const ac4_fb_tables *t, ac4_fb_state *s, const double *X,
                   int n, double *out, double *tmp);
 
 /* ------------------------------------------------------------ resampler */
 typedef struct ac4_rs_filter ac4_rs_filter;
-ac4_rs_filter *ac4_rs_filter_new(void);
+ac4_rs_filter *ac4_rs_filter_new(void);                 /* 1001 / 960 */
+ac4_rs_filter *ac4_rs_filter_new_ratio(int up, int down);
+/* -> 1 when the ratio is 1 (samples pass through) */
+int ac4_rs_ratio(const ac4_rs_filter *f, int *up, int *down);
 void ac4_rs_filter_free(ac4_rs_filter *f);
 
 #define AC4_RS_HIST 64

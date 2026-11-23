@@ -14,11 +14,39 @@
 #define SF_CENTRE 60
 #define SNF_CENTRE 17
 
-/* Table 105 n_msfb_bits by transform length; Table 108 n_grp_bits. */
-static const int SHORT_LEN[4] = { 96, 192, 384, 768 };
+/* TS 103 190-1 4.3.6.1-4.3.6.2, 44,1 / 48 kHz: Table 100 (partial
+   blocks, frame_len_base >= 1536), Table 103 (frame_len_base < 1536; 0 =
+   not defined), Table 109 / 110 (n_grp_bits), Table 106 (n_msfb_bits,
+   n_side_bits, n_msfbl_bits) */
+static int transf_len_long(int fl, int t)
+{
+    static const int L2048[4] = { 128, 256, 512, 1024 };
+    static const int L1920[4] = { 120, 240, 480, 960 };
+    static const int L1536[4] = { 96, 192, 384, 768 };
+    return fl == 2048 ? L2048[t] : fl == 1920 ? L1920[t] : L1536[t];
+}
+
+static int transf_len_short(int fl, int t)
+{
+    switch (fl) {
+    case 1024: return 128 << t;
+    case 960: return 120 << t;
+    case 768: return 96 << t;
+    case 512: return t < 3 ? 128 << t : 0;
+    case 384: return t < 3 ? 96 << t : 0;
+    }
+    return 0;
+}
+
 static const int N_GRP_BITS[4][4] = {
     { 15, 10, 8, 7 }, { 10, 7, 4, 3 }, { 8, 4, 3, 1 }, { 7, 3, 1, 1 }
 };
+
+static int n_grp_bits_short(int fl, int t)
+{
+    static const int A[4] = { 7, 3, 1, 0 }, B[3] = { 3, 1, 0 };
+    return fl >= 768 ? A[t] : B[t];
+}
 
 static const int CB_MOD[12] = { 0, 3, 3, 3, 3, 9, 9, 8, 8, 13, 13, 17 };
 static const int CB_OFF[12] = { 0, 1, 1, 0, 0, 4, 4, 0, 0, 0, 0, 0 };
@@ -40,6 +68,20 @@ static int n_msfb_bits(int length)
     if (length >= 192)
         return 5;
     return 4;
+}
+
+static int n_side_bits(int length)
+{
+    if (length >= 480)
+        return 5;
+    if (length >= 240 || length == 384)
+        return 4;
+    return 3;
+}
+
+static int n_msfbl_bits(int fl)
+{
+    return fl >= 1536 ? 3 : 2;
 }
 
 /* ------------------------------------------------------------ Huffman */
@@ -93,17 +135,26 @@ void ac4_huff_free(ac4_huff *h)
 }
 
 /* ------------------------------------------------------------ framing */
+static int nw0_of(const ac4_framing *f)
+{
+    return 1 << (3 - f->tl[0]);     /* num_windows_0, Pseudocodes 2, 3 */
+}
+
 static void framing_derive(ac4_framing *f)
 {
     int g, base = 0, nw0 = 0;
     if (f->different)
-        nw0 = 1 << (3 - f->tl[0]);
+        nw0 = nw0_of(f);
     for (g = 0; g < f->num_groups; g++) {
         int half = 0;
+        const int *ms = (f->side && f->n_max_sfb_side) ? f->max_sfb_side
+                                                        : f->max_sfb;
+        int nm = (f->side && f->n_max_sfb_side) ? f->n_max_sfb_side
+                                                 : f->n_max_sfb;
         if (f->different)
             half = g >= f->w2g[nw0] ? 1 : 0;
-        f->glen[g] = f->is_long ? 1536 : SHORT_LEN[f->tl[half]];
-        f->gmax[g] = f->max_sfb[half < f->n_max_sfb ? half : f->n_max_sfb - 1];
+        f->glen[g] = f->lens[half];
+        f->gmax[g] = ms[half < nm ? half : nm - 1];
         f->gtab[g] = sfb_for(f->glen[g]);
         f->gbase[g] = base;
         {
@@ -114,42 +165,81 @@ static void framing_derive(ac4_framing *f)
     }
 }
 
+/* Pseudocode 6: n_sect_bits = 3 when get_transf_length(g) <= 2 */
 static int n_sect_bits(const ac4_framing *f, int g)
 {
-    int half;
-    if (f->is_long)
-        return 5;
-    half = 0;
-    if (f->different)
-        half = g >= f->w2g[1 << (3 - f->tl[0])] ? 1 : 0;
-    return f->tl[half] <= 2 ? 3 : 5;
+    int half = 0, tlg;
+    if (f->fl >= 1536) {
+        if (f->is_long)
+            return 5;
+        if (f->different)
+            half = g >= f->w2g[nw0_of(f)] ? 1 : 0;
+        tlg = f->tl[half];
+    } else {
+        tlg = f->tl[0];
+    }
+    return tlg <= 2 ? 3 : 5;
 }
 
-void ac4_framing_parse(ac4_bits *b, ac4_framing *f)
+void ac4_framing_parse(ac4_bits *b, ac4_framing *f, int fl)
+{
+    ac4_framing_parse_ex(b, f, fl, 0, 0);
+}
+
+/* asf_transform_info + asf_psy_info (Tables 37, 38; Pseudocodes 2-5)
+   for frame length fl. b_dual_maxsfb / b_side_limited: the max_sfb_side
+   fields of ASPX_ACPL_1. */
+void ac4_framing_parse_ex(ac4_bits *b, ac4_framing *f, int fl,
+                          int dual_maxsfb, int side_limited)
 {
     int n_grp, i, sfg[AC4_MAX_WIN + 1];
     memset(f, 0, sizeof(*f));
-    f->is_long = (int)ac4_bit(b);
-    if (!f->is_long) {
+    f->fl = fl;
+    if (fl >= 1536) {
+        f->is_long = (int)ac4_bit(b);
+        if (!f->is_long) {
+            f->tl[0] = (int)ac4_u(b, 2);
+            f->tl[1] = (int)ac4_u(b, 2);
+        }
+        f->different = !f->is_long && f->tl[0] != f->tl[1];
+        f->lens[0] = f->is_long ? fl : transf_len_long(fl, f->tl[0]);
+        f->lens[1] = f->is_long ? fl : transf_len_long(fl, f->tl[1]);
+    } else {
         f->tl[0] = (int)ac4_u(b, 2);
-        f->tl[1] = (int)ac4_u(b, 2);
+        f->lens[0] = f->lens[1] = transf_len_short(fl, f->tl[0]);
+        if (!f->lens[0])
+            ac4_fail(b, AC4E_TRANSF_LEN);
+        f->is_long = f->lens[0] == fl;
+        f->different = 0;
     }
-    f->different = !f->is_long && f->tl[0] != f->tl[1];
     {
-        int len0 = f->is_long ? 1536 : SHORT_LEN[f->tl[0]];
-        f->max_sfb[0] = (int)ac4_u(b, n_msfb_bits(len0));
-        f->n_max_sfb = 1;
-        if (f->different) {
-            f->max_sfb[1] = (int)ac4_u(b, n_msfb_bits(SHORT_LEN[f->tl[1]]));
-            f->n_max_sfb = 2;
+        int nh = f->different ? 2 : 1;
+        for (i = 0; i < nh; i++) {
+            int len = f->lens[i];
+            if (side_limited) {
+                f->max_sfb_side[i] = (int)ac4_u(b, n_side_bits(len));
+                f->max_sfb[i] = f->max_sfb_side[i];
+                f->n_max_sfb_side++;
+            } else {
+                f->max_sfb[i] = (int)ac4_u(b, n_msfb_bits(len));
+                if (dual_maxsfb) {
+                    f->max_sfb_side[i] = (int)ac4_u(b, n_msfb_bits(len));
+                    f->n_max_sfb_side++;
+                }
+            }
+            f->n_max_sfb++;
         }
-        for (i = 0; i < f->n_max_sfb; i++) {
-            int len = f->is_long ? 1536 : SHORT_LEN[f->tl[i]];
-            if (f->max_sfb[i] > sfb_for(len)->num_sfb)
+        for (i = 0; i < f->n_max_sfb; i++)
+            if (f->max_sfb[i] > sfb_for(f->lens[i])->num_sfb)
                 ac4_fail(b, AC4E_MAX_SFB);
-        }
+        for (i = 0; i < f->n_max_sfb_side; i++)
+            if (f->max_sfb_side[i] > sfb_for(f->lens[i])->num_sfb)
+                ac4_fail(b, AC4E_MAX_SFB);
     }
-    n_grp = f->is_long ? 0 : N_GRP_BITS[f->tl[0]][f->tl[1]];
+    if (fl >= 1536)
+        n_grp = f->is_long ? 0 : N_GRP_BITS[f->tl[0]][f->tl[1]];
+    else
+        n_grp = n_grp_bits_short(fl, f->tl[0]);
     for (i = 0; i < n_grp; i++)
         sfg[i] = (int)ac4_bit(b);
     /* Pseudocode 3 */
@@ -159,7 +249,7 @@ void ac4_framing_parse(ac4_bits *b, ac4_framing *f)
     if (!f->is_long) {
         f->num_windows = n_grp + 1;
         if (f->different) {
-            int nw0 = 1 << (3 - f->tl[0]);
+            int nw0 = nw0_of(f);
             sfg[n_grp] = 0;
             for (i = n_grp; i > nw0 - 1; i--)
                 sfg[i] = sfg[i - 1];
@@ -181,11 +271,23 @@ void ac4_framing_parse(ac4_bits *b, ac4_framing *f)
     framing_derive(f);
 }
 
-static void framing_lfe(ac4_bits *b, ac4_framing *f)
+/* the same framing read for the side channel (Pseudocode 5,
+   b_side_channel = 1: its groups use max_sfb_side) */
+void ac4_framing_side(const ac4_framing *src, ac4_framing *f)
+{
+    *f = *src;
+    f->side = 1;
+    framing_derive(f);
+}
+
+static void framing_lfe(ac4_bits *b, ac4_framing *f, int fl)
 {
     memset(f, 0, sizeof(*f));
+    f->fl = fl;
     f->is_long = 1;
-    f->max_sfb[0] = (int)ac4_u(b, 3);
+    f->tl[0] = 3;
+    f->lens[0] = f->lens[1] = fl;
+    f->max_sfb[0] = (int)ac4_u(b, n_msfbl_bits(fl));
     f->n_max_sfb = 1;
     f->num_windows = 1;
     f->num_groups = 1;
@@ -337,8 +439,8 @@ static void sf_data(ac4_bits *b, const ac4_books *bk, const ac4_framing *f,
         if (e > total)
             total = e;
     }
-    if (total > 1536)
-        total = 1536;
+    if (total > AC4_MAX_FRAME)
+        total = AC4_MAX_FRAME;
     c->n_lines = total;
     memset(c->lines, 0, sizeof(int32_t) * (size_t)total);
     for (g = 0; g < G; g++)
@@ -421,12 +523,12 @@ static void two_channel_data(ac4_bits *b, const ac4_books *bk, ac4_pair *p)
 {
     p->st.sap_mode = -1;
     if (ac4_bit(b)) {                     /* b_enable_mdct_stereo_proc */
-        ac4_framing_parse(b, &p->fr[0]);
+        ac4_framing_parse(b, &p->fr[0], bk->fl);
         chparam_info(b, bk, &p->fr[0], &p->st);
         p->fr[1] = p->fr[0];
     } else {
-        ac4_framing_parse(b, &p->fr[0]);
-        ac4_framing_parse(b, &p->fr[1]);
+        ac4_framing_parse(b, &p->fr[0], bk->fl);
+        ac4_framing_parse(b, &p->fr[1], bk->fl);
     }
     sf_data(b, bk, &p->fr[0], &p->ch[0]);
     sf_data(b, bk, &p->fr[1], &p->ch[1]);
@@ -439,16 +541,16 @@ static void stereo_data(ac4_bits *b, const ac4_books *bk, ac4_pair *p)
 {
     p->st.sap_mode = -1;
     if (ac4_bit(b)) {                     /* b_enable_mdct_stereo_proc */
-        ac4_framing_parse(b, &p->fr[0]);
+        ac4_framing_parse(b, &p->fr[0], bk->fl);
         chparam_info(b, bk, &p->fr[0], &p->st);
         p->fr[1] = p->fr[0];
     } else {
         if (ac4_bit(b) != 0)              /* spec_frontend_l: SSF */
             ac4_fail(b, AC4E_ELEMENT_PARSE);
-        ac4_framing_parse(b, &p->fr[0]);
+        ac4_framing_parse(b, &p->fr[0], bk->fl);
         if (ac4_bit(b) != 0)              /* spec_frontend_r: SSF */
             ac4_fail(b, AC4E_ELEMENT_PARSE);
-        ac4_framing_parse(b, &p->fr[1]);
+        ac4_framing_parse(b, &p->fr[1], bk->fl);
     }
     sf_data(b, bk, &p->fr[0], &p->ch[0]);
     sf_data(b, bk, &p->fr[1], &p->ch[1]);
@@ -458,11 +560,11 @@ static void mono_data(ac4_bits *b, const ac4_books *bk, int lfe,
                       ac4_mono *m)
 {
     if (lfe) {
-        framing_lfe(b, &m->fr);
+        framing_lfe(b, &m->fr, bk->fl);
     } else {
         if (ac4_bit(b) != 0)              /* spec_frontend: SSF */
             ac4_fail(b, AC4E_ELEMENT_PARSE);
-        ac4_framing_parse(b, &m->fr);
+        ac4_framing_parse(b, &m->fr, bk->fl);
     }
     sf_data(b, bk, &m->fr, &m->ch);
 }

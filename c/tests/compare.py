@@ -12,8 +12,9 @@ AC4_CPORT_OUT (default ~/.cache/ac4-cport).
 
 Both sides decode with everything on and their default CLI settings:
   * Python: Decoder(element) (A-SPX rendered, output guard on) in passes
-    of 1800 frames, then the StreamResampler -> float64, 48 kHz, decoder
-    scale (exactly what `ac4dec` writes before its level rule);
+    of 1800 frames, then the StreamResampler at the stream's ratio (Table
+    83) -> float64 at the external rate, decoder scale (exactly what
+    `ac4dec` writes before its level rule);
   * C: c/ac4dec-c --f64 (A-SPX rendered, guard on, default lookahead).
 
 Reported per channel: max |C - Python| in decoder units and relative to
@@ -41,7 +42,9 @@ sys.path.insert(0, REPO)
 
 from ac4 import container                             # noqa: E402
 from ac4 import cli as PYCLI                          # noqa: E402
-from ac4.decoder import Decoder, REF_PEAK, probe_element  # noqa: E402
+from ac4 import rates as RT                           # noqa: E402
+from ac4.decoder import Decoder, REF_PEAK, probe_element, probe_rate  # noqa
+
 from ac4.resample import StreamResampler              # noqa: E402
 
 C_CLI = os.path.join(REPO, "c", "ac4dec-c")
@@ -56,7 +59,9 @@ def python_reference(path, max_pass=MAX_PASS):
     frames = container.read_frames(path)
     element = probe_element(frames)
     dec = Decoder(element)
-    rs = StreamResampler()
+    rate = probe_rate(frames)
+    rs = StreamResampler(*(RT.ratio(*rate) if rate and RT.ratio(*rate)
+                           else RT.ratio(1, 3)))
     out, status = [], []
     for i in range(0, len(frames), max(8, max_pass)):
         y = dec.decode_pass(frames[i:i + max_pass])

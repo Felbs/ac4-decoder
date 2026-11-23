@@ -45,7 +45,7 @@ void ac4_spectra_init(void);
 #define RELEARN 3
 #define LATE_MAJORITY 0.9
 #define MAX_PENDING 4096
-#define FRAME 1536
+#define FRAME AC4_MAX_FRAME   /* buffer stride; a frame is d->fl long */
 #define HF_DELAY 577         /* QMF analysis + synthesis delay, samples */
 
 /* robust.py: A-SPX level check, output guard */
@@ -84,7 +84,7 @@ static const char *REASONS[AC4E_COUNT] = {
     "decoder.internal", "element.unknown", "seq.outlier", "aspx.config",
     "aspx.parse", "aspx.num_env", "aspx.borders", "acpl.parse",
     "audio_size.late", "guard.level", "aspx.level", "toc.presentation",
-    "toc.unsupported_rate"
+    "toc.unsupported_rate", "asf.transf_length"
 };
 
 const char *ac4_reason_name(int code)
@@ -119,7 +119,7 @@ typedef struct {
     int mask;                   /* channels synthesised */
     int nwin[6];
     int wlen[6][AC4_MAX_WIN];
-    double *win;                /* 6 x 1536 */
+    double *win;                /* 6 x FRAME */
     ac4_aspx_frame af[NPAIR];   /* L/R, Ls/Rs, C (as C/C) */
 } rec_t;
 
@@ -140,6 +140,7 @@ typedef struct {
     int aspx_flag;              /* aspx.level */
     double pk;                  /* peak over all output channels */
     int ok;
+    int n;                      /* samples (the frame length) */
     double pcm[6][FRAME];
 } outf_t;
 
@@ -158,6 +159,12 @@ struct ac4dec {
     int N, L, G;
     int element;                /* resolved ac4dec_element, 0 = not yet */
     int n_ch;
+    /* the stream's rate (rates.py): (fs_index, frame_rate_index) of its
+       first decodable frame whose next frame agrees; fl = frame_len_base
+       (AC4_DEFAULT_FRAME until then); the output resampler is fixed at
+       the first frame given out */
+    int rate_known, fs, fri, fl, nats;
+    int rs_fixed, rs_up, rs_down, out_rate;
     ac4_huff huff[AC4T_N_BOOKS];
     ac4_books books;
     ac4_aspx_books abk;
@@ -209,6 +216,9 @@ struct ac4dec {
     rec_t prev_info;            /* frame n_synth - 1 (no windows) */
     ac4_aspx_pair pair[NPAIR];
     int pair_active[NPAIR];
+    ac4_aspx_tab syn_tab[NPAIR];    /* tables of the last frame with data
+                                       synthesised, per pair */
+    int has_syn_tab[NPAIR];
     long long pair_start[NPAIR];    /* first frame the pair took */
     int path_on[NPAIR];
     int finished;
@@ -390,6 +400,43 @@ ac4dec_element ac4dec_probe_config(const ac4dec_config *cfg,
     return element_of_toc(&c, &t);
 }
 
+int ac4dec_probe_rate(const uint8_t *data, size_t len, int *fs_index,
+                      int *frame_rate_index)
+{
+    ac4_toc t;
+    if (len > MAX_FRAME_BYTES || toc_try(data, len, &t) != 0)
+        return -1;
+    if (fs_index)
+        *fs_index = t.fs_index;
+    if (frame_rate_index)
+        *frame_rate_index = t.frame_rate_index;
+    return 0;
+}
+
+int ac4dec_rate_info(int fs_index, int frame_rate_index, int *frame_len,
+                     int *up, int *down, int *out_rate, double *fps)
+{
+    static const double FPS[14] = {
+        24000.0 / 1001.0, 24.0, 25.0, 30000.0 / 1001.0, 30.0,
+        48000.0 / 1001.0, 48.0, 50.0, 60000.0 / 1001.0, 60.0, 100.0,
+        120000.0 / 1001.0, 120.0, 48000.0 / 2048.0 };
+    int fl = ac4_frame_len_base(fs_index, frame_rate_index), u, dn;
+    if (!fl)
+        return -1;
+    ac4_rate_ratio(fs_index, frame_rate_index, &u, &dn);
+    if (frame_len)
+        *frame_len = fl;
+    if (up)
+        *up = u;
+    if (down)
+        *down = dn;
+    if (out_rate)
+        *out_rate = fs_index == 0 ? 44100 : 48000;
+    if (fps)
+        *fps = FPS[frame_rate_index];
+    return 0;
+}
+
 static const char *const CONTENT[8] = {
     "complete main", "music and effects", "visually impaired",
     "hearing impaired", "dialogue", "commentary", "emergency", "voice over"
@@ -462,6 +509,41 @@ static void set_element(ac4dec *d, int element)
     d->guard.init = G_INIT_FRAC * ref;
 }
 
+/* adopt the stream's rate: frame length, num_aspx_timeslots, the
+   filterbank and the pairs' time grid (rates.py; Decoder._adopt_frame) */
+static void set_rate(ac4dec *d, int fs, int fri)
+{
+    int fl = ac4_frame_len_base(fs, fri), k;
+    d->rate_known = 1;
+    d->fs = fs;
+    d->fri = fri;
+    d->books.fl = fl;
+    d->nats = fl >= 1536 ? fl / 128 : fl / 64;
+    if (fl != d->fl) {
+        long long j;
+        d->fl = fl;
+        for (k = 0; k < 6; k++) {
+            memset(&d->fb[k], 0, sizeof(d->fb[k]));
+            d->fb[k].n_full = fl;
+        }
+        for (k = 0; k < NPAIR; k++) {
+            ac4_aspx_pair_init(&d->pair[k], fl);
+            d->pair_active[k] = 0;
+        }
+        /* frames concealed before the rate was known and not synthesised
+           yet take the stream's frame length (one zero window) */
+        for (j = d->rec_first; j < d->rec_first + d->rec_n; j++) {
+            rec_t *r = &d->recs[(int)(j % d->rec_cap)];
+            if (r->code != AC4E_NONE)
+                for (k = 0; k < 6; k++) {
+                    r->nwin[k] = 1;
+                    r->wlen[k][0] = fl;
+                    memset(r->win + k * FRAME, 0, sizeof(double) * FRAME);
+                }
+        }
+    }
+}
+
 /* which of the six channels a frame synthesises (ASPX_ACPL_3 in 5.1:
    the core pair and the LFE; C, Ls, Rs come from the A-CPL upmix) */
 static int chan_mask(const ac4dec *d, int acpl3)
@@ -499,6 +581,13 @@ static void stream_reset(ac4dec *d)
 {
     int i;
     free_pending(d);
+    d->rate_known = 0;
+    d->rs_fixed = 0;
+    d->fs = d->fri = -1;
+    d->fl = AC4_DEFAULT_FRAME;
+    d->books.fl = AC4_DEFAULT_FRAME;
+    d->nats = AC4_DEFAULT_FRAME / 128;
+    memset(d->has_syn_tab, 0, sizeof(d->has_syn_tab));
     d->acpl3 = 0;
     d->have_shape = 0;
     d->mode = -1;
@@ -513,6 +602,8 @@ static void stream_reset(ac4dec *d)
     d->rec_first = 0;
     d->rec_n = 0;
     memset(d->fb, 0, sizeof(d->fb));
+    for (i = 0; i < 6; i++)
+        d->fb[i].n_full = AC4_DEFAULT_FRAME;
     d->n_synth = 0;
     memset(d->core_prev, 0, sizeof(d->core_prev));
     memset(d->core_tail, 0, sizeof(d->core_tail));
@@ -650,6 +741,8 @@ void ac4dec_get_stats(const ac4dec *d, ac4dec_stats *s)
     s->n_late = d->n_late;
     s->element = d->element;
     s->acpl3 = d->acpl3;
+    s->frame_len = d->rate_known ? d->fl : 0;
+    s->out_rate = d->rate_known ? (d->fs == 0 ? 44100 : 48000) : 0;
     s->aspx = (d->path_on[0] || d->path_on[1] || d->path_on[2])
               && d->has_cfg;
 }
@@ -702,8 +795,8 @@ static void rec_conceal(ac4dec *d, rec_t *r, int code)
     r->mask = chan_mask(d, d->acpl3);
     for (k = 0; k < 6; k++) {
         r->nwin[k] = 1;
-        r->wlen[k][0] = FRAME;
-        memset(r->win + k * FRAME, 0, sizeof(double) * FRAME);
+        r->wlen[k][0] = d->fl;
+        memset(r->win + k * FRAME, 0, sizeof(double) * (size_t)d->fl);
     }
     r->af[0].kind = r->af[1].kind = r->af[2].kind = AC4_GRP_CONCEALED;
     r->af[0].has_tab = r->af[1].has_tab = r->af[2].has_tab = 0;
@@ -750,12 +843,13 @@ static int late_one(ac4dec *d, const pending_t *pd, ac4_aspx_state *st)
     b.eof_code = AC4E_ASPX_PARSE;
     if (setjmp(jb) != 0)
         return 0;
-    ac4_aspx_data(&b, &d->abk, &d->tab, &d->acfg, pd->ifr, 1, st, 0, NULL);
+    ac4_aspx_data(&b, &d->abk, &d->acfg, d->nats, pd->ifr, 1, st, 0, NULL,
+                  NULL);
     if (pd->five) {
-        ac4_aspx_data(&b, &d->abk, &d->tab, &d->acfg, pd->ifr, 1, st, 1,
-                      NULL);
-        ac4_aspx_data(&b, &d->abk, &d->tab, &d->acfg, pd->ifr, 0, st, 2,
-                      NULL);
+        ac4_aspx_data(&b, &d->abk, &d->acfg, d->nats, pd->ifr, 1, st, 1,
+                      NULL, NULL);
+        ac4_aspx_data(&b, &d->abk, &d->acfg, d->nats, pd->ifr, 0, st, 2,
+                      NULL, NULL);
     }
     if (pd->acpl3) {
         if (!d->has_pcfg)
@@ -781,6 +875,9 @@ static void late_closure(ac4dec *d)
         return;
     }
     memset(&st, 0, sizeof(st));
+    /* the frames are checked at the aspx_xover_subband_offsets the
+       configuration's I-frame brought (Ac4Stream.xover0) */
+    memcpy(st.xover, d->fstate.xover, sizeof(st.xover));
     for (i = 0; i < d->n_pend; i++) {
         int ok;
         ver[i] = -1;
@@ -793,8 +890,10 @@ static void late_closure(ac4dec *d)
             n_ver++;
             n_ok += ok;
         }
-        if (!ok)
+        if (!ok) {
             memset(&st, 0, sizeof(st));
+            memcpy(st.xover, d->fstate.xover, sizeof(st.xover));
+        }
     }
     if (n_ver && !((double)n_ok < LATE_MAJORITY * (double)n_ver)) {
         for (i = 0; i < d->n_pend; i++) {
@@ -834,9 +933,8 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     const uint8_t *sub = NULL;
     toc_shape sh;
     ac4_element *e = &d->el;
-    ac4_aspx_tab tab_new;
+    ac4_aspx_tab tab_new, gtab[NPAIR];
     const ac4_aspx_cfg *volatile cfg = NULL;
-    const ac4_aspx_tab *volatile tab = NULL;
     size_t end;
 
     memset(&sh, 0, sizeof(sh));
@@ -850,9 +948,29 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     }
     r->seq = t.sequence_counter;
     r->iframe = t.b_iframe_global;
-    /* the only rate rendered: 48 kHz family, 29.97 fps (frame 1536) */
-    if (t.fs_index != 1 || t.frame_rate_index != 3) {
+    /* the rate (rates.py): every frame_rate_index of Table 83 and index
+       13 of Table 84; not frame_rate_factor / frame_rate_fraction > 1 */
+    if (!ac4_frame_len_base(t.fs_index, t.frame_rate_index)
+        || t.rate_multi) {
         code = AC4E_TOC_UNSUPPORTED;
+        goto fail;
+    }
+    if (!d->rate_known) {
+        /* the stream's rate is the first decodable frame's, when the next
+           frame (if any) agrees */
+        if (has_next) {
+            ac4_toc tn;
+            if (toc_try(nx, nx_len, &tn) != 0
+                || tn.fs_index != t.fs_index
+                || tn.frame_rate_index != t.frame_rate_index) {
+                code = AC4E_TOC_RATE;
+                goto fail;
+            }
+        }
+        set_rate(d, t.fs_index, t.frame_rate_index);
+    } else if (t.fs_index != d->fs || t.frame_rate_index != d->fri) {
+        /* a change of rate is not followed */
+        code = AC4E_TOC_RATE;
         goto fail;
     }
     /* check_toc */
@@ -909,6 +1027,10 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
             sub_len = len - o;
         sub = data + o;
         ifr = s->ndot;
+        if (s->sf_multiplier >= 0) {     /* 96 / 192 kHz substream */
+            code = AC4E_TOC_UNSUPPORTED;
+            goto fail;
+        }
     }
     b.d = sub;
     b.nbits = sub_len * 8;
@@ -925,13 +1047,11 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     if (changed == AC4E_NONE && d->mode >= 0 && e->mode != d->mode)
         changed = AC4E_ELEMENT_MODE;
     if (e->has_aspx_cfg) {
-        if (ac4_aspx_tables(&e->aspx_cfg, &tab_new) != 0)
+        if (ac4_aspx_tables(&e->aspx_cfg, 0, &tab_new) != 0)
             ac4_fail(&b, AC4E_ASPX_CONFIG);
         cfg = &e->aspx_cfg;
-        tab = &tab_new;
     } else if (d->has_cfg) {
         cfg = &d->acfg;
-        tab = &d->tab;
     }
     acpl3 = e->acpl3;
     five = d->element != AC4DEC_ELEMENT_PAIR && !acpl3;
@@ -945,15 +1065,15 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
                                  : (d->has_pcfg ? &d->pcfg : NULL);
         b.p = e->bits_end;
         b.eof_code = AC4E_ASPX_PARSE;
-        ac4_aspx_data(&b, &d->abk, tab, cfg, ifr, 1, &d->fstate, 0,
-                      &r->af[0].g);
+        ac4_aspx_data(&b, &d->abk, cfg, d->nats, ifr, 1, &d->fstate, 0,
+                      &r->af[0].g, &gtab[0]);
         r->af[0].kind = AC4_GRP_DATA;
         if (five) {
-            ac4_aspx_data(&b, &d->abk, tab, cfg, ifr, 1, &d->fstate, 1,
-                          &r->af[1].g);
+            ac4_aspx_data(&b, &d->abk, cfg, d->nats, ifr, 1, &d->fstate, 1,
+                          &r->af[1].g, &gtab[1]);
             r->af[1].kind = AC4_GRP_DATA;
-            ac4_aspx_data(&b, &d->abk, tab, cfg, ifr, 0, &d->fstate, 2,
-                          &r->af[2].g);
+            ac4_aspx_data(&b, &d->abk, cfg, d->nats, ifr, 0, &d->fstate, 2,
+                          &r->af[2].g, &gtab[2]);
             /* the centre, rendered as the same channel twice (decoder.py):
                with balance 0 each half decodes alone */
             r->af[2].g.c[1] = r->af[2].g.c[0];
@@ -1074,7 +1194,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         r->nwin[k] = fr->num_windows;
         for (w = 0; w < fr->num_windows; w++)
             sum += r->wlen[k][w];
-        if (sum != FRAME) {         /* cannot happen; never trust it */
+        if (sum != d->fl) {         /* cannot happen; never trust it */
             code = AC4E_INTERNAL;
             goto fail;
         }
@@ -1082,7 +1202,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     for (k = 0; k < NPAIR; k++)
         if (r->af[k].kind == AC4_GRP_DATA) {
             r->af[k].has_tab = 1;
-            r->af[k].tab = *tab;
+            r->af[k].tab = gtab[k];
         }
     if (!(r->mask & (1 << CH_LS)))
         r->af[1].kind = AC4_GRP_NONE;
@@ -1165,11 +1285,12 @@ static int pair_capable(const ac4dec *d, int p)
     return !d->acpl3 && d->n_ch == 6;   /* Ls/Rs and C (as C/C) */
 }
 
-static void np_frame_stats(const double *x, double *rms, double *amax)
+static void np_frame_stats(const double *x, int n, double *rms,
+                           double *amax)
 {
     double sq[FRAME], m = 0.0;
     int i, nan = 0;
-    for (i = 0; i < FRAME; i++) {
+    for (i = 0; i < n; i++) {
         double a = fabs(x[i]);
         sq[i] = x[i] * x[i];
         if (a != a)
@@ -1177,7 +1298,7 @@ static void np_frame_stats(const double *x, double *rms, double *amax)
         else if (a > m)
             m = a;
     }
-    *rms = sqrt(ac4_np_sum(sq, FRAME) / (double)FRAME);
+    *rms = sqrt(ac4_np_sum(sq, n) / (double)n);
     *amax = nan ? NAN : m;
 }
 
@@ -1193,8 +1314,8 @@ static int bursts(ac4dec *d, int p, double *y[2], double *dc[2],
     int c, over = 0, hot, bad = 0;
     for (c = 0; c < 2; c++) {
         double rh, rc, hm, tmp;
-        np_frame_stats(y[c], &rh, &hm);
-        np_frame_stats(dc[c], &rc, &tmp);
+        np_frame_stats(y[c], d->fl, &rh, &hm);
+        np_frame_stats(dc[c], d->fl, &rc, &tmp);
         /* np.maximum of the two channels' peaks (NaN propagates) */
         pk = c == 0 ? hm : (pk != pk ? pk : (hm != hm ? hm
                                              : (hm > pk ? hm : pk)));
@@ -1212,7 +1333,7 @@ static int bursts(ac4dec *d, int p, double *y[2], double *dc[2],
     if (bad) {
         d->n_burst++;
         for (c = 0; c < 2; c++)
-            memcpy(y[c], dc[c], sizeof(double) * FRAME);
+            memcpy(y[c], dc[c], sizeof(double) * (size_t)d->fl);
     }
     *bad_out = bad;
     return over;
@@ -1220,12 +1341,12 @@ static int bursts(ac4dec *d, int p, double *y[2], double *dc[2],
 
 /* frame peak over the output channels (np max: NaN propagates; then
    non-finite -> inf) */
-static double frame_peak(const outf_t *o, int n_ch)
+static double frame_peak(const outf_t *o, int n_ch, int fl)
 {
     double m = 0.0;
     int c, i;
     for (c = 0; c < n_ch; c++)
-        for (i = 0; i < FRAME; i++) {
+        for (i = 0; i < fl; i++) {
             double a = fabs(o->pcm[c][i]);
             if (!(a <= m)) {
                 if (a != a)
@@ -1259,11 +1380,13 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
     /* every channel 577 samples late: the delay line, unless its pair
        is on the QMF path (below) */
     for (k = 0; k < 6; k++) {
-        memcpy(o->pcm[k], d->core_tail[k], sizeof(double) * HF_DELAY);
-        memcpy(o->pcm[k] + HF_DELAY, d->core_prev[k],
-               sizeof(double) * (FRAME - HF_DELAY));
-        memcpy(d->core_tail[k], d->core_prev[k] + FRAME - HF_DELAY,
-               sizeof(double) * HF_DELAY);
+        /* (tail ++ core)[:fl] out, its last HF_DELAY kept: the frame can
+           be shorter than the delay (512, 384) */
+        double x[HF_DELAY + FRAME];
+        memcpy(x, d->core_tail[k], sizeof(double) * HF_DELAY);
+        memcpy(x + HF_DELAY, d->core_prev[k], sizeof(double) * (size_t)d->fl);
+        memcpy(o->pcm[k], x, sizeof(double) * (size_t)d->fl);
+        memcpy(d->core_tail[k], x + d->fl, sizeof(double) * HF_DELAY);
     }
     for (p = 0; p < NPAIR; p++) {
         double *y[2], *dc[2];
@@ -1299,7 +1422,8 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
     /* channels a frame does not have are silent */
     for (k = d->n_ch; k < 6; k++)
         memset(o->pcm[k], 0, sizeof(o->pcm[k]));
-    o->pk = frame_peak(o, d->n_ch);
+    o->n = d->fl;
+    o->pk = frame_peak(o, d->n_ch, d->fl);
     o->ok = !o->forced && isfinite(o->pk);
 }
 
@@ -1321,17 +1445,22 @@ static void synth_one(ac4dec *d)
                          r->wlen[k][w], d->core[k] + pos, d->tmp);
             pos += r->wlen[k][w];
         }
-        for (i = 0; i < FRAME; i++)
+        for (i = 0; i < d->fl; i++)
             if (!isfinite(d->core[k][i]))
                 d->core[k][i] = 0.0;
     }
-    /* A-SPX: concealed frames take the stream's configuration */
+    /* A-SPX: concealed frames take the tables of the pair's last frame
+       with data (its aspx_xover_subband_offset), or the stream's
+       configuration at offset 0 */
     for (p = 0; p < NPAIR; p++) {
         ac4_aspx_frame *f = &r->af[p];
         if (f->kind == AC4_GRP_CONCEALED) {
             f->has_tab = d->has_cfg;
             if (d->has_cfg)
-                f->tab = d->tab;
+                f->tab = d->has_syn_tab[p] ? d->syn_tab[p] : d->tab;
+        } else if (f->kind == AC4_GRP_DATA) {
+            d->syn_tab[p] = f->tab;
+            d->has_syn_tab[p] = 1;
         }
         if (!d->pair_active[p] && pair_capable(d, p)) {
             d->pair_active[p] = 1;
@@ -1485,7 +1614,7 @@ static int guard_one(ac4dec *d, outf_t *o)
         g->ref = nr;
     }
     for (c = 0; c < d->n_ch; c++)
-        g->last[c] = o->pcm[c][FRAME - 1];
+        g->last[c] = o->pcm[c][o->n - 1];
     g->has_last = 1;
     /* history of forced flags (and of frames muted by the plain rule, not
        by the near rule, so it cannot chain) for the frames after this one:
@@ -1511,7 +1640,7 @@ static void emit(ac4dec *d, ac4dec_frame *out)
     } else {
         for (k = 0; k < d->n_ch; k++) {
             int i;
-            for (i = 0; i < FRAME; i++)
+            for (i = 0; i < o->n; i++)
                 if (!isfinite(o->pcm[k][i]))
                     o->pcm[k][i] = 0.0;
         }
@@ -1555,13 +1684,36 @@ static void emit(ac4dec *d, ac4dec_frame *out)
         d->n_ok++;
     }
     out->n_channels = d->n_ch;
+    if (!d->rs_fixed) {
+        /* the output resampler: the stream's ratio (Table 83 / 84), fixed
+           at the first frame given out (1001 / 960 if no rate is known
+           by then) */
+        int up = 1001, dn = 960;
+        if (d->rate_known)
+            ac4_rate_ratio(d->fs, d->fri, &up, &dn);
+        ac4_rs_filter_free(d->rsf);
+        d->rsf = ac4_rs_filter_new_ratio(up, dn);
+        d->out_rate = d->rate_known && d->fs == 0 ? 44100 : 48000;
+        d->rs_up = up;
+        d->rs_down = dn;
+        d->rs_fixed = 1;
+    }
     if (d->cfg.internal_rate) {
         for (k = 0; k < d->n_ch; k++)
             out->pcm[k] = o->pcm[k];
-        out->n_samples = FRAME;
+        out->n_samples = o->n;
+        out->sample_rate = (int)floor((double)d->out_rate * d->rs_down
+                                      / d->rs_up + 0.5);
+    } else if (!d->rsf) {               /* out of memory: silence */
+        for (k = 0; k < d->n_ch; k++) {
+            memset(d->pcm_out[k], 0, sizeof(d->pcm_out[k]));
+            out->pcm[k] = d->pcm_out[k];
+        }
+        out->n_samples = 0;
     } else {
+        out->sample_rate = d->out_rate;
         for (k = 0; k < d->n_ch; k++)
-            nout = ac4_rs_push(d->rsf, &d->rs[k], o->pcm[k], FRAME,
+            nout = ac4_rs_push(d->rsf, &d->rs[k], o->pcm[k], o->n,
                                d->pcm_out[k]);
         for (k = 0; k < d->n_ch; k++)
             out->pcm[k] = d->pcm_out[k];

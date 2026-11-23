@@ -67,7 +67,7 @@ class Frame(ctypes.Structure):
                 ("n_samples", ctypes.c_int),
                 ("pcm", ctypes.POINTER(ctypes.c_double) * 6),
                 ("sequence_counter", ctypes.c_int), ("iframe", ctypes.c_int),
-                ("seq_jump", ctypes.c_int)]
+                ("seq_jump", ctypes.c_int), ("sample_rate", ctypes.c_int)]
 
 
 _LIB = None

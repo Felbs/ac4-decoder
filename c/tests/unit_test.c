@@ -221,7 +221,7 @@ static void test_aspx_tables(void)
                     c.stop_freq = sp;
                     c.master_freq_scale = ms;
                     c.noise_sbg = ns;
-                    if (ac4_aspx_tables(&c, &t) != 0)
+                    if (ac4_aspx_tables(&c, 0, &t) != 0)
                         continue;
                     n_ok++;
                     CHECK(t.master[0] % 2 == 0 && t.master[t.n_master] % 2 == 0,
@@ -268,7 +268,7 @@ static void dump_aspx(void)
                     c.master_freq_scale = ms;
                     c.noise_sbg = ns;
                     printf("%d %d %d %d", st, sp, ms, ns);
-                    if (ac4_aspx_tables(&c, &t) != 0) {
+                    if (ac4_aspx_tables(&c, 0, &t) != 0) {
                         printf(" fail\n");
                         continue;
                     }
@@ -288,7 +288,9 @@ static void dump_aspx(void)
 
 static void test_sfb(void)
 {
-    static const int nsfb[AC4T_N_SFB] = { 55, 43, 33, 18, 12 }; /* Table B.1 */
+    /* Table B.1 */
+    static const int nsfb[AC4T_N_SFB] = { 63, 61, 55, 49, 49, 43, 36, 36,
+                                          33, 20, 20, 18, 14, 14, 12 };
     int i, k;
     for (i = 0; i < AC4T_N_SFB; i++) {
         const ac4t_sfb *t = &AC4T_SFB[i];
@@ -304,15 +306,16 @@ static void test_sfb(void)
 
 /* push blocks through the filterbank; -> output energy / input energy for
    interior blocks (first and last frame zero, so everything is flushed) */
-static double isometry(const ac4_fb_tables *t, const int *seq, int nb,
-                       int corrupt)
+static double isometry_fl(const ac4_fb_tables *t, const int *seq, int nb,
+                          int corrupt, int fl)
 {
     ac4_fb_state st;
-    double *X = (double *)malloc(sizeof(double) * 1536);
-    double *out = (double *)malloc(sizeof(double) * 1536);
-    double tmp[4 * 1536], ein = 0.0, eout = 0.0;
+    double *X = (double *)malloc(sizeof(double) * 2048);
+    double *out = (double *)malloc(sizeof(double) * 2048);
+    double tmp[4 * 2048], ein = 0.0, eout = 0.0;
     int b, k;
     memset(&st, 0, sizeof(st));
+    st.n_full = fl;
     for (b = 0; b < nb; b++) {
         int n = seq[b];
         int interior = b > 0 && b < nb - 1;
@@ -331,6 +334,35 @@ static double isometry(const ac4_fb_tables *t, const int *seq, int nb,
     free(X);
     free(out);
     return eout / ein;
+}
+
+static double isometry(const ac4_fb_tables *t, const int *seq, int nb,
+                       int corrupt)
+{
+    return isometry_fl(t, seq, nb, corrupt, 1536);
+}
+
+/* one block-switching sequence in a frame of fl: long, short groups of
+   every length of the frame's family (Tables 100, 103), long */
+static int family_seq(int fl, int *sw)
+{
+    int n = 0, i, d;
+    sw[n++] = fl;
+    sw[n++] = fl;
+    for (d = 2; d <= 16 && fl / d >= 96; d *= 2) {
+        for (i = 0; i < d; i++)
+            sw[n++] = fl / d;
+        sw[n++] = fl;
+    }
+    if (fl >= 1536) {               /* different halves: 8 x fl/16 + fl/2 */
+        for (i = 0; i < 8; i++)
+            sw[n++] = fl / 16;
+        sw[n++] = fl / 2;
+        sw[n++] = fl;
+    }
+    sw[n++] = fl;
+    sw[n++] = fl;
+    return n;
 }
 
 static void test_filterbank(void)
@@ -361,12 +393,24 @@ static void test_filterbank(void)
     CHECK(fabs(r - 1.0) < 1e-12, "block switching: energy ratio %.15f", r);
     r = isometry(t, sw, n, 1);
     CHECK(fabs(r - 1.0) > 1e-6, "negative control did not fail (%.15f)", r);
+    {
+        /* every frame length of Table 83, with its block switching */
+        static const int fls[] = { 2048, 1920, 1536, 1024, 960, 768, 512,
+                                   384 };
+        int j;
+        for (j = 0; j < 8; j++) {
+            int seq[128], m = family_seq(fls[j], seq);
+            r = isometry_fl(t, seq, m, 0, fls[j]);
+            CHECK(fabs(r - 1.0) < 1e-12, "frame %d: energy ratio %.15f",
+                  fls[j], r);
+        }
+    }
     ac4_fb_tables_free(t);
 }
 
-static void test_resampler(void)
+static void test_resampler_ratio(int up, int down)
 {
-    ac4_rs_filter *f = ac4_rs_filter_new();
+    ac4_rs_filter *f = ac4_rs_filter_new_ratio(up, down);
     ac4_rs_state a, b;
     int N = 60000, i, na = 0, nb = 0, pos = 0;
     double *x = (double *)malloc(sizeof(double) * (size_t)N);
@@ -385,8 +429,8 @@ static void test_resampler(void)
         pos += cuts[i];
     }
     nb += ac4_rs_push(f, &b, x + pos, N - pos, yb + nb);
-    CHECK(na == (int)(((long long)N * 1001 + 959) / 960), "output count %d",
-          na);
+    CHECK(na == (int)(((long long)N * up + down - 1) / down),
+          "output count %d (%d/%d)", na, up, down);
     CHECK(na == nb, "split output count %d vs %d", nb, na);
     for (i = 0; i < na && i < nb; i++)
         if (fabs(ya[i] - yb[i]) > md)
@@ -401,6 +445,24 @@ static void test_resampler(void)
     free(x);
     free(ya);
     free(yb);
+    ac4_rs_filter_free(f);
+}
+
+/* Table 83's three ratios, and 1 (index 13: the samples pass through) */
+static void test_resampler(void)
+{
+    ac4_rs_filter *f = ac4_rs_filter_new_ratio(1, 1);
+    ac4_rs_state st;
+    double x[100], y[100];
+    int i, n;
+    test_resampler_ratio(1001, 960);
+    test_resampler_ratio(25, 24);
+    test_resampler_ratio(15, 16);
+    for (i = 0; i < 100; i++)
+        x[i] = urand();
+    ac4_rs_init(&st);
+    n = ac4_rs_push(f, &st, x, 100, y);
+    CHECK(n == 100 && !memcmp(x, y, sizeof(x)), "ratio 1 is not a copy");
     ac4_rs_filter_free(f);
 }
 
@@ -549,7 +611,7 @@ static int framing_from(const uint8_t *buf, ac4_framing *f)
     b.eof_code = AC4E_ELEMENT_PARSE;
     if (setjmp(jb))
         return -1;
-    ac4_framing_parse(&b, f);
+    ac4_framing_parse(&b, f, 1536);
     return 0;
 }
 
@@ -813,6 +875,7 @@ static void test_stereo_data(void)
         bk.cb[i] = &huff[i - 1];
     bk.sf = &huff[AC4T_BOOK_SF];
     bk.snf = &huff[AC4T_BOOK_SNF];
+    bk.fl = 1536;
     for (i = 0; i < 3; i++) {
         ac4_bits b;
         int code;

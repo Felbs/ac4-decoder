@@ -43,8 +43,18 @@
  * a live player may take the minimum.
  *
  * Damaged input never crashes the decoder and never changes the output
- * length: every frame gives exactly one frame of samples (1536 at the
- * internal rate, or the matching 1601/1602 at 48 kHz).
+ * length: every frame gives exactly one frame of samples: frame_len_base
+ * at the internal rate (TS 103 190-1 Table 83: 2048 at 25 fps, 1536 at
+ * 29.97 fps, ...; 1536 for frames before the stream's rate is known), or
+ * the matching count at the external rate through the table's resampler
+ * (1601/1602 at 29.97 fps, 1920 at 25 fps).
+ *
+ * RATES. Every frame_rate_index of Table 83 (48 kHz) and index 13 of
+ * Table 84 (44,1 kHz) is decoded. The stream's rate is that of its first
+ * decodable frame whose next frame agrees; a frame at another rate is
+ * concealed (toc.rate), as are frames with frame_rate_factor or
+ * frame_rate_fraction above 1 and 96/192 kHz substreams
+ * (toc.unsupported_rate).
  *
  * Thread safety: a decoder instance must not be used from two threads at
  * once; separate instances are independent.
@@ -59,12 +69,16 @@
 extern "C" {
 #endif
 
-#define AC4DEC_VERSION "0.2.0-m2"
+#define AC4DEC_VERSION "0.3.0-b"
 
-/* Samples per frame at the internal rate (29.97 fps, 48 kHz family). */
+/* Samples per frame at the internal rate at 29.97 fps, 48 kHz (the frame
+   length of frames before a stream's rate is known). */
 #define AC4DEC_FRAME 1536
-/* Most samples one frame can give at 48 kHz (1536 * 1001 / 960 = 1601.6). */
-#define AC4DEC_MAX_OUT 1602
+/* The longest internal frame (frame_len_base 2048: 25 fps, index 13). */
+#define AC4DEC_MAX_FRAME 2048
+/* Most samples one frame can give at the external rate (2048 at index 13;
+   1536 * 1001 / 960 = 1601.6 at 29.97 fps). */
+#define AC4DEC_MAX_OUT 2050
 #define AC4DEC_MAX_CHANNELS 6
 
 #define AC4DEC_MIN_LOOKAHEAD 8
@@ -91,9 +105,10 @@ typedef struct {
     ac4dec_element element;
     int channels;          /* 0 = default (6 for 5_X, 2 for a pair); 2 or 6.
                               A pair element always gives 2. */
-    int internal_rate;     /* 0 (default) = 48 kHz output through the
-                              1001/960 resampler (1601 or 1602 samples per
-                              frame); 1 = the internal rate, 1536/frame */
+    int internal_rate;     /* 0 (default) = the external rate (48 kHz, or
+                              44,1 kHz for fs_index 0) through the stream's
+                              resampler (Table 83); 1 = the internal rate,
+                              frame_len_base samples per frame */
     int lookahead;         /* frames of delay, 0 = AC4DEC_DEFAULT_LOOKAHEAD;
                               at least AC4DEC_MIN_LOOKAHEAD (see above) */
     int no_guard;          /* 1 = output guard off (Python guard=False;
@@ -145,6 +160,9 @@ typedef struct {
     int sequence_counter;  /* -1 if the TOC did not parse */
     int iframe;            /* b_iframe_global */
     int seq_jump;          /* the counter broke sequence (lost frames) */
+    int sample_rate;       /* of pcm[], rounded (the internal rate is the
+                              external one times down / up, e.g. 46034 Hz
+                              at 29.97 fps) */
 } ac4dec_frame;
 
 typedef struct ac4dec ac4dec;
@@ -180,6 +198,17 @@ ac4dec_element ac4dec_probe(const uint8_t *data, size_t len);
 ac4dec_element ac4dec_probe_config(const ac4dec_config *cfg,
                                    const uint8_t *data, size_t len);
 
+/* The rate signalling of one frame's TOC: -> 0 and fills fs_index and
+   frame_rate_index, or -1 when the TOC does not parse. */
+int ac4dec_probe_rate(const uint8_t *data, size_t len, int *fs_index,
+                      int *frame_rate_index);
+/* TS 103 190-1 Tables 83, 84 for a rate: -> 0 and fills frame_len
+   (frame_len_base), up / down (the decoder resampling ratio), out_rate
+   (48000 or 44100) and fps (frames per second); -1 when the tables
+   define none (reserved index, 44,1 kHz other than index 13). */
+int ac4dec_rate_info(int fs_index, int frame_rate_index, int *frame_len,
+                     int *up, int *down, int *out_rate, double *fps);
+
 /* The decoder's fixed per-element output reference (decoder units; the
    Python CLI writes it at 0.9 of full scale): 9e5 for 5_X, 2e5 for a pair. */
 double ac4dec_ref_peak(ac4dec_element e);
@@ -201,6 +230,8 @@ typedef struct {
     long n_seq_jumps;
     int element;           /* ac4dec_element once known */
     int acpl3;             /* the stream is ASPX_ACPL_3 (2-ch core + A-CPL) */
+    int frame_len;         /* frame_len_base, 0 while the rate is unknown */
+    int out_rate;          /* the external rate (0 while unknown) */
     int aspx;              /* A-SPX is being rendered (a pair is on the QMF
                               path and an aspx_config is known) */
 } ac4dec_stats;
@@ -211,14 +242,17 @@ void ac4dec_get_stats(const ac4dec *d, ac4dec_stats *s);
    i = 0, 1, ... until it returns NULL. *count receives how many. */
 const char *ac4dec_reason(const ac4dec *d, int i, long *count);
 
-/* The 1001/960 resampler on its own (TS 103 190-1 Table 83), for callers
+/* The output resampler on its own (TS 103 190-1 Table 83), for callers
    that take the internal rate (internal_rate = 1) and resample later; the
-   same filter as the decoder's 48 kHz output. Causal: after n inputs in
-   total, exactly ceil(n * 1001 / 960) outputs have been given. */
+   same filter as the decoder's external-rate output. Causal: after n
+   inputs in total, exactly ceil(n * up / down) outputs have been given
+   (ratio 1: the samples pass through). _open is 1001 / 960 (29.97 fps). */
 typedef struct ac4dec_resampler ac4dec_resampler;
 ac4dec_resampler *ac4dec_resampler_open(int channels);
+ac4dec_resampler *ac4dec_resampler_open_ratio(int channels, int up,
+                                              int down);
 void ac4dec_resampler_close(ac4dec_resampler *r);
-/* in[c]: n samples per channel; out[c]: room for n * 1001 / 960 + 2.
+/* in[c]: n samples per channel; out[c]: room for n * up / down + 2.
    -> samples written per channel. */
 int ac4dec_resampler_push(ac4dec_resampler *r, const double *const *in,
                           int n, double *const *out);
