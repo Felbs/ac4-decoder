@@ -5,7 +5,9 @@
  *
  * The IMDCT is a DCT-IV computed with an N/2-point complex FFT (N/2 =
  * 3 * 2^k for every AC-4 transform length used at 48 kHz), scaled as the
- * Python's imdct_raw: dct4 (2 * sum) / N * sqrt(N / 2). */
+ * Python's imdct_raw: dct4 (2 * sum) / N * IMDCT_K / 2, IMDCT_K =
+ * sqrt(2 * 1536): the standard's (1/N) * sum (TS 103 190-1 Pseudocodes
+ * 60-63) for every transform length, times one global constant. */
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -292,7 +294,7 @@ void ac4_fb_block(const ac4_fb_tables *t, ac4_fb_state *s, const double *X,
     n_prev = s->n_prev;
     ip = len_index(n_prev);
     dct4(&t->plan[i], X, folded, work);
-    scale = sqrt(n / 2.0);
+    scale = sqrt(2.0 * 1536.0) / 2.0;     /* IMDCT_K / 2 */
     for (k = 0; k < n; k++)
         folded[k] = 2.0 * folded[k] / n * scale;
     w = t->lw[i][ip];                    /* left_window(n, n_prev) */

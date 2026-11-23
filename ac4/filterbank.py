@@ -105,26 +105,29 @@ def left_window(n, n_prev, alpha=None):
     return w
 
 
+# THE SCALE (TS 103 190-1 5.5.2.2, Pseudocodes 60-63). The standard's
+# IMDCT is (1/N) * sum for EVERY transform length N: its post-IFFT step
+# divides by N. This decoder's output is that times one global constant,
+# IMDCT_K = sqrt(2 * 1536), so a long block at frame length 1536 keeps the
+# level the decoder always had (its "decoder scale"). An earlier version
+# scaled each block by sqrt(N/2) (an orthonormal lapped transform), which
+# is not the standard's: short blocks came out sqrt(1536 / N) too quiet
+# against long ones (3 dB at 768, 6 dB at 384, 9 dB at 192, 12 dB at 96),
+# and the time-domain aliasing at long/short transitions did not cancel.
+# On air, (768, 768) frames between long frames sat 0.5 to 1.3 dB below
+# their neighbours (median, 6 streams, 361 frames); at the standard's scale
+# they sit within 0.5 dB.
+IMDCT_K = np.sqrt(2.0 * 1536.0)
+
+
 def imdct_raw(X, orthonormal=True):
-    """N spectral lines -> 2N UNWINDOWED time samples (m22's proven unfold).
-
-    THE SCALE IS NOT COSMETIC.  m22's IMDCT carries a 2/N, so the synthesis it
-    defines is orthogonal but not ORTHOnormal: the first run of this file's
-    gate read 8.75e-01 = 1 - 2/16, i.e. S @ S.T came out as (2/N) * I exactly.
-    That is a constant, and a gate that fails by a constant is telling you what
-    the constant is rather than that the construction is wrong.
-
-    With block switching the N-dependence stops being a harmless global gain:
-    each block length would get a DIFFERENT gain, so short blocks would sit at
-    the wrong level relative to long ones and every transition would step in
-    loudness.  Scaling by sqrt(N/2) makes every block unit-gain, which is the
-    physically correct relative scaling for a lapped orthogonal transform.
-    """
+    """N spectral lines -> 2N UNWINDOWED time samples (m22's proven unfold),
+    IMDCT_K * (1/N) * sum (see IMDCT_K). orthonormal=False: (2/N) * sum."""
     from scipy.fft import dct
     n = len(X)
     folded = dct(X, type=4, norm=None) / n
     if orthonormal:
-        folded = folded * np.sqrt(n / 2.0)
+        folded = folded * (IMDCT_K / 2.0)
     a_b, c_d = folded[n // 2:], folded[:n // 2]
     return np.concatenate([a_b, -a_b[::-1], -c_d[::-1], -c_d])
 
@@ -191,12 +194,18 @@ def operator(lengths, n_full, mode):
 
 
 def gate(lengths, n_full, mode, trim, verbose=True):
-    """S @ S.T == I on the interior.  -> max |deviation|."""
+    """S.T @ S == diag(IMDCT_K^2 / (2 N_b)) on the interior: a lapped
+    orthogonal transform whose block b carries the standard's gain
+    IMDCT_K / N_b (Pseudocode 62) against the orthonormal sqrt(2 / N_b).
+    -> max |deviation|."""
     S = operator(lengths, n_full, mode)
     G = S.T @ S
     lo, hi = trim, G.shape[0] - trim
     if hi <= lo:
         return float("nan")
+    want = np.concatenate([np.full(n, IMDCT_K ** 2 / (2.0 * n))
+                           for n in lengths])
+    G = G / np.sqrt(np.outer(want, want))
     core = G[lo:hi, lo:hi]
     dev = float(np.abs(core - np.eye(hi - lo)).max())
     if verbose:
@@ -217,7 +226,7 @@ def imdct_raw_batch(X2, orthonormal=True):
     n = X2.shape[-1]
     folded = dct(X2, type=4, norm=None, axis=-1) / n
     if orthonormal:
-        folded = folded * np.sqrt(n / 2.0)
+        folded = folded * (IMDCT_K / 2.0)
     a_b, c_d = folded[..., n // 2:], folded[..., :n // 2]
     return np.concatenate(
         [a_b, -a_b[..., ::-1], -c_d[..., ::-1], -c_d], axis=-1)

@@ -110,6 +110,41 @@ def test_filterbank_block_switching_is_orthogonal(seq):
     assert FB.gate(seq, 16, "reversed", trim=16, verbose=False) < 1e-9
 
 
+def _spec_imdct(X):
+    """TS 103 190-1 Pseudocodes 60-63 as printed (no window): 2N samples."""
+    N = len(X)
+    k = np.arange(N // 2)
+    xc = -np.cos(2 * np.pi * (8 * k + 1) / (16 * N))
+    xs = -np.sin(2 * np.pi * (8 * k + 1) / (16 * N))
+    Z = (X[N - 2 * k - 1] * xc - X[2 * k] * xs) \
+        + 1j * (X[2 * k] * xc + X[N - 2 * k - 1] * xs)
+    n = np.arange(N // 2)
+    z = (Z[None, :] * np.exp(1j * 4 * np.pi * np.outer(n, k) / N)).sum(1)
+    yr = (z.real * xc - z.imag * xs) / N
+    yi = (z.imag * xc + z.real * xs) / N
+    x = np.zeros(2 * N)
+    for m in range(N // 4):
+        x[2 * m] = yi[N // 4 + m]
+        x[2 * m + 1] = -yr[N // 4 - m - 1]
+        x[N // 2 + 2 * m] = yr[m]
+        x[N // 2 + 2 * m + 1] = -yi[N // 2 - m - 1]
+        x[N + 2 * m] = yr[N // 4 + m]
+        x[N + 2 * m + 1] = -yi[N // 4 - m - 1]
+        x[3 * N // 2 + 2 * m] = -yi[m]
+        x[3 * N // 2 + 2 * m + 1] = yr[N // 2 - m - 1]
+    return x
+
+
+@pytest.mark.parametrize("n", [1536, 768, 384, 192, 96, 2048, 128])
+def test_imdct_is_the_standards_times_one_constant(n):
+    """Every transform length gets the standard's (1/N) * sum times the
+    same IMDCT_K (the old sqrt(N/2) scaling left short blocks too quiet)."""
+    X = np.random.default_rng(n).standard_normal(n)
+    ours = FB.imdct_raw(X)
+    spec = _spec_imdct(X)
+    assert np.abs(ours - FB.IMDCT_K * spec).max() < 1e-9 * np.abs(ours).max()
+
+
 def test_filterbank_literal_reading_is_rejected():
     # the negative control: the other reading of the window rule must fail
     seq = [16, 8, 8, 4, 4, 4, 4, 16, 16]

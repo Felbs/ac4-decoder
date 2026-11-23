@@ -3,8 +3,9 @@
  * Unit tests for libac4dec's building blocks (no captures needed):
  *   bit reader and variable_bits; every Huffman codebook builds as a
  *   complete prefix code and round-trips every symbol; the scale factor
- *   band tables; the filterbank is an isometry (lapped orthogonal
- *   transform: ||S x|| == ||x||) for steady and switching block lengths,
+ *   band tables; the filterbank is a lapped orthogonal transform with the
+ *   standard's per-block gain (output energy == sum of 1536 / N times
+ *   the block's input energy) for steady and switching block lengths,
  *   with a negative control; the resampler gives the same samples however
  *   the input is split, the right count, and unit DC gain; every A-SPX
  *   and A-CPL codebook builds and round-trips; the QMF bank (through the
@@ -317,7 +318,9 @@ static double isometry(const ac4_fb_tables *t, const int *seq, int nb,
         int interior = b > 0 && b < nb - 1;
         for (k = 0; k < n; k++) {
             X[k] = interior ? urand() : 0.0;
-            ein += X[k] * X[k];
+            /* the standard's gain: block b carries (1536 / N_b) of an
+               orthonormal transform's energy (TS 103 190-1 5.5.2.2) */
+            ein += X[k] * X[k] * (1536.0 / n);
         }
         ac4_fb_block(t, &st, X, n, out, tmp);
         if (corrupt && b == nb / 2)
