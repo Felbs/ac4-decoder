@@ -44,6 +44,7 @@ enum {
     AC4E_GUARD_LEVEL,      /* guard.level (output guard) */
     AC4E_ASPX_LEVEL,       /* aspx.level (A-SPX level check) */
     AC4E_TOC_PRESENTATION, /* toc.presentation (no decodable substream) */
+    AC4E_TOC_UNSUPPORTED,  /* toc.unsupported_rate (not 48 kHz, 29.97) */
     AC4E_COUNT
 };
 const char *ac4_reason_name(int code);

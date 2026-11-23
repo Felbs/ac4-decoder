@@ -412,3 +412,23 @@ def test_centre_goes_through_the_aspx_renderer(monkeypatch):
     # L/R, Ls/Rs and the centre: three renderer calls, the last with the
     # centre's core as both channels
     assert len(calls) == 3 and calls[2][0]
+
+
+@pytest.mark.parametrize("fri", [2, 4])
+def test_frames_at_other_rates_are_concealed(fri):
+    """Only frame_rate_index 3 (29.97 fps, 1536 samples) is rendered; a
+    frame at another rate is concealed with its own reason instead of being
+    decoded as 1536 samples (noise)."""
+    from ac4 import stream as ST
+    t = dict(pres=[dict(groups=[0], pres_sub=0)],
+             groups=[dict(ch_mode_code="10", index=1)], sizes=[2, 4])
+    f = bytearray(build_toc(**t) + bytes(6))
+    # rewrite frame_rate_index (4 bits after fs_index, bit 14 of the TOC;
+    # 2, 3 and 4 share the TOC layout)
+    bits = list(format(int.from_bytes(f[:3], "big"), "024b"))
+    bits[14:18] = format(fri, "04b")
+    f[:3] = int("".join(bits), 2).to_bytes(3, "big")
+    assert M.parse(bytes(f))["frame_rate_index"] == fri
+    s = ST.Ac4Stream("pair")
+    s.decode_frames([bytes(f)])
+    assert s.status == ["toc.unsupported_rate"]

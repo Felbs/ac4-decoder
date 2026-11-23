@@ -153,6 +153,14 @@ class Ac4Stream:
                     st = M.parse(f)
                 except Exception as e:                         # noqa: BLE001
                     raise RB.Damaged("toc.parse", str(e)[:60])
+                # the only rate this decoder renders: 48 kHz family,
+                # 29.97 fps (frame length 1536; TS 103 190-1 Table 83).
+                # Another frame length decoded as 1536 would be noise.
+                if (st["fs_index"], st["frame_rate_index"]) != (1, 3):
+                    raise RB.Damaged("toc.unsupported_rate",
+                                     f"fs_index {st['fs_index']} "
+                                     f"frame_rate_index "
+                                     f"{st['frame_rate_index']}")
                 # a TOC or codec mode that differs from the stream's is
                 # judged only after the frame has passed every other check
                 # (RB.Relearn): a real change is accepted at an I-frame, or

@@ -524,6 +524,11 @@ int main(int argc, char **argv)
         }
         if (!first)
             printf("\n");
+        for (i = 0; (r = ac4dec_reason(dec, i, &cnt)) != NULL; i++)
+            if (!strcmp(r, "toc.unsupported_rate"))
+                printf("  this decoder renders 48 kHz-family streams at "
+                       "29.97 fps only (TS 103 190-1 frame_rate_index 3); "
+                       "the frames at other rates are silent\n");
         if (stats.acpl3)
             printf("  stream is ASPX_ACPL_3 (2-ch core + A-CPL): %s\n",
                    n_ch == 6 ? "5.1 from the A-CPL upmix"

@@ -83,7 +83,8 @@ static const char *REASONS[AC4E_COUNT] = {
     "asf.sect_len", "asf.max_sfb", "asf.quant", "asf.sf_range", "asf.level",
     "decoder.internal", "element.unknown", "seq.outlier", "aspx.config",
     "aspx.parse", "aspx.num_env", "aspx.borders", "acpl.parse",
-    "audio_size.late", "guard.level", "aspx.level", "toc.presentation"
+    "audio_size.late", "guard.level", "aspx.level", "toc.presentation",
+    "toc.unsupported_rate"
 };
 
 const char *ac4_reason_name(int code)
@@ -849,6 +850,11 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     }
     r->seq = t.sequence_counter;
     r->iframe = t.b_iframe_global;
+    /* the only rate rendered: 48 kHz family, 29.97 fps (frame 1536) */
+    if (t.fs_index != 1 || t.frame_rate_index != 3) {
+        code = AC4E_TOC_UNSUPPORTED;
+        goto fail;
+    }
     /* check_toc */
     if (t.sequence_counter > 1020) {
         code = AC4E_TOC_SEQ_RANGE;

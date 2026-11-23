@@ -183,6 +183,10 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
         why = ", ".join(f"{k} {v}" for k, v in
                         sorted(dec.concealed.reasons.items()))
         say(f"  concealed frames by reason: {why}")
+        if dec.concealed.reasons.get("toc.unsupported_rate"):
+            say("  this decoder renders 48 kHz-family streams at 29.97 fps "
+                "only (TS 103 190-1 frame_rate_index 3); the frames at "
+                "other rates are silent")
     say(f"{len(frames)} frames ({dec.n_bad} bad, {dec.n_concealed} "
         f"concealed, {dec.n_seq_jumps} sequence jumps), element {element}, "
         f"{n_ch} ch, {secs:.3f} s -> {dst}  "
