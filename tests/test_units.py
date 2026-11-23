@@ -262,3 +262,46 @@ def test_substream_info_chan_reads_top_channel_fields(code, ch_mode):
     assert st["channel_modes"] == [ch_mode]
     assert b.p == len(s)
     assert st["ndot_bits"] == [len(s) - 1]
+
+
+# ---------------------------------------------------------------- framing
+def _framing(bits):
+    from ac4 import channels as CH
+    return CH.Framing(_bits(bits))
+
+
+def test_pair_without_stereo_processing_uses_each_channels_framing(
+        monkeypatch):
+    """b_enable_mdct_stereo_proc = 0: L and R carry separate sf_info, and
+    R must be dequantised and ungrouped with its own (here: L one long
+    block, R four 384-sample blocks), not with L's."""
+    from ac4 import pair as PAIR
+    from ac4 import robust as RB
+    from ac4 import stream as ST
+    fr_l = _framing("1" + "000101")                  # long, max_sfb 5
+    # short: transf_length 2, 2 (384), max_sfb 5, no grouping (3 bits)
+    fr_r = _framing("0" + "10" + "10" + "000101" + "000")
+    assert fr_r.num_windows == 4 and fr_r.num_groups == 4
+
+    def ch(fr):
+        return dict(lines=np.zeros(1536, dtype=np.int32), sfs=[None] * 5,
+                    sfs_all=[[None] * 5] * fr.num_groups, framing=fr)
+
+    def fake_pair(sub, T, b_iframe=False):
+        return dict(L=ch(fr_l), R=ch(fr_r),
+                    st_lr=dict(sap_mode=None, ms_used=None, sap=None,
+                               max_sfb=5, framing=fr_l),
+                    aspx=None, codec_mode=0, bits=8, nbits=64,
+                    audio_size=1, audio_start=0, mode=("pair", 0))
+
+    monkeypatch.setattr(PAIR, "decode_pair", fake_pair)
+    monkeypatch.setattr(ST.M, "parse", lambda f: dict(
+        sequence_counter=1, toc_bytes=0, payload_base=0,
+        substream_sizes=[0, 8], b_iframe_global=1))
+    monkeypatch.setattr(RB, "CHECKS", False)
+    s = ST.Ac4Stream("pair")
+    wins, lengths, _g, counts = s.decode_frames([bytes(16)])
+    assert s.status == [None]
+    assert lengths["L"] == [1536] and counts["L"] == [1]
+    assert lengths["R"] == [384] * 4 and counts["R"] == [4]
+    assert [len(w) for w in wins["R"]] == [384] * 4

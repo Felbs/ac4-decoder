@@ -259,7 +259,10 @@ class Ac4Stream:
                 # noise fill seeded by the stream's own sequence counter,
                 # exactly as the batch render does
                 rng = np.random.default_rng(st["sequence_counter"])
-                fm = {"L": r["st_lr"]["framing"], "R": r["st_lr"]["framing"]}
+                # each channel's OWN framing: with b_enable_mdct_stereo_proc
+                # = 0 the two channels of a pair carry separate sf_info and
+                # can differ (with it on, both are the shared one)
+                fm = {"L": r["L"]["framing"], "R": r["R"]["framing"]}
                 # ASPX_ACPL_3 (E77) carries the 5.1 programme as a TWO-channel
                 # core plus A-CPL; Ls/Rs/C do not exist as coded channels, so
                 # this frame has only a pair to give no matter what `chans`
@@ -277,8 +280,8 @@ class Ac4Stream:
                         if k not in chans:
                             wins.pop(k); lengths.pop(k); counts.pop(k)
                 elif self.element != "pair":
-                    fm.update({"Ls": r["st_sr"]["framing"],
-                               "Rs": r["st_sr"]["framing"],
+                    fm.update({"Ls": r["Ls"]["framing"],
+                               "Rs": r["Rs"]["framing"],
                                "C": r["C"]["framing"],
                                "lfe": r["lfe"]["framing"]})
                 pk = {k: R.packed_spectrum(r[k], fm[k], rng)
