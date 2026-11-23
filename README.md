@@ -31,10 +31,11 @@ repository.
 |---|---|
 | Bitstream | version 2, 48 kHz, 29.97 fps, one presentation, channel-coded |
 | Input | fragmented MP4 (init segment + `moof`/`mdat` fragments, or bare fragments) |
-| 5.1 (`5_X` channel element, coding_config 0) | codec mode 1 (A-SPX): all six channels. Codec mode 4 (ASPX_ACPL_3): the two-channel core only (see below) |
+| 5.1 (`5_X` channel element, coding_config 0) | codec mode 1 (A-SPX): all six channels. Codec mode 4 (ASPX_ACPL_3): all six channels, L/R/C/Ls/Rs from the A-CPL upmix of the two-channel core, the LFE from its own data (see A-CPL below) |
 | Stereo (`channel_pair_element`) | stereo_codec_mode 0 (SIMPLE) and 1 (A-SPX) |
 | Core (ASF/MDCT) | Huffman spectral data, scale factors, long and short frames with block switching, KBD windows, stereo processing (sap_mode 1 and 2: M/S; sap_mode 3: full SAP with prediction coefficients, see below), spectral noise fill (clause 5.1.4, the standard's own noise generator; no capture here signals it), LFE |
 | A-SPX | parsed and rendered on the L/R and Ls/Rs pairs: 64-band complex QMF, envelope decoding, HF generation, envelope adjustment with the limiter, noise, joint-balance rendering |
+| A-CPL | ASPX_ACPL_3 (clause 5.7.7.6.2): parameter decoding and dequantisation, interpolation, the three decorrelators with the transient ducker, the 5-channel upmix in the QMF domain. ASPX_ACPL_1/2 (in 5_X or a channel pair) do not occur on the captures and are not built |
 | Output | 48 kHz via the 1001/960 resampler (TS 103 190-1 Table 83); without it audio runs 4.27 % fast. Every channel is 577 samples (12 ms) after the MDCT core: the A-SPX pairs through the QMF bank, the others (centre, LFE, a pair without A-SPX) through a delay line of the same length, so all channels are time-aligned |
 | I-frames | decoding can start mid-stream; A-SPX starts at the first I-frame |
 | Damaged input | never raises, never changes the output length; damaged frames are concealed (see below) |
@@ -53,7 +54,7 @@ between runs; the figure is the better of two runs, decode time only):
 |---|---|---|
 | 5.1, codec mode 1 (A-SPX), broadcaster A | 178 s | 1.8x |
 | stereo, broadcaster A | 178 s | 4.3x |
-| 5.1 sent as ASPX_ACPL_3 (stereo core decoded), broadcaster B | 42 s | 3.4x |
+| 5.1 sent as ASPX_ACPL_3, broadcaster B (stereo core only; with the A-CPL upmix, 2026-11-23, `c/tests/speed.py`: 3.5x) | 42 s | 3.4x |
 | stereo, broadcaster B | 42 s | 4.4x |
 
 The damaged-input checks and full SAP cost 1 to 19 % against the version
@@ -64,8 +65,9 @@ spread between runs is of the same size, so the cost is not pinned down.
 long-term average spectrum, Welch with 8192 points over the whole file, is
 within 50 dB of its maximum): broadcaster A 5.1: L 16.9, R 16.5, C 11.5,
 Ls 16.9, Rs 11.5 kHz (LFE 0.2 kHz); broadcaster A stereo: 12.8 kHz;
-broadcaster B 5.1 (its stereo core): 18.0 kHz; broadcaster B stereo:
-16.5 kHz. The centre has no A-SPX rendering (see below), so it stops where
+broadcaster B 5.1 (its stereo core): 18.0 kHz, and with the A-CPL upmix
+(2026-11-23, 4096 points, from the first I-frame) L 16.8, R 15.6, C 14.3,
+Ls 17.5, Rs 15.0 kHz (LFE 0.2 kHz); broadcaster B stereo: 16.5 kHz. The centre has no A-SPX rendering (see below), so it stops where
 the core does. These figures describe what the broadcasters send as much
 as the decoder.
 
@@ -113,6 +115,53 @@ frame continuity of alpha (inferred; about 4 000 such references in the
 bound the alpha scale from above only: a decoder using twice the standard's
 0.1 per step fails them, one using half of it passes them, and only the
 unit tests (which encode the standard's text) catch that.
+
+### A-CPL (ASPX_ACPL_3)
+
+Broadcaster B sends its 5.1 as a stereo core plus advanced-coupling
+parameters (5_X_codec_mode 4). Every 5_X frame on the captures is codec
+mode 1 (broadcaster A, which by Table 214 has no A-CPL) or 4 (B); none is
+ASPX_ACPL_1/2. B's stream uses 15 parameter bands, fine quantisation, one
+parameter set per frame, smooth interpolation (1,123 frames) and steep
+(13). The decoder parses and differentially decodes the eleven parameter
+sets (Tables 62-65, Pseudocode 121, the codebooks' cb_off), dequantises
+them (Tables 203-208), and builds L, R, C, Ls, Rs from the core pair's
+A-SPX output in the QMF domain: interpolation (Pseudocode 109), three
+decorrelators with the transient ducker (Pseudocodes 111-114), the upmix
+(Pseudocodes 118, 119); the LFE is decoded from its own data. Readings
+are under [Interpretations](#interpretations).
+
+There is no reference output, so it was checked against what the
+standard implies (`c/tests/acpl_check.py`, B's 42 s capture, from its
+first I-frame; levels in dB of full scale):
+
+* **It sums back to the core.** Pseudocode 118 makes L + Ls/sqrt2 +
+  C/sqrt2 a mix of the core pair alone (the decorrelated terms cancel);
+  with the transmitted gammas, (L + C/sqrt2 + Ls/sqrt2) / (1 + sqrt2)
+  equals the core's left channel to -49.8 dB (right: -48.8 dB; worst
+  frame -24 dB, median -72 dB). This also checks the gamma decoding.
+* **Levels.** RMS / peak: L -25.8 / -8.8, R -25.8 / -8.4, C -20.9 / -3.0,
+  Ls -32.8 / -11.2, Rs -32.3 / -10.8, LFE -37.2 / -20.0 (the core pair
+  -26.3 / -8.9); nothing near clipping, all samples finite. C carries 2.6
+  dB more than the core pair below 8 kHz; the surrounds sit 7 to 10 dB
+  under it, the fronts 2 to 3 dB under it.
+* **Boundaries.** Frame-to-frame level steps of the upmixed channels are
+  those of the core (99.9th percentile 15-19 dB against 16-17 dB, the
+  programme's own); at the I-frames (where the configuration is sent) at
+  most 3.5 dB on L/R/C and 7 dB on the surrounds. High-frequency energy
+  folded on the frame period: peak/mean 1.12-1.23 on the upmixed channels
+  against 1.15 on the core (no click at frame boundaries). At the first
+  I-frame the upmix starts without a gap (C from -35 to -18 dB, the
+  surrounds from silence to -32 dB).
+* **Decorrelators.** All-pass sections with poles inside the unit circle
+  (largest radius 0.959); an impulse keeps its energy (unit tests).
+* **Alignment.** L and R at lag 0 against C (correlation 0.87, 0.91);
+  the LFE at +165 samples (correlation 0.55, the programme's low-pass).
+* **Listening proxies.** C correlates 0.99 with the core's mid signal and
+  holds 42 % of its energy in the speech band (250 Hz - 4 kHz), as L and
+  R do; the surrounds are decorrelated but not silent (Ls~L 0.20, Ls~Rs
+  0.15, Rs~R -0.28; their best lag against C is 500-900 samples, the
+  decorrelators' delay).
 
 ## Changes against the standard
 
@@ -173,10 +222,59 @@ at 0.9 of full scale):
   from the previous one; that one is used. Rare on air (8 of 2,363
   envelopes on broadcaster B's 5.1, 8 of 2,670 on its stereo, 4 of 1,218
   and 10 of 632 on broadcaster A's 10 s lanes): worst change 3.7e-4 of
-  full scale, SNR 99 dB (broadcaster B stereo); 109 dB or more elsewhere.
+  full scale, SNR 102 dB (broadcaster B stereo, 42 s; 99 dB on its 10 s
+  lane); 109 dB or more elsewhere.
 * **The late `audio_size` check** could judge a frame already concealed
   for another reason again: the Python counted it twice in `n_bad`, the C
   replaced its reason. Now it keeps its first reason and is counted once.
+
+## Interpretations
+
+Where TS 103 190-1 leaves room, these are the readings both decoders take
+(the A-SPX readings are under
+[Changes against the standard](#changes-against-the-standard)).
+
+**A-CPL (clause 5.7.7, ASPX_ACPL_3)**
+
+* **Time grid.** The standard gives A-CPL the A-SPX output matrix of the
+  frame (6.2.11); here frame f's A-CPL acts on the same QMF slots as frame
+  f's A-SPX: 24 f + 4 .. 24 f + 27 (`aspx_render.TS_OFFSET`). Checked on
+  air: the two steep-interpolation frames of broadcaster B's 5.1 that fall
+  in a frame with an A-SPX transient change their parameters at slot 14
+  and 13, where A-SPX puts its transient border (slots 14 and 12). See
+  Known issues for the grid itself.
+* **Transient ducker** (Pseudocodes 112-114). Run once per QMF time slot
+  (Pseudocode 113 takes one subsample per band; "the previous frame" in
+  the text is read as the previous slot: the decay ALPHA then has a time
+  constant of 5 ms, against 120 ms per frame, too slow for transients),
+  over the 15-band partition of Table 197
+  (the loop runs to acpl_max_num_param_bands = 15, whatever the stream's
+  band count), on the energy of the ducker's own input, the decorrelator
+  output (Pseudocodes 113 and 114 use the same x; "the input channel").
+* **Cold start.** acpl_param_prev is 0 "when decoding the first AC-4
+  frame". This decoder plays the stereo core in L/R before the stream's
+  first acpl_config_2ch (it cannot upmix without it), so at the first
+  frame with A-CPL data (and after any frame without) the previous
+  parameters are taken equal to that frame's first set: the upmix starts
+  without a fade from silence. Decorrelator and ducker states start at 0
+  as the standard says.
+* **Frames without A-CPL data** (before the first I-frame): L/R are the
+  core (through the same QMF path), C/Ls/Rs silent, the tool's state
+  cleared. A **concealed frame** holds the previous parameters (its core
+  is already faded out by the concealment) and runs the decorrelators on.
+* **Out-of-range values.** After time-differential decoding (Pseudocode
+  121) a value can leave what the F0 codebook can code and what Tables
+  203-206 cover; on air this happens only after frames lost on air (33
+  frames after a 4-frame gap on broadcaster B, until each parameter's
+  next frequency-coded set). Such a value is clamped to the range at
+  dequantisation; the q value itself stays the reference for the next
+  frame. It is not treated as damage (it was not, there).
+* **Level checks.** The burst guard and `aspx.level` judge the A-SPX output
+  of the core pair before the upmix, as for every other stream; a frame
+  they replace plays the core (the stereo downmix) on L/R and nothing on
+  C/Ls/Rs.
+* With `channels=2` (`--channels 2`) an ASPX_ACPL_3 stream gives its stereo
+  core, without the upmix.
 
 ## The C decoder
 
@@ -196,12 +294,17 @@ c/ac4dec-c audio.m4s out.wav     # --f64 RAW, --status FILE, --lookahead N, ...
 damaged-input rules and output guard, as a delay line: frames come out
 `lookahead` frames after they go in (default 180, 6 s; minimum 8 for live
 use). Against the Python on all 14 captures at hand (both broadcasters;
-stereo, 5.1 codec mode 1, ASPX_ACPL_3), everything on: largest difference
-4.7e-15 of full scale, 16-bit WAVs byte-identical, the same per-frame
-statuses (`c/tests/compare.py`). On damaged input it gives the Python's
+stereo, 5.1 codec mode 1, ASPX_ACPL_3 with the A-CPL upmix), everything
+on: largest difference 4.7e-15 of full scale (1.75e-15 on the upmixed
+5.1), 16-bit WAVs byte-identical, the same per-frame statuses
+(`c/tests/compare.py`). `c/tests/check_acpl.py` holds the C A-CPL to the
+Python on the branches the captures do not reach (12/9/7 bands, coarse
+quantisation, two parameter sets, clamped values, concealed frames):
+5.2e-16 of peak on 480 random frames. `c/tests/acpl_check.py` gives the
+sanity measurements of the upmix (see A-CPL below). On damaged input it gives the Python's
 figures exactly at the default lookahead (`c/tests/robust_compare.py`); at
-the minimum lookahead the guard seeds from fewer frames: 8 gate failures,
-126 undamaged frames concealed. `c/tests/check_noise_fill.py`,
+the minimum lookahead the guard seeds from fewer frames: 4 gate messages (2 decodes),
+168 undamaged frames concealed. `c/tests/check_noise_fill.py`,
 `late_check.py` and `align_check.py` check the noise fill, the late
 `audio_size` check and the channel alignment against the Python. The C
 streams and has no decode passes; it equals a one-pass Python decode.
@@ -211,18 +314,23 @@ time; Python with its C kernels built):
 
 | stream | length | Python | C |
 |---|---|---|---|
-| 5.1, codec mode 1 (A-SPX), broadcaster A | 10 s | 4.2x | 26.3x |
-| stereo, broadcaster A | 10 s | 9.1x | 55.6x |
-| 5.1 sent as ASPX_ACPL_3 (stereo core decoded), broadcaster B | 42 s | 7.5x | 51.7x |
-| stereo, broadcaster B | 42 s | 9.3x | 60.1x |
+| 5.1, codec mode 1 (A-SPX), broadcaster A | 10 s | 4.2x | 23.8x |
+| stereo, broadcaster A | 10 s | 9.1x | 50.0x |
+| 5.1 sent as ASPX_ACPL_3 (A-CPL upmix), broadcaster B | 42 s | 3.5x | 24.5x |
+| stereo, broadcaster B | 42 s | 9.1x | 55.3x |
+
+The upmix halves the speed on broadcaster B's 5.1 (7.5x / 51.7x with its
+stereo core only): half the C's time is now QMF synthesis, of seven
+channels (the five upmixed ones, and the core pair before the upmix,
+which the level checks judge); the A-CPL itself is 12 %. A and B stereo
+are unchanged within the spread between runs.
 
 ## What it does not do yet
 
-* **A-CPL.** An ASPX_ACPL_3 5.1 stream decodes to its stereo core (the coded
-  downmix the broadcaster sent); C, LFE, Ls and Rs are written silent.
-  `acpl_data_2ch()` is parsed, for bit accounting only (no upmix).
-  ASPX_ACPL_1/2 and stereo_codec_mode 2/3 are concealed as damaged frames
-  (`element.parse`).
+* **A-CPL modes 1 and 2.** ASPX_ACPL_1/2 (5_X codec modes 2 and 3,
+  stereo_codec_mode 2 and 3) are concealed as damaged frames
+  (`element.parse`); no capture carries them. ASPX_ACPL_3 is decoded (above);
+  codec mode 1 has no A-CPL (Table 214).
 * **A-SPX on the centre channel.** Its block is parsed (to keep state) but
   not rendered, so the centre stops where its core does (11.5 kHz measured).
 * Companding (read, not applied); A-SPX additional harmonics (under 1.5 % of
@@ -246,8 +354,7 @@ guard as a last resort (`ac4/robust.py` lists every rule):
   sequence_counter <= 1020, layout and rates as in the stream so far); `audio_size` closure: the parse of `audio_data()` must end 0..7
   bits before `audio_size` says (byte alignment), which holds on every
   clean frame measured (uniform over 0..7). That covers the core, all A-SPX
-  blocks (centre included) and, for ASPX_ACPL_3, `acpl_data_2ch()`, which
-  is now read for bit accounting (not synthesised); section codebooks 12-15,
+  blocks (centre included) and, for ASPX_ACPL_3, `acpl_data_2ch()`; section codebooks 12-15,
   sections that overrun `max_sfb`, `max_sfb` beyond the band table,
   quantised lines above 8191, scale factors outside 0..255; A-SPX
   envelope counts (Table 127) and borders; and a sanity bound on dequantised lines (1e9, 37 dB above the
@@ -325,14 +432,22 @@ kinds, a swap damaging two; runs of 3 to 20 consecutive frames; a damaged
 TOC in the first frame): no exception, exact length everywhere. 8,185
 damaged frames were concealed, 983 decoded identical to the clean decode
 around them and 1,876 differently but with no sample above 2x the clean
-stream's peak; 2 were LOUD. 27 undamaged frames were concealed in all (at
-most 4 per hit allowed). Worst peak 4.45x the clean stream's own peak
-(byte bursts; 1.48x for runs, 1.21x or less for every other kind): two
+stream's peak; 2 were LOUD. 75 undamaged frames were concealed in all (at
+most 4 per hit allowed; 27 before the A-CPL upmix, measured the same day
+on the same cuts: the 48 more are on broadcaster B's 5.1 cuts, whose
+frames 120-239 are now upmixed, every one within 3 frames of a damaged
+frame, muted by the guard's near-damage rule). Worst peak 4.45x the clean
+stream's own peak (byte bursts; 1.96x for runs, on B's upmixed 5.1, a
+damaged frame inside a run that passed the checks and stayed under the
+near-damage limit of 2x; 1.48x before the upmix; 1.21x or less for every
+other kind): two
 isolated burst frames early in broadcaster A's 5.1 cut, under the
 guard's start-level limit (see below), are the only failing decodes (2,
 with 4 gate messages; 3 decodes, 5 messages before the 2026-11-23 fixes).
 On the clean cuts nothing is concealed and the guard changes no sample.
-The C decoder gives exactly the same figures at its default lookahead.
+The C decoder gives exactly the same figures at its default lookahead
+(at the minimum lookahead, 8: 2 LOUD, 4 gate messages, 168 collateral;
+before the upmix 4, 8 and 126).
 (The figure of 1.82x printed here before was measured on an earlier set
 of cuts and did not reproduce: the decoder of the C port's milestone 2
 gave 4.45x, 2 LOUD, 5 failures on these.) With the checks and level checks
@@ -412,6 +527,19 @@ reading.
   configuration fell in a later pass is gone: every channel is now
   delayed the same way from the first frame.) The C decoder streams and
   has no passes; it equals a one-pass Python decode.
+* **The QMF tools' time grid (A-SPX and A-CPL)** (found 2026-11-23, not
+  changed). Both tools put frame f on QMF slots 24 f + 4 + ...
+  (`aspx_render.TS_OFFSET`, an impulse measurement of the analysis bank's
+  delay). On air, the transient markers the encoder sends lead the core's
+  own transients by about 12 slots (768 samples, half a frame): 10 of 14
+  A-SPX transient borders (`aspx_tsg_ptr`) on both broadcasters fall 12 or
+  13 slots before the largest rise of the core's 3-9 kHz energy, and the
+  A-CPL steep-interpolation slots also lead (by 8 to 23 slots, 9 of 13).
+  If confirmed, the grid would be TS_OFFSET = 16, for both tools at once
+  (A-CPL takes the A-SPX constant; the C renderer would then need one more
+  frame of lookahead, since envelopes would reach 22 slots into the next
+  frame). Not changed here: it moves the A-SPX output of every stream and
+  needs its own check.
 * **A-SPX envelope dequantisation** (found while checking full SAP, effect
   not measured): `aspx_envadj.map_scf` and `map_scf_joint` always use
   a = 1, while TS 103 190-1 Pseudocodes 82 and 84 use a = 2 for 1.5 dB
@@ -438,7 +566,13 @@ fixes of 2026-11-23 (`channel_mode` codes, each channel's framing, the
 noise fill generator and levels, the A-SPX limiter against the
 standard's pseudocode, the noise index across envelopes, the transient envelope, no HF patch
 without A-SPX data, all six channels time-aligned, the late check on an
-already concealed frame).
+already concealed frame). `tests/test_acpl.py` checks A-CPL against the
+standard's Pseudocodes 109-114, 118, 119 and 121 written out sample by
+sample (several band counts, both quantisation modes, one and two
+parameter sets, smooth and steep interpolation), the dequantisation
+tables, the decorrelators as stable all-pass filters, that the upmix sums
+back to the core under downmix gammas, frames without data and concealed
+frames, and a decode of a stubbed ASPX_ACPL_3 stream to six channels.
 
 Integration tests cut each capture to its first two fragments (about 4 s)
 and check that every frame decodes and the WAV length is exact. (The
@@ -478,7 +612,8 @@ fail.
 | `sfb.py` | scale-factor band offsets |
 | `channels.py`, `pair.py` | `5_X` channel element; `channel_pair_element` |
 | `audio.py` | dequantisation, stereo processing (M/S and full SAP), noise fill |
-| `acpl_parse.py` | A-CPL side data, parsed only (no upmix) |
+| `acpl_parse.py` | A-CPL side data: parsing, cb_off, differential decoding |
+| `acpl.py` | A-CPL: dequantisation, interpolation, decorrelators, ducker, the ASPX_ACPL_3 upmix |
 | `frameinfo.py` | walks each frame's audio_data() to its end and checks it against audio_size |
 | `mdct.py`, `filterbank.py` | MDCT, KBD windows, block switching, overlap-add |
 | `qmf.py` | 64-band complex QMF bank |
