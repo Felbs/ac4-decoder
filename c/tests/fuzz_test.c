@@ -14,9 +14,10 @@
  *
  * Required: no crash (build the _asan variant to check memory errors too),
  * every frame gives exactly the samples the timeline owes it, every sample
- * is finite. Reported (not gated: the output guard of robust.py is not in
- * milestone 1): concealed counts and the worst peak against the clean
- * decode's own peak.
+ * is finite, every frame comes out exactly once and in order (the decoder
+ * is a delay line; ac4dec_flush drains it). Reported (the gate on levels is
+ * c/tests/robust_compare.py): concealed counts and the worst peak against
+ * the clean decode's own peak.
  */
 #include <math.h>
 #include <stdio.h>
@@ -45,63 +46,97 @@ typedef struct {
     size_t n;
 } frame_t;
 
-/* decode a frame list; -> peak, checks timing and finiteness */
-static double run(frame_t *fr, long n, ac4dec_element el, int internal,
-                  long *n_conc, double *clean_pk_frames, double *worst_ratio)
+/* one output frame: timing, order, finiteness */
+typedef struct {
+    long next;                 /* the index expected next */
+    long total;                /* samples given so far */
+    int internal;
+    long n_conc;
+    double pk;
+    const double *clean_pk;
+    double *worst;
+} acc_t;
+
+static void take(acc_t *a, const ac4dec_frame *o)
+{
+    long want;
+    int c, k;
+    double fpk = 0.0;
+    CHECK(o->status == AC4DEC_OK || o->status == AC4DEC_CONCEALED
+          || o->status == AC4DEC_BAD, "bad status %d", (int)o->status);
+    CHECK(o->index == a->next, "frame %lld out, %ld expected", o->index,
+          a->next);
+    if (o->status != AC4DEC_OK)
+        a->n_conc++;
+    if (a->internal) {
+        want = 1536;
+    } else {
+        long long tot = (long long)(a->next + 1) * 1536;
+        want = (long)((tot * 1001 + 959) / 960) - a->total;
+    }
+    CHECK(o->n_samples == want, "frame %ld: %d samples, want %ld", a->next,
+          o->n_samples, want);
+    a->total += o->n_samples;
+    a->next++;
+    CHECK(o->n_channels >= 1 && o->n_channels <= 6, "channels %d",
+          o->n_channels);
+    for (c = 0; c < o->n_channels; c++)
+        for (k = 0; k < o->n_samples; k++) {
+            double v = o->pcm[c][k];
+            if (!isfinite(v)) {
+                CHECK(0, "non-finite sample");
+                break;
+            }
+            if (fabs(v) > fpk)
+                fpk = fabs(v);
+        }
+    if (fpk > a->pk)
+        a->pk = fpk;
+    if (a->clean_pk && a->worst && *a->clean_pk > 0) {
+        double r = fpk / *a->clean_pk;
+        if (r > *a->worst)
+            *a->worst = r;
+    }
+}
+
+/* decode a frame list; -> peak, checks timing, order and finiteness */
+static double run_la(frame_t *fr, long n, ac4dec_element el, int internal,
+                     int lookahead, long *n_conc, double *clean_pk,
+                     double *worst_ratio)
 {
     ac4dec_config cfg;
     ac4dec *d;
-    long i, total = 0;
-    double pk = 0.0;
+    ac4dec_frame o;
+    long i;
+    acc_t a;
     memset(&cfg, 0, sizeof(cfg));
+    memset(&a, 0, sizeof(a));
     cfg.element = el;
     cfg.internal_rate = internal;
+    cfg.lookahead = lookahead;
     d = ac4dec_open(&cfg);
     if (!d) {
         CHECK(0, "open failed");
         return 0.0;
     }
-    *n_conc = 0;
-    for (i = 0; i < n; i++) {
-        ac4dec_frame o;
-        long want;
-        int c, k, st = ac4dec_decode_frame(d, fr[i].p, fr[i].n, &o);
-        double fpk = 0.0;
-        CHECK(st == AC4DEC_OK || st == AC4DEC_CONCEALED || st == AC4DEC_BAD,
-              "bad status %d", st);
-        if (st != AC4DEC_OK)
-            (*n_conc)++;
-        if (internal) {
-            want = 1536;
-        } else {
-            long long tot = (long long)(i + 1) * 1536;
-            want = (long)((tot * 1001 + 959) / 960) - total;
-        }
-        CHECK(o.n_samples == want, "frame %ld: %d samples, want %ld", i,
-              o.n_samples, want);
-        total += o.n_samples;
-        CHECK(o.n_channels >= 1 && o.n_channels <= 6, "channels %d",
-              o.n_channels);
-        for (c = 0; c < o.n_channels; c++)
-            for (k = 0; k < o.n_samples; k++) {
-                double v = o.pcm[c][k];
-                if (!isfinite(v)) {
-                    CHECK(0, "non-finite sample");
-                    break;
-                }
-                if (fabs(v) > fpk)
-                    fpk = fabs(v);
-            }
-        if (fpk > pk)
-            pk = fpk;
-        if (clean_pk_frames && worst_ratio && clean_pk_frames[0] > 0) {
-            double r = fpk / clean_pk_frames[0];
-            if (r > *worst_ratio)
-                *worst_ratio = r;
-        }
-    }
+    a.internal = internal;
+    a.clean_pk = clean_pk;
+    a.worst = worst_ratio;
+    for (i = 0; i < n; i++)
+        if (ac4dec_decode_frame(d, fr[i].p, fr[i].n, &o))
+            take(&a, &o);
+    while (ac4dec_flush(d, &o))
+        take(&a, &o);
+    CHECK(a.next == n, "%ld frames in, %ld out", n, a.next);
+    *n_conc = a.n_conc;
     ac4dec_close(d);
-    return pk;
+    return a.pk;
+}
+
+static double run(frame_t *fr, long n, ac4dec_element el, int internal,
+                  long *n_conc, double *clean_pk, double *worst_ratio)
+{
+    return run_la(fr, n, el, internal, 0, n_conc, clean_pk, worst_ratio);
 }
 
 static void synthetic(void)
@@ -128,8 +163,15 @@ static void synthetic(void)
         fr[i].n = fr[i].p ? n : 0;
     }
     for (el = 0; el <= 2; el++)
-        for (internal = 0; internal <= 1; internal++)
+        for (internal = 0; internal <= 1; internal++) {
             run(fr, 300, (ac4dec_element)el, internal, &n_conc, NULL, NULL);
+            run_la(fr, 300, (ac4dec_element)el, internal,
+                   AC4DEC_MIN_LOOKAHEAD, &n_conc, NULL, NULL);
+            run_la(fr, 3, (ac4dec_element)el, internal, 0, &n_conc, NULL,
+                   NULL);
+            run_la(fr, 0, (ac4dec_element)el, internal, 0, &n_conc, NULL,
+                   NULL);
+        }
     /* the MP4 reader on garbage */
     for (i = 0; i < 200; i++) {
         ac4mp4_sample *s = NULL;
@@ -202,6 +244,12 @@ static void capture(const char *path, int seeds)
         el = ac4dec_probe(fr[i].p, fr[i].n);
     clean_pk = run(fr, n, el, 0, &n_conc, NULL, NULL);
     CHECK(n_conc == 0, "%s: %ld clean frames concealed", path, n_conc);
+    {
+        long n2;
+        run_la(fr, n, el, 1, AC4DEC_MIN_LOOKAHEAD, &n2, NULL, NULL);
+        CHECK(n2 == 0, "%s: %ld clean frames concealed (lookahead %d)", path,
+              n2, AC4DEC_MIN_LOOKAHEAD);
+    }
     for (k = 0; k < K_COUNT; k++) {
         int s;
         for (s = 0; s < seeds; s++) {

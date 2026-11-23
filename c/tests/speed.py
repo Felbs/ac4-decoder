@@ -4,10 +4,9 @@
     nice -n 10 python3 c/tests/speed.py CAPTURE.m4s [...]
 
 Per capture, best of RUNS (default 2) runs each, every process on one
-thread (OMP/OpenBLAS/MKL threads pinned to 1):
-  * ac4dec (Python, ac4.cli, C kernels as built): the full decoder,
-    A-SPX rendered;
-  * the same with A-SPX rendering disabled (the work the C port does);
+thread (OMP/OpenBLAS/MKL threads pinned to 1), both with their default
+settings (A-SPX rendered, output guard on):
+  * ac4dec (Python, ac4.cli, C kernels as built);
   * ac4dec-c.
 Two figures each: the decoder's own timer (decode time, what the README's
 table reports) and the wall time of the whole process (interpreter start,
@@ -31,14 +30,6 @@ PY = os.environ.get("AC4_PYTHON", sys.executable)
 ENV = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
            MKL_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1",
            PYTHONPATH=REPO + os.pathsep + os.environ.get("PYTHONPATH", ""))
-
-CORE_ONLY = (
-    "import sys\n"
-    "from ac4 import aspx_render, cli\n"
-    "def _off(*a, **k):\n"
-    "    raise RuntimeError('A-SPX rendering disabled')\n"
-    "aspx_render.apply_hf_pair = _off\n"
-    "sys.exit(cli.main(sys.argv[1:]))\n")
 
 PAT = re.compile(r"([0-9.]+) s -> .*\[([0-9.]+) s, ([0-9.]+)x real time")
 
@@ -68,19 +59,16 @@ def main(files):
         tag = os.path.splitext(os.path.basename(p))[0]
         o = os.path.join(OUT, "speed_" + tag)
         py = best([PY, "-m", "ac4", p, o + ".py.wav"])
-        core = best([PY, "-c", CORE_ONLY, p, o + ".pycore.wav"])
         c = best([C_CLI, p, o + ".c.wav"])
-        rows.append((p, py, core, c))
+        rows.append((p, py, c))
         secs = c[0]
         print(f"\n{os.path.basename(os.path.dirname(p))}/"
               f"{os.path.basename(p)}: {secs:.1f} s of audio")
         print(f"  {'decoder':34s} {'decode RTF':>11s} {'wall RTF':>9s}")
-        for name, r in (("ac4dec (Python, A-SPX rendered)", py),
-                        ("ac4dec (Python, core only)", core),
-                        ("ac4dec-c (core only)", c)):
+        for name, r in (("ac4dec (Python)", py), ("ac4dec-c", c)):
             print(f"  {name:34s} {secs / r[1]:10.1f}x {secs / r[2]:8.1f}x")
-        print(f"  C vs Python core only: {core[1] / c[1]:.0f}x faster "
-              f"(decode), {core[2] / c[2]:.0f}x (wall)")
+        print(f"  C vs Python: {py[1] / c[1]:.0f}x faster (decode), "
+              f"{py[2] / c[2]:.0f}x (wall)")
     return 0
 
 

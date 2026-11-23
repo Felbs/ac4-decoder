@@ -1,18 +1,23 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /*
  * ac4dec-c -- decode the AC-4 audio track of a fragmented MP4 file to WAV.
- * The C port of `ac4dec` (ac4/cli.py), milestone 1 (core only: no A-SPX,
- * no A-CPL; see include/ac4dec.h).
+ * The C port of `ac4dec` (ac4/cli.py): A-SPX rendered, output guard on,
+ * as the Python CLI (see include/ac4dec.h).
  *
  *   ac4dec-c IN.m4s OUT.wav [--element auto|5_X|pair] [--channels 2|6]
- *            [--seconds S] [--max-pass N] [--ref-peak X] [--f64 RAW]
- *            [--internal] [-q]
+ *            [--seconds S] [--max-pass N] [--ref-peak X] [--no-guard]
+ *            [--lookahead N] [--f64 RAW] [--internal] [--status FILE] [-q]
  *
  * OUT is 16-bit PCM at 48 kHz, written with the Python CLI's level rule:
  * samples times 0.9 / ref_peak, ref_peak starting at the element's fixed
  * reference (9e5 for 5.1, 2e5 stereo), rising to the loudest sample of a
  * pass, capped at twice the start (anything above it is clipped), applied
- * per decode pass of --max-pass frames before resampling, as there.
+ * per pass of --max-pass output frames before resampling, as there. The
+ * decoder itself is one stream (no pass boundaries); --lookahead sets its
+ * delay (default AC4DEC_DEFAULT_LOOKAHEAD).
+ *
+ * --status FILE writes one line per frame: index, status (0 OK,
+ * 1 concealed, 2 bad) and the reason.
  *
  * --f64 RAW also writes the decoder-scale samples (before the level rule)
  * as interleaved little-endian float64 at 48 kHz (or the internal rate
@@ -35,7 +40,9 @@ static void usage(void)
             "usage: ac4dec-c IN.m4s OUT.wav [--element auto|5_X|pair] "
             "[--channels 2|6]\n"
             "                [--seconds S] [--max-pass N] [--ref-peak X] "
-            "[--f64 RAW] [--internal] [-q]\n");
+            "[--no-guard]\n"
+            "                [--lookahead N] [--f64 RAW] [--internal] "
+            "[--status FILE] [-q]\n");
 }
 
 static double now(void)
@@ -85,27 +92,32 @@ typedef struct {
     double burst, ref_peak;
 } level_t;
 
-static void level_apply(level_t *lv, double *y, long n, int quiet)
+static void level_apply(level_t *lv, double *const *y, int n_ch, long n,
+                        int quiet)
 {
     double pk = 0.0;
     long i;
-    for (i = 0; i < n; i++)
-        if (fabs(y[i]) > pk)
-            pk = fabs(y[i]);
+    int c;
+    for (c = 0; c < n_ch; c++)
+        for (i = 0; i < n; i++)
+            if (fabs(y[c][i]) > pk)
+                pk = fabs(y[c][i]);
     if (pk > lv->burst) {
         if (!quiet)
             fprintf(stdout, "  samples up to %.4g clipped to %.4g\n", pk,
                     lv->ref_peak);
-        for (i = 0; i < n; i++) {
-            if (y[i] > lv->ref_peak)
-                y[i] = lv->ref_peak;
-            else if (y[i] < -lv->ref_peak)
-                y[i] = -lv->ref_peak;
-        }
+        for (c = 0; c < n_ch; c++)
+            for (i = 0; i < n; i++) {
+                if (y[c][i] > lv->ref_peak)
+                    y[c][i] = lv->ref_peak;
+                else if (y[c][i] < -lv->ref_peak)
+                    y[c][i] = -lv->ref_peak;
+            }
         pk = 0.0;
-        for (i = 0; i < n; i++)
-            if (fabs(y[i]) > pk)
-                pk = fabs(y[i]);
+        for (c = 0; c < n_ch; c++)
+            for (i = 0; i < n; i++)
+                if (fabs(y[c][i]) > pk)
+                    pk = fabs(y[c][i]);
     }
     if (pk > lv->ref_peak) {
         if (!quiet)
@@ -114,8 +126,9 @@ static void level_apply(level_t *lv, double *y, long n, int quiet)
                     20.0 * log10(pk / lv->ref_peak));
         lv->ref_peak = pk;
     }
-    for (i = 0; i < n; i++)
-        y[i] = y[i] * (0.9 / lv->ref_peak);
+    for (c = 0; c < n_ch; c++)
+        for (i = 0; i < n; i++)
+            y[c][i] = y[c][i] * (0.9 / lv->ref_peak);
 }
 
 static unsigned char *read_file(const char *path, size_t *len)
@@ -148,12 +161,94 @@ static unsigned char *read_file(const char *path, size_t *len)
     return d;
 }
 
+/* the output of one pass (planar), level rule + resampler + writers */
+typedef struct {
+    int n_ch, internal, quiet;
+    long max_pass, nf;
+    double *pass, *ibuf, *rout[AC4DEC_MAX_CHANNELS];
+    short *pcm16;
+    ac4dec_resampler *rs_wav, *rs_raw;
+    level_t lv;
+    FILE *fw, *fr;
+    unsigned long long n_out;
+} sink_t;
+
+static void sink_flush(sink_t *k)
+{
+    double *planar[AC4DEC_MAX_CHANNELS];
+    long ns = k->nf * 1536, s;
+    int c, no;
+    if (k->nf == 0)
+        return;
+    for (c = 0; c < k->n_ch; c++)
+        planar[c] = k->pass + (size_t)c * (size_t)k->max_pass * 1536;
+    if (k->fr) {
+        /* decoder-scale comparison output */
+        if (k->internal) {
+            for (s = 0; s < ns; s++)
+                for (c = 0; c < k->n_ch; c++)
+                    k->ibuf[s * k->n_ch + c] = planar[c][s];
+            fwrite(k->ibuf, sizeof(double), (size_t)(ns * k->n_ch), k->fr);
+        } else {
+            no = ac4dec_resampler_push(k->rs_raw,
+                                       (const double *const *)planar,
+                                       (int)ns, k->rout);
+            for (s = 0; s < no; s++)
+                for (c = 0; c < k->n_ch; c++)
+                    k->ibuf[s * k->n_ch + c] = k->rout[c][s];
+            fwrite(k->ibuf, sizeof(double), (size_t)no * (size_t)k->n_ch,
+                   k->fr);
+        }
+    }
+    /* the level rule sees the whole pass (all channels) at once */
+    level_apply(&k->lv, planar, k->n_ch, ns, k->quiet);
+    no = ac4dec_resampler_push(k->rs_wav, (const double *const *)planar,
+                               (int)ns, k->rout);
+    for (s = 0; s < no; s++) {
+        for (c = 0; c < k->n_ch; c++) {
+            double v = k->rout[c][s];
+            if (v > 1.0)
+                v = 1.0;
+            else if (v < -1.0)
+                v = -1.0;
+            {
+                double x = v * 32767.0;
+                short q = (short)x;              /* truncation, as numpy */
+                unsigned char *b = (unsigned char *)&k->pcm16[s * k->n_ch + c];
+                b[0] = (unsigned char)((unsigned short)q & 0xff);
+                b[1] = (unsigned char)((unsigned short)q >> 8);
+            }
+        }
+    }
+    fwrite(k->pcm16, 2, (size_t)no * (size_t)k->n_ch, k->fw);
+    k->n_out += (unsigned long long)no;
+    k->nf = 0;
+}
+
+static void sink_frame(sink_t *k, const ac4dec_frame *fo, FILE *st)
+{
+    int c;
+    long off = k->nf * 1536;
+    for (c = 0; c < k->n_ch; c++) {
+        double *dst = k->pass + (size_t)c * (size_t)k->max_pass * 1536 + off;
+        if (c < fo->n_channels && fo->n_samples == 1536)
+            memcpy(dst, fo->pcm[c], sizeof(double) * 1536);
+        else
+            memset(dst, 0, sizeof(double) * 1536);
+    }
+    if (st)
+        fprintf(st, "%lld %d %s\n", fo->index, (int)fo->status,
+                fo->reason ? fo->reason : "-");
+    if (++k->nf == k->max_pass)
+        sink_flush(k);
+}
+
 int main(int argc, char **argv)
 {
-    const char *src = NULL, *dst = NULL, *f64 = NULL;
+    const char *src = NULL, *dst = NULL, *f64 = NULL, *status = NULL;
     const char *el_arg = "auto";
-    int channels = 0, quiet = 0, internal = 0, i, c;
-    long max_pass = 1800;
+    int channels = 0, quiet = 0, internal = 0, no_guard = 0, i, c;
+    long max_pass = 1800, lookahead = 0;
     double seconds = -1.0, ref_peak = 0.0, t0, dt;
     unsigned char *data;
     size_t len;
@@ -162,16 +257,12 @@ int main(int argc, char **argv)
     ac4dec_element element = AC4DEC_ELEMENT_AUTO;
     ac4dec_config cfg;
     ac4dec *dec;
-    ac4dec_resampler *rs_wav = NULL, *rs_raw = NULL;
     ac4dec_stats stats;
-    FILE *fw, *fr = NULL;
-    level_t lv;
-    double *pass = NULL, *planar[AC4DEC_MAX_CHANNELS], *rout[AC4DEC_MAX_CHANNELS];
-    short *pcm16 = NULL;
-    double *ibuf = NULL;
-    unsigned long long n_out = 0;
+    FILE *fst = NULL;
+    sink_t k;
     int n_ch;
 
+    memset(&k, 0, sizeof(k));
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--element") && i + 1 < argc)
@@ -184,10 +275,16 @@ int main(int argc, char **argv)
             max_pass = atol(argv[++i]);
         else if (!strcmp(a, "--ref-peak") && i + 1 < argc)
             ref_peak = atof(argv[++i]);
+        else if (!strcmp(a, "--lookahead") && i + 1 < argc)
+            lookahead = atol(argv[++i]);
         else if (!strcmp(a, "--f64") && i + 1 < argc)
             f64 = argv[++i];
+        else if (!strcmp(a, "--status") && i + 1 < argc)
+            status = argv[++i];
         else if (!strcmp(a, "--internal"))
             internal = 1;
+        else if (!strcmp(a, "--no-guard"))
+            no_guard = 1;
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet"))
             quiet = 1;
         else if (a[0] == '-' && a[1]) {
@@ -260,115 +357,84 @@ int main(int argc, char **argv)
     cfg.element = element;
     cfg.channels = channels;
     cfg.internal_rate = 1;          /* the level rule runs before resampling */
+    cfg.lookahead = (int)lookahead;
+    cfg.no_guard = no_guard;
     dec = ac4dec_open(&cfg);
     if (!dec) {
-        fprintf(stderr, "cannot open the decoder\n");
+        fprintf(stderr, "cannot open the decoder (bad --lookahead?)\n");
         return 1;
     }
     n_ch = (element == AC4DEC_ELEMENT_PAIR) ? 2 : (channels ? channels : 6);
-    lv.ref_peak = ref_peak > 0.0 ? ref_peak : ac4dec_ref_peak(element);
-    lv.burst = 2.0 * lv.ref_peak;
-    if (lv.ref_peak > lv.burst)
-        lv.ref_peak = lv.burst;
-    rs_wav = ac4dec_resampler_open(n_ch);
+    k.n_ch = n_ch;
+    k.internal = internal;
+    k.quiet = quiet;
+    k.max_pass = max_pass;
+    k.lv.ref_peak = ref_peak > 0.0 ? ref_peak : ac4dec_ref_peak(element);
+    k.lv.burst = 2.0 * k.lv.ref_peak;
+    if (k.lv.ref_peak > k.lv.burst)
+        k.lv.ref_peak = k.lv.burst;
+    k.rs_wav = ac4dec_resampler_open(n_ch);
     if (f64 && !internal)
-        rs_raw = ac4dec_resampler_open(n_ch);
-    pass = (double *)malloc(sizeof(double) * (size_t)max_pass * 1536
-                            * (size_t)n_ch);
-    ibuf = (double *)malloc(sizeof(double) * (size_t)max_pass * 1536
-                            * (size_t)n_ch);
+        k.rs_raw = ac4dec_resampler_open(n_ch);
+    k.pass = (double *)malloc(sizeof(double) * (size_t)max_pass * 1536
+                              * (size_t)n_ch);
+    k.ibuf = (double *)malloc(sizeof(double) * (size_t)max_pass * 1602
+                              * (size_t)n_ch);
     for (c = 0; c < n_ch; c++)
-        rout[c] = (double *)malloc(sizeof(double)
-                                   * ((size_t)max_pass * 1602 + 8));
-    pcm16 = (short *)malloc(sizeof(short) * ((size_t)max_pass * 1602 + 8)
-                            * (size_t)n_ch);
-    if (!rs_wav || (f64 && !internal && !rs_raw) || !pass || !ibuf || !pcm16) {
+        k.rout[c] = (double *)malloc(sizeof(double)
+                                     * ((size_t)max_pass * 1602 + 8));
+    k.pcm16 = (short *)malloc(sizeof(short) * ((size_t)max_pass * 1602 + 8)
+                              * (size_t)n_ch);
+    if (!k.rs_wav || (f64 && !internal && !k.rs_raw) || !k.pass || !k.ibuf
+        || !k.pcm16) {
         fprintf(stderr, "out of memory\n");
         return 1;
     }
     for (c = 0; c < n_ch; c++)
-        if (!rout[c]) {
+        if (!k.rout[c]) {
             fprintf(stderr, "out of memory\n");
             return 1;
         }
-    fw = fopen(dst, "wb");
-    if (!fw || wav_header(fw, n_ch, 0) != 0) {
+    k.fw = fopen(dst, "wb");
+    if (!k.fw || wav_header(k.fw, n_ch, 0) != 0) {
         fprintf(stderr, "cannot write %s\n", dst);
         return 1;
     }
     if (f64) {
-        fr = fopen(f64, "wb");
-        if (!fr) {
+        k.fr = fopen(f64, "wb");
+        if (!k.fr) {
             fprintf(stderr, "cannot write %s\n", f64);
             return 1;
         }
     }
-
-    for (f0 = 0; f0 < n_frames; f0 += max_pass) {
-        long nf = n_frames - f0 < max_pass ? n_frames - f0 : max_pass, k;
-        long ns = nf * 1536, s;
-        int no;
-        /* decode a pass: planar per channel */
-        for (c = 0; c < n_ch; c++)
-            planar[c] = pass + (size_t)c * (size_t)ns;
-        for (k = 0; k < nf; k++) {
-            ac4dec_frame fo;
-            const ac4mp4_sample *sm = &smp[f0 + k];
-            ac4dec_decode_frame(dec, sm->len ? data + sm->off : NULL, sm->len,
-                                &fo);
-            for (c = 0; c < n_ch; c++) {
-                if (c < fo.n_channels && fo.n_samples == 1536)
-                    memcpy(planar[c] + k * 1536, fo.pcm[c],
-                           sizeof(double) * 1536);
-                else
-                    memset(planar[c] + k * 1536, 0, sizeof(double) * 1536);
-            }
+    if (status) {
+        fst = fopen(status, "w");
+        if (!fst) {
+            fprintf(stderr, "cannot write %s\n", status);
+            return 1;
         }
-        if (fr) {
-            /* decoder-scale comparison output */
-            if (internal) {
-                for (s = 0; s < ns; s++)
-                    for (c = 0; c < n_ch; c++)
-                        ibuf[s * n_ch + c] = planar[c][s];
-                fwrite(ibuf, sizeof(double), (size_t)(ns * n_ch), fr);
-            } else {
-                no = ac4dec_resampler_push(rs_raw,
-                                           (const double *const *)planar,
-                                           (int)ns, rout);
-                for (s = 0; s < no; s++)
-                    for (c = 0; c < n_ch; c++)
-                        ibuf[s * n_ch + c] = rout[c][s];
-                fwrite(ibuf, sizeof(double), (size_t)no * (size_t)n_ch, fr);
-            }
-        }
-        /* the level rule sees the whole pass (all channels) at once */
-        level_apply(&lv, pass, ns * n_ch, quiet);
-        no = ac4dec_resampler_push(rs_wav, (const double *const *)planar,
-                                   (int)ns, rout);
-        for (s = 0; s < no; s++) {
-            for (c = 0; c < n_ch; c++) {
-                double v = rout[c][s];
-                if (v > 1.0)
-                    v = 1.0;
-                else if (v < -1.0)
-                    v = -1.0;
-                {
-                    double x = v * 32767.0;
-                    short q = (short)x;          /* truncation, as numpy */
-                    unsigned char *b = (unsigned char *)&pcm16[s * n_ch + c];
-                    b[0] = (unsigned char)((unsigned short)q & 0xff);
-                    b[1] = (unsigned char)((unsigned short)q >> 8);
-                }
-            }
-        }
-        fwrite(pcm16, 2, (size_t)no * (size_t)n_ch, fw);
-        n_out += (unsigned long long)no;
     }
-    fseek(fw, 0, SEEK_SET);
-    wav_header(fw, n_ch, n_out * 2ull * (unsigned long long)n_ch);
-    fclose(fw);
-    if (fr)
-        fclose(fr);
+
+    for (f0 = 0; f0 < n_frames; f0++) {
+        ac4dec_frame fo;
+        const ac4mp4_sample *sm = &smp[f0];
+        if (ac4dec_decode_frame(dec, sm->len ? data + sm->off : NULL,
+                                sm->len, &fo))
+            sink_frame(&k, &fo, fst);
+    }
+    {
+        ac4dec_frame fo;
+        while (ac4dec_flush(dec, &fo))
+            sink_frame(&k, &fo, fst);
+    }
+    sink_flush(&k);
+    fseek(k.fw, 0, SEEK_SET);
+    wav_header(k.fw, n_ch, k.n_out * 2ull * (unsigned long long)n_ch);
+    fclose(k.fw);
+    if (k.fr)
+        fclose(k.fr);
+    if (fst)
+        fclose(fst);
     dt = now() - t0;
     ac4dec_get_stats(dec, &stats);
     if (!quiet) {
@@ -387,21 +453,21 @@ int main(int argc, char **argv)
                    "L/R; the other channels are written silent\n");
         printf("%ld frames (%ld bad, %ld concealed, %ld sequence jumps), "
                "element %s, %d ch, %.3f s -> %s  [%.2f s, %.2fx real time; "
-               "core only: A-SPX/A-CPL not rendered]\n",
-               n_frames, stats.n_bad + stats.n_concealed, stats.n_concealed,
-               stats.n_seq_jumps,
+               "A-SPX bursts %ld]\n",
+               n_frames, stats.n_bad, stats.n_concealed, stats.n_seq_jumps,
                element == AC4DEC_ELEMENT_PAIR ? "pair" : "5_X", n_ch,
-               (double)n_out / 48000.0, dst, dt,
-               dt > 0 ? ((double)n_out / 48000.0) / dt : 0.0);
+               (double)k.n_out / 48000.0, dst, dt,
+               dt > 0 ? ((double)k.n_out / 48000.0) / dt : 0.0,
+               stats.n_burst);
     }
     ac4dec_close(dec);
-    ac4dec_resampler_close(rs_wav);
-    ac4dec_resampler_close(rs_raw);
-    free(pass);
-    free(ibuf);
-    free(pcm16);
+    ac4dec_resampler_close(k.rs_wav);
+    ac4dec_resampler_close(k.rs_raw);
+    free(k.pass);
+    free(k.ibuf);
+    free(k.pcm16);
     for (c = 0; c < n_ch; c++)
-        free(rout[c]);
+        free(k.rout[c]);
     free(smp);
     free(data);
     return 0;

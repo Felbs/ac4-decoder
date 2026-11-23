@@ -468,9 +468,28 @@ static void audio_size(ac4_bits *b, ac4_element *e)
     e->audio_start = b->p;
 }
 
-static void aspx_config(ac4_bits *b)
+static void aspx_config(ac4_bits *b, ac4_aspx_cfg *c)
 {
-    ac4_u(b, 15);                         /* Table 50: 15 fixed bits */
+    /* Table 50: 15 fixed bits */
+    c->quant_mode_env = (int)ac4_u(b, 1);
+    c->start_freq = (int)ac4_u(b, 3);
+    c->stop_freq = (int)ac4_u(b, 2);
+    c->master_freq_scale = (int)ac4_u(b, 1);
+    c->interpolation = (int)ac4_u(b, 1);
+    c->preflat = (int)ac4_u(b, 1);
+    c->limiter = (int)ac4_u(b, 1);
+    c->noise_sbg = (int)ac4_u(b, 2);
+    c->num_env_bits_fixfix = (int)ac4_u(b, 1);
+    c->freq_res_mode = (int)ac4_u(b, 2);
+}
+
+static void acpl_config_2ch(ac4_bits *b, ac4_acpl_cfg *c)
+{
+    static const int NPB[4] = { 15, 12, 9, 7 };   /* Table 142 */
+    c->num_param_bands = NPB[ac4_u(b, 2)];
+    c->param_band = 0;
+    c->quant_mode_0 = (int)ac4_u(b, 1);
+    c->quant_mode_1 = (int)ac4_u(b, 1);
 }
 
 void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
@@ -483,8 +502,8 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
     if (e->mode == 4) {                   /* ASPX_ACPL_3: stereo core */
         e->acpl3 = 1;
         if (b_iframe) {
-            aspx_config(b);
-            ac4_u(b, 4);                  /* acpl_config_2ch, Table 60 */
+            aspx_config(b, &e->aspx_cfg);
+            acpl_config_2ch(b, &e->acpl_cfg);   /* Table 60 */
             e->has_aspx_cfg = e->has_acpl_cfg = 1;
         }
         mono_data(b, bk, 1, &e->lfe);
@@ -496,7 +515,7 @@ void ac4_parse_5x(ac4_bits *b, const ac4_books *bk, int b_iframe,
     if (e->mode != 1)
         ac4_fail(b, AC4E_ELEMENT_PARSE);
     if (b_iframe) {
-        aspx_config(b);
+        aspx_config(b, &e->aspx_cfg);
         e->has_aspx_cfg = 1;
     }
     mono_data(b, bk, 1, &e->lfe);
@@ -520,7 +539,7 @@ void ac4_parse_pair(ac4_bits *b, const ac4_books *bk, int b_iframe,
     if (e->mode >= 2)
         ac4_fail(b, AC4E_ELEMENT_PARSE);  /* ASPX_ACPL_1/2 */
     if (b_iframe && e->mode == 1) {
-        aspx_config(b);
+        aspx_config(b, &e->aspx_cfg);
         e->has_aspx_cfg = 1;
     }
     if (e->mode == 1)

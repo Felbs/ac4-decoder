@@ -23,6 +23,20 @@ typedef struct {
     int num_sfb;
 } ac4t_sfb;
 
+/* A-SPX books: 3 * kind + h, kind 0..5 = ENV_LEVEL_15, ENV_LEVEL_30,
+   ENV_BALANCE_15, ENV_BALANCE_30, NOISE_LEVEL, NOISE_BALANCE; h 0..2 =
+   F0, DF, DT. */
+#define AC4T_N_ASPX_BOOKS 18
+extern const ac4t_book AC4T_ASPX_BOOKS[AC4T_N_ASPX_BOOKS];
+/* A-CPL books: 6 * kind + 3 * q + h, kind 0..3 = ALPHA, BETA, BETA3,
+   GAMMA; q 0..1 = FINE, COARSE; h 0..2 = F0, DF, DT. */
+#define AC4T_N_ACPL_BOOKS 24
+extern const ac4t_book AC4T_ACPL_BOOKS[AC4T_N_ACPL_BOOKS];
+
+/* Table D.3 QMF prototype (640 taps) and Table D.2 ASPX_NOISE (re, im). */
+extern const double AC4T_QWIN[640];
+extern const double AC4T_ASPX_NOISE[512][2];
+
 /* Index 0..4 = transform length 1536, 768, 384, 192, 96. */
 #define AC4T_N_SFB 5
 extern const ac4t_sfb AC4T_SFB[AC4T_N_SFB];

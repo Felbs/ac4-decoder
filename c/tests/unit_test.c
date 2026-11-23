@@ -6,7 +6,15 @@
  *   band tables; the filterbank is an isometry (lapped orthogonal
  *   transform: ||S x|| == ||x||) for steady and switching block lengths,
  *   with a negative control; the resampler gives the same samples however
- *   the input is split, the right count, and unit DC gain.
+ *   the input is split, the right count, and unit DC gain; every A-SPX
+ *   and A-CPL codebook builds and round-trips; the QMF bank (through the
+ *   A-SPX pair renderer with no A-SPX data) reconstructs its input 577
+ *   samples late, with a negative control; the A-SPX tables obey the
+ *   structural rules of clause 5.7.6.3.1.
+ *
+ *   tests/unit_test --dump-aspx   prints the A-SPX tables for every
+ *   aspx_config (c/tests/check_aspx_tables.py compares them with the
+ *   Python's).
  */
 #include <math.h>
 #include <stdio.h>
@@ -106,6 +114,168 @@ static void test_huffman(void)
                       i, s);
         ac4_huff_free(&h);
     }
+}
+
+static void test_aspx_books(void)
+{
+    int i, s, set;
+    for (set = 0; set < 2; set++) {
+        int n = set ? AC4T_N_ACPL_BOOKS : AC4T_N_ASPX_BOOKS;
+        for (i = 0; i < n; i++) {
+            ac4_huff h;
+            const ac4t_book *bk = set ? &AC4T_ACPL_BOOKS[i]
+                                      : &AC4T_ASPX_BOOKS[i];
+            double kraft = 0.0;
+            for (s = 0; s < bk->n; s++)
+                if (bk->len[s])
+                    kraft += ldexp(1.0, -bk->len[s]);
+            CHECK(fabs(kraft - 1.0) < 1e-12, "%s book %d Kraft sum %.15f",
+                  set ? "A-CPL" : "A-SPX", i, kraft);
+            CHECK(ac4_huff_build(&h, bk) == 0, "%s book %d does not build",
+                  set ? "A-CPL" : "A-SPX", i);
+            for (s = 0; s < bk->n; s++)
+                if (bk->len[s])
+                    CHECK(round_trip(&h, bk, s) == s,
+                          "%s book %d symbol %d round trip",
+                          set ? "A-CPL" : "A-SPX", i, s);
+            ac4_huff_free(&h);
+        }
+    }
+}
+
+/* QMF analysis + synthesis with no A-SPX data: the input comes back 577
+   samples late. -> reconstruction SNR (dB) over the interior */
+static double qmf_snr(int corrupt)
+{
+    ac4_qmf_tables *q = ac4_qmf_tables_new();
+    ac4_aspx_pair *p = (ac4_aspx_pair *)calloc(1, sizeof(*p));
+    ac4_aspx_frame f;
+    int nf = 12, j, i;
+    double *x = (double *)malloc(sizeof(double) * 1536 * (size_t)nf);
+    double *y = (double *)malloc(sizeof(double) * 1536 * (size_t)nf);
+    double es = 0.0, en = 0.0, junk[1536];
+    memset(&f, 0, sizeof(f));
+    for (i = 0; i < 1536 * nf; i++) {
+        x[i] = urand();
+        y[i] = 0.0;
+    }
+    ac4_aspx_pair_reset(p);
+    for (j = 0; j < nf; j++) {
+        const double *in[2];
+        double *out[2];
+        in[0] = in[1] = x + 1536 * j;
+        out[0] = y + 1536 * (j > 0 ? j - 1 : 0);
+        out[1] = junk;
+        ac4_aspx_pair_push(p, q, in, &f, out, NULL);
+        if (corrupt && j == 5)
+            p->qre[0][(5 * 24 + 3) % AC4_QRING][7] += 50.0;
+    }
+    for (i = 2 * 1536; i < (nf - 2) * 1536; i++) {
+        double d = y[i] - x[i - 577];
+        es += x[i - 577] * x[i - 577];
+        en += d * d;
+    }
+    free(x);
+    free(y);
+    free(p);
+    ac4_qmf_tables_free(q);
+    return 10.0 * log10(es / (en > 1e-300 ? en : 1e-300));
+}
+
+static void test_qmf(void)
+{
+    double good = qmf_snr(0), bad = qmf_snr(1);
+    CHECK(good > 70.0, "QMF round trip SNR %.1f dB", good);
+    CHECK(bad < 40.0, "QMF negative control SNR %.1f dB", bad);
+}
+
+static int strictly_up(const int *v, int n)
+{
+    int i;
+    for (i = 0; i + 1 < n; i++)
+        if (v[i] >= v[i + 1])
+            return 0;
+    return 1;
+}
+
+static void test_aspx_tables(void)
+{
+    ac4_aspx_cfg c;
+    ac4_aspx_tab t;
+    int st, sp, ms, ns, n_ok = 0;
+    memset(&c, 0, sizeof(c));
+    for (st = 0; st < 8; st++)
+        for (sp = 0; sp < 4; sp++)
+            for (ms = 0; ms < 2; ms++)
+                for (ns = 0; ns < 4; ns++) {
+                    int i, k;
+                    c.start_freq = st;
+                    c.stop_freq = sp;
+                    c.master_freq_scale = ms;
+                    c.noise_sbg = ns;
+                    if (ac4_aspx_tables(&c, &t) != 0)
+                        continue;
+                    n_ok++;
+                    CHECK(t.master[0] % 2 == 0 && t.master[t.n_master] % 2 == 0,
+                          "master table ends on odd subbands");
+                    CHECK(strictly_up(t.master, t.n_master + 1)
+                          && strictly_up(t.hi, t.n_hi + 1)
+                          && strictly_up(t.lo, t.n_lo + 1)
+                          && strictly_up(t.noise, t.n_noise + 1),
+                          "a table is not strictly increasing");
+                    for (i = 0; i <= t.n_lo; i++) {
+                        int found = 0;
+                        for (k = 0; k <= t.n_hi; k++)
+                            found |= t.hi[k] == t.lo[i];
+                        CHECK(found, "lowres border not in highres");
+                    }
+                    CHECK(t.patches[t.n_patches] <= t.sbx + t.num_sb,
+                          "patches beyond the A-SPX range");
+                }
+    CHECK(n_ok > 100, "only %d A-SPX configurations give tables", n_ok);
+}
+
+static void dump_list(const char *name, const int *v, int n)
+{
+    int i;
+    printf(" %s", name);
+    for (i = 0; i < n; i++)
+        printf("%c%d", i ? ',' : '=', v[i]);
+    if (!n)
+        printf("=");
+}
+
+static void dump_aspx(void)
+{
+    ac4_aspx_cfg c;
+    ac4_aspx_tab t;
+    int st, sp, ms, ns;
+    memset(&c, 0, sizeof(c));
+    for (st = 0; st < 8; st++)
+        for (sp = 0; sp < 4; sp++)
+            for (ms = 0; ms < 2; ms++)
+                for (ns = 0; ns < 4; ns++) {
+                    c.start_freq = st;
+                    c.stop_freq = sp;
+                    c.master_freq_scale = ms;
+                    c.noise_sbg = ns;
+                    printf("%d %d %d %d", st, sp, ms, ns);
+                    if (ac4_aspx_tables(&c, &t) != 0) {
+                        printf(" fail\n");
+                        continue;
+                    }
+                    dump_list("master", t.master, t.n_master + 1);
+                    dump_list("hi", t.hi, t.n_hi + 1);
+                    dump_list("lo", t.lo, t.n_lo + 1);
+                    dump_list("noise", t.noise, t.n_noise + 1);
+                    dump_list("pnum", t.patch_num_sb, t.n_patches);
+                    dump_list("pstart", t.patch_start_sb, t.n_patches);
+                    dump_list("patches", t.patches, t.n_patches + 1);
+                    dump_list("lim", t.lim, t.n_lim);
+                    dump_list("h2l", t.high2low, t.n_hi);
+                    dump_list("l2h", t.low2high, t.n_lo + 1);
+                    printf("\n");
+                }
 }
 
 static void test_sfb(void)
@@ -224,13 +394,20 @@ static void test_resampler(void)
     ac4_rs_filter_free(f);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "--dump-aspx")) {
+        dump_aspx();
+        return 0;
+    }
     test_bits();
     test_huffman();
+    test_aspx_books();
     test_sfb();
     test_filterbank();
     test_resampler();
+    test_qmf();
+    test_aspx_tables();
     if (fails) {
         printf("UNIT TESTS FAILED (%d)\n", fails);
         return 1;

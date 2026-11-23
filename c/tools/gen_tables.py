@@ -4,9 +4,11 @@
 
     python3 c/tools/gen_tables.py > c/src/ac4_tables.c
 
-Only the tables milestone 1 needs: the ASF spectral, scale factor and noise
-fill Huffman codebooks, and the scale factor band offsets for the transform
-lengths that occur at 48 kHz with a 1536-sample frame. The generated file is
+The ASF spectral, scale factor and noise fill Huffman codebooks, the scale
+factor band offsets for the transform lengths that occur at 48 kHz with a
+1536-sample frame, the A-SPX and A-CPL Huffman codebooks, the 640-tap QMF
+prototype (ac4/tables/ac4_qwin.json) and the A-SPX noise table
+(ac4/tables/ac4_aspx_noise.json). The generated file is
 committed, so building the C library needs no Python.
 """
 import json
@@ -19,6 +21,17 @@ TAB = os.path.join(HERE, "..", "..", "ac4", "tables")
 BOOKS = ["ASF_HCB_%d" % i for i in range(1, 12)] + \
     ["ASF_HCB_SCALEFAC", "ASF_HCB_SNF"]
 LENGTHS = (1536, 768, 384, 192, 96)
+# A-SPX books: [ENV_LEVEL_15, ENV_LEVEL_30, ENV_BALANCE_15, ENV_BALANCE_30,
+# NOISE_LEVEL, NOISE_BALANCE] x [F0, DF, DT]
+ASPX = ["ASPX_HCB_%s_%s" % (k, h)
+        for k in ("ENV_LEVEL_15", "ENV_LEVEL_30", "ENV_BALANCE_15",
+                  "ENV_BALANCE_30", "NOISE_LEVEL", "NOISE_BALANCE")
+        for h in ("F0", "DF", "DT")]
+# A-CPL books: [ALPHA, BETA, BETA3, GAMMA] x [FINE, COARSE] x [F0, DF, DT]
+ACPL = ["ACPL_HCB_%s_%s_%s" % (k, q, h)
+        for k in ("ALPHA", "BETA", "BETA3", "GAMMA")
+        for q in ("FINE", "COARSE")
+        for h in ("F0", "DF", "DT")]
 
 
 def arr(name, ctype, vals, out):
@@ -44,10 +57,36 @@ def main():
             [c & ((1 << L) - 1) if L > 0 else 0 for L, c in zip(lens, cws)],
             out)
         out.append("")
-    out.append("const ac4t_book AC4T_BOOKS[AC4T_N_BOOKS] = {")
-    for b in BOOKS:
-        out.append("    { AC4T_%s_LEN, AC4T_%s_CW, %d }," % (b, b,
-                                                       len(huff[b + "_LEN"])))
+    for b in ASPX + ACPL:
+        lens, cws = huff[b + "_LEN"], huff[b + "_CW"]
+        if len(lens) != len(cws):
+            sys.exit("length mismatch in " + b)
+        arr("AC4T_" + b + "_LEN", "uint8_t", lens, out)
+        arr("AC4T_" + b + "_CW", "uint32_t",
+            [c & ((1 << L) - 1) if L > 0 else 0 for L, c in zip(lens, cws)],
+            out)
+        out.append("")
+    for name, books in (("AC4T_BOOKS[AC4T_N_BOOKS]", BOOKS),
+                        ("AC4T_ASPX_BOOKS[AC4T_N_ASPX_BOOKS]", ASPX),
+                        ("AC4T_ACPL_BOOKS[AC4T_N_ACPL_BOOKS]", ACPL)):
+        out.append("const ac4t_book %s = {" % name)
+        for b in books:
+            out.append("    { AC4T_%s_LEN, AC4T_%s_CW, %d }," % (
+                b, b, len(huff[b + "_LEN"])))
+        out.append("};")
+        out.append("")
+    qw = json.load(open(os.path.join(TAB, "ac4_qwin.json")))["coef"]
+    nz = json.load(open(os.path.join(TAB, "ac4_aspx_noise.json")))
+    if len(qw) != 640 or len(nz["re"]) != 512 or len(nz["im"]) != 512:
+        sys.exit("QWIN / ASPX_NOISE sizes")
+    out.append("const double AC4T_QWIN[640] = {")
+    for i in range(0, 640, 4):
+        out.append("    " + ", ".join(repr(float(v)) for v in qw[i:i + 4]) + ",")
+    out.append("};")
+    out.append("")
+    out.append("const double AC4T_ASPX_NOISE[512][2] = {")
+    for r, m in zip(nz["re"], nz["im"]):
+        out.append("    { %r, %r }," % (float(r), float(m)))
     out.append("};")
     out.append("")
     for L in LENGTHS:
