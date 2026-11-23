@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compare the C decoder (c/ac4dec-c) with the Python reference (ac4/).
 
-    python3 c/tests/compare.py [CAPTURE.m4s ...]
+    python3 c/tests/compare.py [FILE ...]
+
+FILE: any input the decoders read (MP4, AC-4 sync frames, MPEG-TS).
 
 With no arguments the captures are the *.m4s / *.mp4 files under
 AC4_TEST_DIR (recursively), as the Python integration tests find them.
@@ -37,7 +39,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, REPO)
 
-from ac4 import mp4                                   # noqa: E402
+from ac4 import container                             # noqa: E402
 from ac4 import cli as PYCLI                          # noqa: E402
 from ac4.decoder import Decoder, REF_PEAK, probe_element  # noqa: E402
 from ac4.resample import StreamResampler              # noqa: E402
@@ -51,7 +53,7 @@ FRAME = 1536
 def python_reference(path, max_pass=MAX_PASS):
     """-> (float64 (n, ch) at 48 kHz, decoder scale; element; Decoder;
     per-frame status list)."""
-    frames = mp4.read_frames(path)
+    frames = container.read_frames(path)
     element = probe_element(frames)
     dec = Decoder(element)
     rs = StreamResampler()

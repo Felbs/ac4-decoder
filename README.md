@@ -12,11 +12,13 @@ endorsed by Dolby Laboratories (see [NOTICE](NOTICE)).
 pip install -e .                 # numpy + scipy
 python -m ac4.build_kernels      # optional: build the C kernels (faster)
 ac4dec audio.m4s out.wav         # or: python -m ac4 audio.m4s out.wav
+ac4dec audio.ac4 --list          # inputs: MP4, AC-4 sync frames, MPEG-TS
+ac4dec in.ts out.wav --language fr      # or --presentation N / id:N
 ```
 
 ```python
-from ac4 import decode, mp4
-pcm, dec = decode(mp4.read_frames("audio.m4s"))   # float64 (n, ch), 48 kHz
+from ac4 import decode, container
+pcm, dec = decode(container.read_frames("audio.m4s"))  # float64 (n, ch), 48 kHz
 print(dec.chans, dec.n_ok, dec.n_bad)             # decoder scale, not +-1.0
 print(dec.n_concealed, dict(dec.concealed.reasons))   # damaged frames
 ```
@@ -24,19 +26,22 @@ print(dec.n_concealed, dict(dec.concealed.reasons))   # damaged frames
 ## What it decodes
 
 Everything below was measured on off-air captures from two ATSC 3.0
-broadcasters using different encoder configurations. No captures are in this
-repository.
+broadcasters using different encoder configurations, and on Dolby's public
+AC-4 Online Delivery Kit test signals. No captures or test signals are in
+this repository.
 
 | | |
 |---|---|
-| Bitstream | version 2, 48 kHz, 29.97 fps, one presentation, channel-coded |
-| Input | fragmented MP4 (init segment + `moof`/`mdat` fragments, or bare fragments) |
+| Bitstream | version 2, 48 kHz, 29.97 fps, channel-coded. Frames at other rates are concealed (`toc.unsupported_rate`), not misdecoded |
+| Input | detected from the content: MP4 (fragmented: init segment + `moof`/`mdat` fragments, or bare fragments; or non-fragmented, from the sample table), AC-4 sync frames (TS 103 190-1 Annex G, CRC checked, ID3 tags skipped), MPEG-2 TS (ETSI TS 101 154). The `dac4` box is parsed (`--list`) |
+| Presentations | the table of contents is parsed in full (presentations, substream groups, substream indices, content type and language, object/A-JOC substream info); the decoded presentation is chosen per TS 103 190-2 4.8.2 (see Interpretations), or with `--presentation N`, `id:N`, `--language`; its audio substream is located by its `substream_index`, and is an I-frame when its own `b_audio_ndot` says so |
 | 5.1 (`5_X` channel element, coding_config 0) | codec mode 1 (A-SPX): all six channels. Codec mode 4 (ASPX_ACPL_3): all six channels, L/R/C/Ls/Rs from the A-CPL upmix of the two-channel core, the LFE from its own data (see A-CPL below) |
 | Stereo (`channel_pair_element`) | stereo_codec_mode 0 (SIMPLE) and 1 (A-SPX) |
 | Core (ASF/MDCT) | Huffman spectral data, scale factors, long and short frames with block switching, KBD windows, stereo processing (sap_mode 1 and 2: M/S; sap_mode 3: full SAP with prediction coefficients, see below), spectral noise fill (clause 5.1.4, the standard's own noise generator; no capture here signals it), LFE |
-| A-SPX | parsed and rendered on the L/R and Ls/Rs pairs: 64-band complex QMF, envelope decoding, HF generation, envelope adjustment with the limiter, noise, joint-balance rendering |
+| A-SPX | parsed and rendered on the L/R and Ls/Rs pairs and the centre: 64-band complex QMF, envelope decoding (1.5 and 3 dB steps), HF generation, envelope adjustment with the limiter, noise, joint-balance rendering. Additional harmonics (sinusoids), FIC/TIC (interleaved waveform coding) and companding are parsed and not applied (see What it does not do yet) |
 | A-CPL | ASPX_ACPL_3 (clause 5.7.7.6.2): parameter decoding and dequantisation, interpolation, the three decorrelators with the transient ducker, the 5-channel upmix in the QMF domain. ASPX_ACPL_1/2 (in 5_X or a channel pair) do not occur on the captures and are not built |
-| Output | 48 kHz via the 1001/960 resampler (TS 103 190-1 Table 83); without it audio runs 4.27 % fast. Every channel is 577 samples (12 ms) after the MDCT core: the A-SPX pairs through the QMF bank, the others (centre, LFE, a pair without A-SPX) through a delay line of the same length, so all channels are time-aligned |
+| Output | 48 kHz via the 1001/960 resampler (TS 103 190-1 Table 83); without it audio runs 4.27 % fast. Every channel is 577 samples (12 ms) after the MDCT core: the A-SPX channels through the QMF bank, the others (LFE, a pair without A-SPX) through a delay line of the same length, so all channels are time-aligned. Channel order checked on a public 2.0 channel-identification signal against its AAC version (envelope correlation L-L 0.947, R-R 0.949; crossed 0.90, 0.89) |
+| Metadata | parsed, not applied: dialnorm, further loudness information, DRC modes (`ac4/metadata.py`); dialogue enhancement config and parameters; EMDF payload ids (`tools/survey.py` reports them) |
 | I-frames | decoding can start mid-stream; A-SPX starts at the first I-frame |
 | Damaged input | never raises, never changes the output length; damaged frames are concealed (see below) |
 
@@ -67,9 +72,15 @@ within 50 dB of its maximum): broadcaster A 5.1: L 16.9, R 16.5, C 11.5,
 Ls 16.9, Rs 11.5 kHz (LFE 0.2 kHz); broadcaster A stereo: 12.8 kHz;
 broadcaster B 5.1 (its stereo core): 18.0 kHz, and with the A-CPL upmix
 (2026-11-23, 4096 points, from the first I-frame) L 16.8, R 15.6, C 14.3,
-Ls 17.5, Rs 15.0 kHz (LFE 0.2 kHz); broadcaster B stereo: 16.5 kHz. The centre has no A-SPX rendering (see below), so it stops where
-the core does. These figures describe what the broadcasters send as much
-as the decoder.
+Ls 17.5, Rs 15.0 kHz (LFE 0.2 kHz); broadcaster B stereo: 16.5 kHz. These
+figures describe what the broadcasters send as much as the decoder, and
+were measured before the A-SPX fixes of the next section (the centre now
+has A-SPX; the high bands are now on the core's scale). After them, the
+better measure is the spectral step at the A-SPX crossover, which a
+correct high band keeps at the programme's own tilt: -0.9 dB on
+broadcaster B stereo, -3.2 / -2.9 / -1.9 dB on broadcaster A's L / R / C,
+-3.9 dB on a public stereo test stream (it was -35 dB, or +11 dB,
+depending on which of the two bugs was in force).
 
 ### Full SAP (sap_mode 3)
 
@@ -165,6 +176,61 @@ first I-frame; levels in dB of full scale):
 
 ## Changes against the standard
 
+### Phase A (2026-11-23, later)
+
+In both decoders, each with a test that fails without it; output changes
+measured on the 12 distinct captures (both broadcasters), each against the
+output before it, at 48 kHz, in units of full scale (the CLI's level rule).
+
+* **`stereo_data()`** (TS 103 190-1 Table 23). The channel_pair_element and
+  the ASPX_ACPL_3 core read `two_channel_data()` (Table 26), which lacks the
+  `spec_frontend` bit before each channel's `sf_info` when MDCT stereo
+  processing is off. Such frames misparsed (none on the captures; 2.5 to
+  4 % of the frames of the public stereo test streams).
+* **The substream's I-frame flag** is its own `b_audio_ndot` (TS 103 190-2
+  6.3.2.7.6), not `b_iframe_global`. The public test streams send a
+  substream I-frame, with its `aspx_config`, halfway between global
+  I-frames; the decoder skipped that configuration and misparsed the frame.
+  The captures never differ: unchanged.
+* **The TOC** is parsed in full; `total_n_substream_groups` is 1 + the
+  largest group index (6.3.2.1.8), not the sum over presentations (two
+  presentations sharing a group misread the substream table); the audio
+  substream is located by its `substream_index`, not assumed to be
+  substream 1. Captures unchanged.
+* **The IMDCT scale** (5.5.2.2, Pseudocodes 60-63) is (1/N) * sum for every
+  transform length N. Both decoders scaled each block by sqrt(N/2) (an
+  orthonormal lapped transform): against the standard, short blocks came out
+  sqrt(1536 / N) too quiet relative to long blocks (3, 6, 9, 12 dB at 768,
+  384, 192, 96) and the time-domain aliasing at long/short transitions did
+  not cancel. Now every block is (1/N) * sum times one constant,
+  `IMDCT_K` = sqrt(2 * 1536), so long blocks keep the decoder scale. On air,
+  (768, 768) frames between long frames sat 0.5 to 1.3 dB below their
+  neighbours (median, 6 streams, 361 frames); now within 0.5 dB. Change:
+  SNR 11 to 18 dB, all in frames with short blocks.
+* **A-SPX envelopes in 1.5 dB steps** (Pseudocodes 82, 84: a = 2 when the
+  interval's `aspx_qmode_env` is 0, which `aspx_data` forces for a FIXFIX
+  interval with one envelope, the commonest framing). Both decoders used
+  a = 1 (the known issue "effect not measured"), so those envelopes came
+  out 2^(q/2) too large. The envelopes are absolute energies on the
+  standard's scale, so they also take `IMDCT_K`^2 (`aspx_envadj.ENV_SCALE`);
+  the a = 1 error had stood in for that factor on average. The frames it
+  overshot were the "A-SPX bursts" (31 frames of broadcaster B's 42 s
+  stereo): the burst guard now fires on no capture. Change: broadcaster B
+  SNR 13 to 36 dB per channel, broadcaster A 26 to 69 dB.
+* **The QMF tools' time grid** (the old known issue): `TS_OFFSET` 18, see
+  Interpretations. Change: broadcaster B SNR 21-26 dB on stereo and the
+  fronts, 11-12 dB on the upmixed surrounds (A-CPL moves with it);
+  broadcaster A 33-71 dB.
+* **A-SPX on the centre** of a 5_X element (its `aspx_data_1ch`, Table 25),
+  rendered with the pair renderer fed the centre twice (with
+  `aspx_balance` 0 each half decodes alone). Broadcaster A's centre now
+  continues across the crossover (-1.9 dB). Change: centre only, SNR 44-46
+  dB.
+* **Frames at other rates** (not 48 kHz / 29.97 fps) are concealed as
+  `toc.unsupported_rate` instead of being decoded as 1536-sample frames.
+
+### Earlier (2026-11-23)
+
 Fixes of 2026-11-23, in both decoders (Python and C), each with a test that
 fails without it. Output changes are measured on the 14 captures at hand
 (both broadcasters), at 48 kHz, against the output before each fix, in
@@ -234,15 +300,77 @@ Where TS 103 190-1 leaves room, these are the readings both decoders take
 (the A-SPX readings are under
 [Changes against the standard](#changes-against-the-standard)).
 
+**Phase A**
+
+* **The QMF tools' time grid: `TS_OFFSET` = 24 - `ts_offset_hfgen` = 18.**
+  Frame f's A-SPX interval slot ts (and its A-CPL slots) act on QMF
+  analysis slot 24 f + 18 + ts of the decoded core. Pseudocode 75
+  (Q_low[ts] = Q[ts - ts_offset_hfgen], 6 slots for frame lengths 1536 to
+  2048, Table 192) and 5.7.6.5 (Qout(i) = Qin(i - 6) + Y(i)), read
+  literally, give 24 f - 6 + ts; the decoder used 24 f + 4 + ts (the
+  analysis filter's measured delay). On air the data fit the literal reading
+  one frame later: the envelope adjuster's E_ref / E_est, which jumps from
+  envelope to envelope wherever envelopes and core are misaligned, swings
+  least at offsets 16-18 on broadcaster B's stereo and 5.1 and a public
+  stereo test stream (mean |step| 1.76 / 2.44 / 1.48 dB at 16-18 against
+  2.32 / 3.47 / 2.15 dB at -6; broadcaster A's 5.1 is nearly flat), and the
+  A-SPX transient borders led the core's transients by 12-13 slots at the
+  old offset 4 (i.e. 16-17). The decoder's IMDCT output timing is the
+  standard's (block f's left half is output frame f, Pseudocode 64), so the
+  one frame is not a filterbank delay.
+* **Decoder scale.** Every block's IMDCT is the standard's (1/N) * sum
+  times `IMDCT_K` = sqrt(2 * 1536); A-SPX envelopes, absolute energies on
+  the standard's scale, take `IMDCT_K`^2. Against the loudness metadata of
+  five streams (BS.1770 integrated loudness of the decode against
+  `loudrelgat`), full scale is 122.1 dB re 1 decoder unit (spread
+  +-1.8 dB), close to `IMDCT_K` * 2^14.5 (122.2 dB): the standard's own
+  arithmetic (dequantisation, IMDCT) puts full scale near 2^14.5. The CLI's
+  level rule is unchanged.
+* **Companding (5.7.5) is not applied** (`aspx_render.COMPANDING = False`;
+  the implementation is in the Python renderer). Its gain,
+  L^((1 - alpha) / alpha) * 2^(1 / alpha), depends on the absolute scale
+  of the levels L, which the standard does not give; its fixed point
+  L = 0.138 implies a full scale of about 1. On air the companded streams
+  (broadcaster B's stereo: 99 % of frames; the public stereo test streams:
+  all) already decode at their metadata loudness without expansion, the
+  core's dynamics already follow the absolute A-SPX envelopes (slope of
+  log E_ref on log E_est 0.89 on a public stereo stream, 0.96 on
+  broadcaster A's uncompanded 5.1, not the 1/alpha = 1.54 a compressed core
+  would give), and expansion at any scale tried (full scale x 1/4 to x 16)
+  made both fits worse. The g_avg formula's exponent prints as "1alpha /
+  alpha"; it is read as (1 - alpha) / alpha.
+* **QMF synthesis phase.** 5.7.4.2 prints exp(j pi (k + 1/2)(2n - 257)
+  / 128); both decoders use 2n - 255, which reconstructs the analysis bank
+  to 78 dB (delay 577) where 257 gives 43 dB (delay 578).
+* **`ac4_presentation_substream_info()`** closes the else-branch of
+  `ac4_presentation_v1_info()` (TS 103 190-2 6.2.1.3; the printed syntax
+  loses a line at the page break).
+* **Presentation choice** (TS 103 190-2 4.8.2 leaves it to the
+  application): the first enabled presentation with a channel-coded audio
+  substream, preferring the `--language` given (primary subtag), then
+  "complete main" content (Table 91) over audio description, commentary
+  and the rest. `md_compat` is reported, not used. Of the chosen
+  presentation the first channel-coded substream is decoded; several
+  substream groups (M&E + dialogue, main + associated) are not mixed
+  (6.2.16). The choice is made per frame, so it follows a TOC that changes.
+* **Sync frames.** A frame whose CRC fails is passed on empty (concealed,
+  timeline kept). After lost sync a frame is accepted when its CRC checks
+  or, for 0xAC40 frames, when the next sync word (or an ID3 tag, or the end)
+  is where its frame_size says; the skipped bytes' frames are lost (the
+  decoder sees a sequence-counter jump).
+* **Metadata of 7_X and above** (`basic_metadata`): ch_mode 5-6 and 11-15
+  are read as 3/4/0 (`pre_upmixtyp_3_4`), 9-10 as 3/2/2, 7-8 as 5/2/0.
+  This parse fails on the public immersive streams, which phase C will
+  look at.
+
 **A-CPL (clause 5.7.7, ASPX_ACPL_3)**
 
 * **Time grid.** The standard gives A-CPL the A-SPX output matrix of the
   frame (6.2.11); here frame f's A-CPL acts on the same QMF slots as frame
-  f's A-SPX: 24 f + 4 .. 24 f + 27 (`aspx_render.TS_OFFSET`). Checked on
-  air: the two steep-interpolation frames of broadcaster B's 5.1 that fall
-  in a frame with an A-SPX transient change their parameters at slot 14
-  and 13, where A-SPX puts its transient border (slots 14 and 12). See
-  Known issues for the grid itself.
+  f's A-SPX: 24 f + 18 .. 24 f + 41 (`aspx_render.TS_OFFSET`, see below).
+  Checked on air: the two steep-interpolation frames of broadcaster B's 5.1
+  that fall in a frame with an A-SPX transient change their parameters at
+  slot 14 and 13, where A-SPX puts its transient border (slots 14 and 12).
 * **Transient ducker** (Pseudocodes 112-114). Run once per QMF time slot
   (Pseudocode 113 takes one subsample per band; "the previous frame" in
   the text is read as the previous slot: the decay ALPHA then has a time
@@ -290,6 +418,14 @@ make -C c asan                   # the same gate under AddressSanitizer + UBSan
 c/ac4dec-c audio.m4s out.wav     # --f64 RAW, --status FILE, --lookahead N, ...
 ```
 
+**Inputs and presentations.** `include/ac4dec_input.h` (`ac4in_read`)
+reads what `ac4/container.py` reads (MP4 with or without fragments, AC-4
+sync frames with their CRC, MPEG-TS), frame for frame
+(`c/tests/check_inputs.py`, clean and damaged inputs); `ac4dec_config`
+takes `presentation`, `presentation_id` and `language`, and
+`ac4dec_presentations()` lists a frame's presentations. `ac4dec-c IN
+--list`, `--presentation`, `--language` as the Python CLI.
+
 **Status.** It decodes what this package decodes (above), with the same
 damaged-input rules and output guard, as a delay line: frames come out
 `lookahead` frames after they go in (default 180, 6 s; minimum 8 for live
@@ -329,19 +465,52 @@ are unchanged within the spread between runs.
 
 * **A-CPL modes 1 and 2.** ASPX_ACPL_1/2 (5_X codec modes 2 and 3,
   stereo_codec_mode 2 and 3) are concealed as damaged frames
-  (`element.parse`); no capture carries them. ASPX_ACPL_3 is decoded (above);
-  codec mode 1 has no A-CPL (Table 214).
-* **A-SPX on the centre channel.** Its block is parsed (to keep state) but
-  not rendered, so the centre stops where its core does (11.5 kHz measured).
-* Companding (read, not applied); A-SPX additional harmonics (under 1.5 % of
-  channel-frames); the SSF speech frontend; coding_config other than 0.
-* Mono, 3.0, 5.0 and 7.x elements; immersive and object audio (A-JOC, IFM,
-  OAMD).
-* Bitstream versions 0 and 1; frame rates other than 29.97; sample rates
-  other than 48 kHz.
-* Choosing a presentation or substream: substream 1 is always decoded.
-* DRC, dialogue enhancement and loudness metadata.
-* Raw AC-4 sync frames, MPEG-TS, non-fragmented MP4, the `dac4` box.
+  (`element.parse`); no capture carries them, but every 5.1 stream of the
+  public test signals is ASPX_ACPL_2 (coding_config 0). ASPX_ACPL_3 is
+  decoded (above); codec mode 1 has no A-CPL (Table 214).
+* **Frame rates other than 29.97 fps and sample rates other than 48 kHz**
+  (frame lengths other than 1536): concealed as `toc.unsupported_rate`.
+  The public test signals come in 25 fps (2048-sample frames, resampling
+  15/16) as well; every band table is banked, the rest (A-SPX framing at
+  16 slots, A-CPL, the resampler ratio, the C decoder's fixed frame size)
+  is not built.
+* **Companding** (parsed; in the Python renderer but off, see
+  Interpretations); **A-SPX additional harmonics** (sinusoid insertion:
+  parsed, not rendered; frequent on the public stereo streams, under 2 %
+  of channel blocks on air); **FIC/TIC** interleaved waveform coding
+  (parsed; only the public 25 fps stereo uses it).
+* **Metadata is parsed, not applied**: no DRC (every stream measured uses
+  compression curves or E-AC-3 default profiles, none transmits gains; the
+  broadcasters signal profile "none"), no dialnorm / target level, no
+  dialogue enhancement.
+* Mixing the substream groups of one presentation (M&E + dialogue, main +
+  associated): only its first channel-coded substream is decoded.
+* The SSF speech frontend; coding_config other than 0; mono, 3.0, 5.0 and
+  7.x elements; immersive and object audio (A-JOC, IFM, OAMD); bitstream
+  versions 0 and 1.
+
+## Survey
+
+`tools/survey.py FILE ...` parses every frame of any input and reports the
+TOC, presentations, substream groups, each audio substream's element,
+codec mode, coding_config, companding, stereo processing, short blocks,
+noise fill and A-SPX tools, and the metadata. On the 7 distinct capture
+streams of both broadcasters and the 18 distinct public test signals
+(2026-11-23):
+
+| | broadcasters A and B | public test signals |
+|---|---|---|
+| TOC | v2, 48 kHz, 29.97 fps, 1 presentation (single group), 2 substreams (presentation substream + audio); B sets payload_base | the same, at 25 and 29.97 fps |
+| channel modes, elements | 5.1: 5_X ASPX (A), 5_X ASPX_ACPL_3 (B); stereo: channel_pair ASPX (A, B), SIMPLE (A) | stereo: channel_pair ASPX; 5.1: 5_X ASPX_ACPL_2, coding_config 0; 7.1.4 (immersive_channel_element, 5.1.4 content); "IMS": presentation_version 2, 7.1 (3/4/0) 7_X ASPX |
+| I-frames | global I-frames only; 144 / 72 / 30 frames apart | a substream I-frame (b_audio_ndot) halfway between global ones |
+| companding | B stereo: on in 99 % of frames; A stereo: on; both 5.1: off | stereo: on or averaged in every frame |
+| A-SPX tools | TNA everywhere; additional harmonics rare | additional harmonics in most frames; FIC/TIC in the 25 fps stereo |
+| stereo processing | sap_mode 1-3, short blocks | the same |
+| dialnorm | -24 dBFS | -23 (2.0, 5.1), -19 (7.1.4, IMS), -16 dBFS |
+| DRC | 4 default modes (home theatre, flat panel TV, portable speakers, headphones), all "default profile", E-AC-3 profile "none" | default profiles and one transmitted compression curve; E-AC-3 profiles film standard / film light / music light; no transmitted gains anywhere |
+| dialogue enhancement | method 0 (channel independent), max gain 9 dB, on the centre (5.1) or L/R (stereo) | method 0; IMS also method 2 (hybrid) |
+| EMDF payloads | none | payload id 18 in the IMS streams |
+| loudness info | loudrelgat, loudspchgat, truepk, loudstrm3s, rtll_comp | the same |
 
 ## Damaged input
 
@@ -513,8 +682,14 @@ reading.
   start. `decode()` returns the decoder's own scale.
 * **Burst guard.** Separate from the damaged-input guard above: an A-SPX
   frame above twice the element's fixed reference plays its core band. It
-  is a heuristic carried over from the receiver, and it fires on clean
-  material too (31 frames of one broadcaster's 42 s stereo lane).
+  is a heuristic carried over from the receiver. It used to fire on clean
+  material (31 frames of one broadcaster's 42 s stereo); those were the
+  1.5 dB envelopes dequantised as 3 dB (fixed), and it now fires on no
+  capture. It still fires on 7 frames of a public stereo test stream,
+  which is louder than the fixed reference.
+* **Broadcaster A's stereo** keeps a 34 dB step down at its A-SPX
+  crossover after the envelope fixes (its 5.1 and broadcaster B do not):
+  its high band is still far too quiet. Not found yet.
 * **Pass boundaries.** The output is not fully independent of how the
   frames are split into decode passes (`decode_pass`; the CLI's default
   pass is 1800 frames, 60 s): the last frame of a pass can differ from a
@@ -527,28 +702,20 @@ reading.
   configuration fell in a later pass is gone: every channel is now
   delayed the same way from the first frame.) The C decoder streams and
   has no passes; it equals a one-pass Python decode.
-* **The QMF tools' time grid (A-SPX and A-CPL)** (found 2026-11-23, not
-  changed). Both tools put frame f on QMF slots 24 f + 4 + ...
-  (`aspx_render.TS_OFFSET`, an impulse measurement of the analysis bank's
-  delay). On air, the transient markers the encoder sends lead the core's
-  own transients by about 12 slots (768 samples, half a frame): 10 of 14
-  A-SPX transient borders (`aspx_tsg_ptr`) on both broadcasters fall 12 or
-  13 slots before the largest rise of the core's 3-9 kHz energy, and the
-  A-CPL steep-interpolation slots also lead (by 8 to 23 slots, 9 of 13).
-  If confirmed, the grid would be TS_OFFSET = 16, for both tools at once
-  (A-CPL takes the A-SPX constant; the C renderer would then need one more
-  frame of lookahead, since envelopes would reach 22 slots into the next
-  frame). Not changed here: it moves the A-SPX output of every stream and
-  needs its own check.
-* **A-SPX envelope dequantisation** (found while checking full SAP, effect
-  not measured): `aspx_envadj.map_scf` and `map_scf_joint` always use
-  a = 1, while TS 103 190-1 Pseudocodes 82 and 84 use a = 2 for 1.5 dB
-  steps (`aspx_qmode_env` 0, which `aspx_data` forces for FIXFIX frames
-  with one envelope). Inherited unchanged from the original receiver.
 * `channels.asf_scalefac_data` and `channels.asf_snf_data` refer to an
   undefined name (`NUM_SFB_48`). Nothing calls them; they are kept as copied.
 
 ## Tests
+
+Phase A added `tests/test_phase_a.py` (stereo_data, the substream I-frame
+flag, the TOC's presentations, groups and indices written bit by bit from
+TS 103 190-2, presentation choice, envelope dequantisation, the time grid,
+the centre's A-SPX, other rates) and `tests/test_inputs.py` (the CRC's
+check value, sync frames with escape, bad CRC, resync and ID3, an MPEG-TS
+built packet by packet, a non-fragmented MP4 with a `dac4`, and the same
+inputs through the C reader when it is built); `tests/test_units.py`
+holds the IMDCT against Pseudocodes 60-63 written out. `tools/survey.py`
+reports what a stream uses (see Survey below).
 
 ```
 pytest                                    # unit tests, no audio needed
@@ -606,8 +773,10 @@ fail.
 
 | module | role |
 |---|---|
-| `mp4.py` | fragmented-MP4 sample reader |
-| `toc.py`, `toc_v1.py` | table of contents (`toc_v1` holds the bit reader and constants) |
+| `container.py` | input detection; AC-4 sync frames (CRC), MPEG-TS |
+| `mp4.py` | MP4 sample reader (fragments and sample tables), `dac4` |
+| `metadata.py` | loudness, DRC, dialogue enhancement and EMDF metadata (parsed) |
+| `toc.py`, `toc_v1.py` | table of contents and presentation choice (`toc_v1` holds the bit reader and constants) |
 | `hcb.py`, `spectral.py` | Huffman codebooks and decoding |
 | `sfb.py` | scale-factor band offsets |
 | `channels.py`, `pair.py` | `5_X` channel element; `channel_pair_element` |

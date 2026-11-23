@@ -56,7 +56,9 @@ LIB = os.path.join(REPO, "c", "libac4dec.so")
 class Cfg(ctypes.Structure):
     _fields_ = [("element", ctypes.c_int), ("channels", ctypes.c_int),
                 ("internal_rate", ctypes.c_int), ("lookahead", ctypes.c_int),
-                ("no_guard", ctypes.c_int)]
+                ("no_guard", ctypes.c_int), ("presentation", ctypes.c_int),
+                ("presentation_id", ctypes.c_long),
+                ("language", ctypes.c_char * 16)]
 
 
 class Frame(ctypes.Structure):

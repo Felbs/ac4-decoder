@@ -559,7 +559,8 @@ def test_all_channels_time_aligned(monkeypatch, with_cfg):
     s = slice(2 * 1536, None)
     for k in (L, R, Ls, Rs):
         err = k[s] - C[s]
-        assert 10 * np.log10(np.sum(C[s] ** 2) / np.sum(err ** 2)) > 60
+        assert 10 * np.log10(np.sum(C[s] ** 2)
+                             / (np.sum(err ** 2) + 1e-300)) > 60
 
 
 def test_aspx_noise_index_runs_on_across_envelopes(monkeypatch):
