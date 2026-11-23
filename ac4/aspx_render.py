@@ -115,6 +115,19 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None):
     loud and uncorrelated with its own core, while the left channel looked
     perfect -- so a single-channel gate could never have caught it.
     """
+    if cfg is None:
+        # no A-SPX configuration yet: the pair only goes through the QMF
+        # bank (analysis, synthesis), which is the delay every channel of
+        # the decoder has (TS 103 190-1 6.2.8, 6.2.14)
+        w = Q.qwin()
+        if state_log is not None:             # the state is untouched
+            state_log.extend([state0] * (len(groups) + 1))
+        out = {}
+        for k, x in (("L", pcmL), ("R", pcmR)):
+            xx = x[:(len(x) // Q.NSB) * Q.NSB]
+            out[k] = Q.synthesise(Q.analyse(xx, w, Q.analysis_matrix()), w,
+                                  Q.synthesis_matrix(255))
+        return out, 0
     t = t_for(cfg)
     lim = E.sbg_lim(t)
     nt = E.noise_table()

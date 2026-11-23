@@ -32,11 +32,12 @@
  * aspx_config can be concealed by the late audio_size check only while it
  * is held, i.e. when the I-frame that brings the configuration arrives
  * within L + 1 frames of it (the Python checks a whole decode pass).
- * Likewise the L/R (Ls/Rs) pair goes through the A-SPX path, 577 samples
- * later than the core, from the first frame when an aspx_config has been
- * parsed by the time that frame is synthesised (as the Python's one-pass
- * decode), else from the first frame after it (a 577-sample step, as at a
- * Python pass boundary). The default, AC4DEC_DEFAULT_LOOKAHEAD = 180
+ * Every channel comes out 577 samples after the MDCT core (TS 103 190-1
+ * 6.2.8 / 6.2.14 put each channel through the QMF bank): the pairs that
+ * can carry A-SPX go through the QMF bank from their first frame (HF
+ * generation and adjustment only where a frame has A-SPX data), the
+ * others (centre, LFE, a pair without A-SPX) through a delay line of the
+ * same length. The default, AC4DEC_DEFAULT_LOOKAHEAD = 180
  * (6 s), covers the I-frame intervals measured on air (up to 144 frames);
  * a live player may take the minimum.
  *
@@ -162,7 +163,8 @@ typedef struct {
     long n_seq_jumps;
     int element;           /* ac4dec_element once known */
     int acpl3;             /* the stream is ASPX_ACPL_3 (2-ch core) */
-    int aspx;              /* A-SPX is being rendered */
+    int aspx;              /* A-SPX is being rendered (a pair is on the QMF
+                              path and an aspx_config is known) */
 } ac4dec_stats;
 
 void ac4dec_get_stats(const ac4dec *d, ac4dec_stats *s);

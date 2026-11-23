@@ -455,3 +455,58 @@ def test_aspx_frames_without_data_are_core_only():
         err = y[1536:] - ref[1536:]
         snr = 10 * np.log10(np.sum(ref[1536:] ** 2) / np.sum(err ** 2))
         assert snr > 60, snr
+
+
+# ---------------------------------------------------------- alignment
+def _xcorr_lag(a, b, maxlag=1200):
+    """Lag of b against a, in samples (positive: b is later)."""
+    n = len(a)
+    cc = np.fft.irfft(np.conj(np.fft.rfft(a, 2 * n)) * np.fft.rfft(b, 2 * n))
+    cc = np.concatenate([cc[-maxlag:], cc[:maxlag + 1]])
+    return int(np.argmax(np.abs(cc))) - maxlag
+
+
+@pytest.mark.parametrize("with_cfg", [False, True])
+def test_all_channels_time_aligned(monkeypatch, with_cfg):
+    """The same core in all six channels of a 5.1 element: L/R and Ls/Rs
+    go through the QMF bank (577 samples), so C and LFE must come out
+    equally late (TS 103 190-1 6.2.8 / 6.2.14). Before the fix C and LFE
+    led the others by 577 samples (12 ms) whenever the pairs were on the
+    A-SPX path (here: an aspx_config, and every frame's A-SPX concealed,
+    which mutes only the band above the crossover, where the test signal
+    has nothing), and before any aspx_config nothing was on the QMF path.
+    Two passes, so the delay line is carried over a pass boundary too."""
+    from ac4 import decoder as D
+    from ac4 import robust as RB
+    cfg = _aspx_cfg()[0] if with_cfg else None
+    grp = RB.CONCEALED if with_cfg else None
+    rng = np.random.default_rng(3)
+    n = 10
+    specs = [rng.standard_normal(1536) * (np.arange(1536) < 400)
+             for _ in range(2 * n)]
+    dec = D.Decoder("5_X", guard=False)
+    dec.hf_ratio = None
+    state = {"i": 0}
+
+    def fake_decode_frames(frames, chans):
+        i0 = state["i"]
+        state["i"] += len(frames)
+        w = {k: [specs[i0 + j] for j in range(len(frames))] for k in chans}
+        ln = {k: [1536] * len(frames) for k in chans}
+        ct = {k: [1] * len(frames) for k in chans}
+        dec.stream.mode = ("5_X", 1)
+        dec.stream.cfg = cfg
+        dec.stream.status = [None] * len(frames)
+        return w, ln, {"lr": [grp] * len(frames),
+                       "sr": [grp] * len(frames)}, ct
+
+    monkeypatch.setattr(dec.stream, "decode_frames", fake_decode_frames)
+    y = np.vstack([dec.decode_pass([b""] * n), dec.decode_pass([b""] * n)])
+    L, R, C, LFE, Ls, Rs = y.T
+    for other in (R, LFE, Ls, Rs):
+        assert _xcorr_lag(C, other) == 0
+    assert _xcorr_lag(C, L) == 0
+    s = slice(2 * 1536, None)
+    for k in (L, R, Ls, Rs):
+        err = k[s] - C[s]
+        assert 10 * np.log10(np.sum(C[s] ** 2) / np.sum(err ** 2)) > 60

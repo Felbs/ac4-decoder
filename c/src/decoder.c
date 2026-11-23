@@ -46,6 +46,7 @@ void ac4_spectra_init(void);
 #define LATE_MAJORITY 0.9
 #define MAX_PENDING 4096
 #define FRAME 1536
+#define HF_DELAY 577         /* QMF analysis + synthesis delay, samples */
 
 /* robust.py: A-SPX level check, output guard */
 #define MAX_HF_RATIO 16.0
@@ -195,6 +196,7 @@ struct ac4dec {
     long long n_synth;
     double core[6][FRAME];
     double core_prev[6][FRAME];
+    double core_tail[6][HF_DELAY];   /* delay line: last 577 core samples */
     rec_t prev_info;            /* frame n_synth - 1 (no windows) */
     ac4_aspx_pair pair[2];
     int pair_active[2];
@@ -423,6 +425,7 @@ static void stream_reset(ac4dec *d)
     memset(d->fb, 0, sizeof(d->fb));
     d->n_synth = 0;
     memset(d->core_prev, 0, sizeof(d->core_prev));
+    memset(d->core_tail, 0, sizeof(d->core_tail));
     for (i = 0; i < 2; i++) {
         ac4_aspx_pair_reset(&d->pair[i]);
         d->pair_active[i] = 0;
@@ -557,7 +560,7 @@ void ac4dec_get_stats(const ac4dec *d, ac4dec_stats *s)
     s->n_late = d->n_late;
     s->element = d->element;
     s->acpl3 = d->acpl3;
-    s->aspx = d->path_on[0] || d->path_on[1];
+    s->aspx = (d->path_on[0] || d->path_on[1]) && d->has_cfg;
 }
 
 const char *ac4dec_reason(const ac4dec *d, int i, long *count)
@@ -1123,12 +1126,19 @@ static void assemble(ac4dec *d, double hf[2][2][FRAME], double dcore[2][2][FRAME
     o->seq_jump = ri->seq_jump;
     o->forced = ri->code != AC4E_NONE;
     o->aspx_flag = 0;
-    for (k = 0; k < 6; k++)
-        memcpy(o->pcm[k], d->core_prev[k], sizeof(o->pcm[k]));
+    /* every channel 577 samples late: the delay line, unless its pair
+       is on the QMF path (below) */
+    for (k = 0; k < 6; k++) {
+        memcpy(o->pcm[k], d->core_tail[k], sizeof(double) * HF_DELAY);
+        memcpy(o->pcm[k] + HF_DELAY, d->core_prev[k],
+               sizeof(double) * (FRAME - HF_DELAY));
+        memcpy(d->core_tail[k], d->core_prev[k] + FRAME - HF_DELAY,
+               sizeof(double) * HF_DELAY);
+    }
     for (p = 0; p < 2; p++) {
         double *y[2], *dc[2];
         int a = p == 0 ? CH_L : CH_LS;
-        if (!d->path_on[p] && d->pair_active[p] && d->has_cfg && have[p])
+        if (!d->path_on[p] && d->pair_active[p] && have[p])
             d->path_on[p] = 1;
         if (!d->path_on[p] || !have[p])
             continue;

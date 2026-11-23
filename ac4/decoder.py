@@ -106,14 +106,15 @@ class Decoder:
     frames; the filterbank overlap, the A-SPX envelope state, the QMF
     lead-in and the burst guard's carry-over are kept between calls.
 
+    Every channel comes out HF_DELAY (577) samples after the MDCT core: the
+    pairs that can carry A-SPX through the QMF bank from their first frame,
+    the others (centre, LFE, a pair without A-SPX) through a delay line.
+
     KNOWN (inherited, measured): the output is NOT fully independent of
-    where the batches are cut. Before the first A-SPX configuration
-    arrives, a batch that also contains that configuration delays its
-    core-only frames by 577 samples and one that does not, does not; and
-    the last frame of a batch can differ from a one-batch decode in its
-    last 1279 samples (up to about 1 % of peak on one stereo stream,
-    about -100 dB on others). Decode in the same batch sizes to get the
-    same samples.
+    where the batches are cut: the last frame of a batch can differ from a
+    one-batch decode in its last 1279 samples (up to about 1 % of peak on
+    one stereo stream, about -100 dB on others). Decode in the same batch
+    sizes to get the same samples.
 
     element   "5_X" (5.1 channel element) or "pair" (channel_pair_element)
     channels  2 -> L, R;  6 -> L, R, C, LFE, Ls, Rs (WAV 5.1 order).
@@ -138,6 +139,9 @@ class Decoder:
         self.fb_state = {k: None for k in self.chans}
         self.lead_pcm = {k: np.zeros(0) for k in ("L", "R", "Ls", "Rs")}
         self.lead_groups = {"lr": [], "sr": []}
+        # the last HF_DELAY core samples of every channel: the delay line
+        # of the channels that do not go through the QMF bank
+        self.core_tail = {k: np.zeros(HF_DELAY) for k in self.chans}
         self.hf_state = {"lr": [None], "sr": [None]}
         self.hf_hot = {"lr": 0, "sr": 0}
         self.n_burst = 0
@@ -168,6 +172,20 @@ class Decoder:
     @property
     def n_seq_jumps(self):
         return self.stream.n_seq_jumps
+
+    def _pair_capable(self, gkey):
+        """Can this pair carry A-SPX (then it goes through the QMF bank from
+        its first frame on)? The L/R pair of a 5_X element (codec modes 1
+        and 4), its Ls/Rs pair unless the stream is ASPX_ACPL_3, and a
+        channel_pair_element with stereo_codec_mode 1."""
+        mode = self.stream.mode
+        if mode is None:
+            return False
+        if self.element == "pair":
+            return gkey == "lr" and mode[1] == 1
+        if gkey == "lr":
+            return True
+        return not (self.acpl3 or self.stream.acpl3) and len(self.chans) == 6
 
     def decode_pass(self, frames):
         """-> float64 array (len(frames) * 1536, n_channels) at the internal
@@ -253,54 +271,68 @@ class Decoder:
             self.log.append(f"channel lengths disagree {sorted(ns)} -- "
                             f"cropping to {n_min}")
             pcm = {k: v[:n_min] for k, v in pcm.items()}
-        if dec.cfg is not None:
-            for (ka, kb), gkey in ((("L", "R"), "lr"), (("Ls", "Rs"), "sr")):
-                if ka not in chans:
-                    continue
-                gl = grp[gkey]
-                if any(g is not None for g in gl):
-                    lead = min(len(self.lead_pcm[ka]), LEAD * FRAME)
-                    pa = np.concatenate([self.lead_pcm[ka][-lead:], pcm[ka]])
-                    pb = np.concatenate([self.lead_pcm[kb][-lead:], pcm[kb]])
-                    gg = self.lead_groups[gkey][-LEAD:] + gl
-                    n_lead = len(gg) - len(gl)
-                    hs, slog = self.hf_state[gkey], []
-                    try:
-                        hf, _n = R37.apply_hf_pair(
-                            pa, pb, gg, dec.cfg,
-                            state0=hs[max(0, len(hs) - 1 - n_lead)],
-                            state_log=slog)
-                        pcm[ka], pcm[kb], nb_, self.hf_hot[gkey] = \
-                            core_for_bursts(hf["L"][lead:], hf["R"][lead:],
-                                            pa, pb, lead, self.burst_limit,
-                                            self.hf_hot[gkey],
-                                            hf_ratio=(self.hf_ratio
-                                                      if RB.CHECKS
-                                                      else None),
-                                            flagged=self._aspx_flag,
-                                            hf_floor=self.hf_floor)
-                        if nb_:
-                            self.n_burst += nb_
-                            self.log.append(
-                                f"A-SPX burst on {ka}/{kb}: {nb_} frame(s) "
-                                f"above {self.burst_limit:.3g} play core-band")
-                        self.hf_state[gkey] = slog[-(LEAD + 1):]
-                    except Exception as e:                     # noqa: BLE001
-                        self.hf_state[gkey] = (
-                            hs + [hs[-1]] * len(gl))[-(LEAD + 1):]
-                        self.n_hf_fail += 1
+        # Every channel leaves the decoder HF_DELAY samples late: a pair
+        # that can carry A-SPX goes through the QMF bank (analysis, HF
+        # generation and adjustment where there is A-SPX data, synthesis),
+        # whose delay that is; every other channel (centre, LFE, a pair
+        # without A-SPX) through a plain delay line of the same length.
+        # TS 103 190-1 6.2.8 / 6.2.14 put each channel through the QMF bank,
+        # so all of them are time-aligned.
+        core = dict(pcm)
+        via_qmf = set()
+        for (ka, kb), gkey in ((("L", "R"), "lr"), (("Ls", "Rs"), "sr")):
+            if ka not in chans:
+                continue
+            gl = grp[gkey]
+            if self._pair_capable(gkey):
+                lead = min(len(self.lead_pcm[ka]), LEAD * FRAME)
+                pa = np.concatenate([self.lead_pcm[ka][-lead:], pcm[ka]])
+                pb = np.concatenate([self.lead_pcm[kb][-lead:], pcm[kb]])
+                gg = self.lead_groups[gkey][-LEAD:] + gl
+                n_lead = len(gg) - len(gl)
+                hs, slog = self.hf_state[gkey], []
+                try:
+                    hf, _n = R37.apply_hf_pair(
+                        pa, pb, gg, dec.cfg,
+                        state0=hs[max(0, len(hs) - 1 - n_lead)],
+                        state_log=slog)
+                    pcm[ka], pcm[kb], nb_, self.hf_hot[gkey] = \
+                        core_for_bursts(hf["L"][lead:], hf["R"][lead:],
+                                        pa, pb, lead, self.burst_limit,
+                                        self.hf_hot[gkey],
+                                        hf_ratio=(self.hf_ratio
+                                                  if RB.CHECKS
+                                                  else None),
+                                        flagged=self._aspx_flag,
+                                        hf_floor=self.hf_floor)
+                    via_qmf |= {ka, kb}
+                    if nb_:
+                        self.n_burst += nb_
                         self.log.append(
-                            f"A-SPX pass failed ({type(e).__name__}: "
-                            f"{str(e)[:90]}) -- this pass is core-band only")
-                    self.lead_pcm[ka] = pa[-LEAD * FRAME:]
-                    self.lead_pcm[kb] = pb[-LEAD * FRAME:]
-                else:
-                    self.lead_pcm[ka] = pcm[ka][-LEAD * FRAME:]
-                    self.lead_pcm[kb] = pcm[kb][-LEAD * FRAME:]
+                            f"A-SPX burst on {ka}/{kb}: {nb_} frame(s) "
+                            f"above {self.burst_limit:.3g} play core-band")
+                    self.hf_state[gkey] = slog[-(LEAD + 1):]
+                except Exception as e:                         # noqa: BLE001
                     self.hf_state[gkey] = (
-                        self.hf_state[gkey] + [self.hf_state[gkey][-1]]
-                        * len(gl))[-(LEAD + 1):]
-                self.lead_groups[gkey] = (self.lead_groups[gkey] + gl)[-LEAD:]
+                        hs + [hs[-1]] * len(gl))[-(LEAD + 1):]
+                    self.n_hf_fail += 1
+                    self.log.append(
+                        f"A-SPX pass failed ({type(e).__name__}: "
+                        f"{str(e)[:90]}) -- this pass is core-band only")
+                self.lead_pcm[ka] = pa[-LEAD * FRAME:]
+                self.lead_pcm[kb] = pb[-LEAD * FRAME:]
+            else:
+                self.lead_pcm[ka] = pcm[ka][-LEAD * FRAME:]
+                self.lead_pcm[kb] = pcm[kb][-LEAD * FRAME:]
+                self.hf_state[gkey] = (
+                    self.hf_state[gkey] + [self.hf_state[gkey][-1]]
+                    * len(gl))[-(LEAD + 1):]
+            self.lead_groups[gkey] = (self.lead_groups[gkey] + gl)[-LEAD:]
+        for k in chans:
+            x = np.concatenate([self.core_tail[k], core[k]])
+            if k not in via_qmf:
+                pcm[k] = x[:len(core[k])]
+            self.core_tail[k] = x[-HF_DELAY:]
         return np.column_stack([pcm[k] for k in chans])
 
 
