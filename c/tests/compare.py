@@ -59,6 +59,8 @@ MAX_PASS = int(os.environ.get("AC4_MAX_PASS", "1800"))
 # default) in units of full scale; otherwise decoder scale, the old
 # fixed-reference level rule for the WAVs
 LOUDNESS = os.environ.get("AC4_LOUDNESS") == "1"
+# AC4_DE_LEVEL=dB: dialogue enhancement at that gain in both decoders
+DE_LEVEL = float(os.environ.get("AC4_DE_LEVEL", "0"))
 FRAME = 1536
 
 def python_reference(path, max_pass=MAX_PASS):
@@ -66,7 +68,8 @@ def python_reference(path, max_pass=MAX_PASS):
     per-frame status list)."""
     frames = container.read_frames(path)
     element = probe_element(frames)
-    dec = Decoder(element, target_level=-24.0 if LOUDNESS else None)
+    dec = Decoder(element, target_level=-24.0 if LOUDNESS else None,
+                  de_level=DE_LEVEL)
     rate = probe_rate(frames)
     rs = StreamResampler(*(RT.ratio(*rate) if rate and RT.ratio(*rate)
                            else RT.ratio(1, 3)))
@@ -114,6 +117,7 @@ def compare(path, tag):
     c_st = os.path.join(OUT, tag + ".c.status")
     t0 = time.time()
     lvl = [] if LOUDNESS else ["--legacy-level"]
+    lvl += ["--de-level", str(DE_LEVEL)]
     r = subprocess.run([C_CLI, path, c_wav] + lvl + ["--f64", c_raw,
                         "--status", c_st, "-q"], capture_output=True,
                        text=True)
@@ -128,6 +132,7 @@ def compare(path, tag):
     names = CHANS6 if ref.shape[1] == 6 else CHANS6[:2]
     py_wav = os.path.join(OUT, tag + ".py.wav")
     PYCLI.decode_file(path, py_wav, quiet=True, max_pass=MAX_PASS,
+                      de_level=DE_LEVEL,
                       ref_peak=0.0 if LOUDNESS else REF_PEAK[element])
     w_py, w_c = read_wav16(py_wav), read_wav16(c_wav)
     print(f"\n{tag}  ({os.path.basename(path)}, element {element}"

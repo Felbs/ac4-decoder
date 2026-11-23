@@ -123,6 +123,7 @@ typedef struct {
     double *win;                /* NCH x FRAME */
     ac4_aspx_frame af[NPAIR];   /* L/R, Ls/Rs, C (as C/C) */
     ac4_meta meta;              /* presentation substream (valid 0: none) */
+    ac4_de_entry de;            /* dialogue enhancement data */
 } rec_t;
 
 /* a frame from before the first aspx_config (audio_size.late) */
@@ -175,6 +176,8 @@ struct ac4dec {
     int rs_fixed, rs_up, rs_down, out_rate;
     ac4_huff huff[AC4T_N_BOOKS];
     ac4_huff drc_hcb;           /* DRC_HCB */
+    ac4_huff de_hcb[4];         /* DE_HCB_ABS_0, DIFF_0, ABS_1, DIFF_1 */
+    ac4_de_state de_state;
     ac4_drc_config drc_state;   /* from the last I-frame */
     ac4_leveler *lev;           /* cfg.loudness: made at the first emit */
     ac4_books books;
@@ -817,6 +820,11 @@ ac4dec *ac4dec_open(const ac4dec_config *cfg)
         ac4dec_close(d);
         return NULL;
     }
+    for (i = 0; i < 4; i++)
+        if (ac4_huff_build(&d->de_hcb[i], &AC4T_MISC_BOOKS[1 + i]) != 0) {
+            ac4dec_close(d);
+            return NULL;
+        }
     for (i = 1; i <= 11; i++)
         d->books.cb[i] = &d->huff[i - 1];
     d->books.sf = &d->huff[AC4T_BOOK_SF];
@@ -860,6 +868,8 @@ void ac4dec_close(ac4dec *d)
     for (i = 0; i < AC4T_N_BOOKS; i++)
         ac4_huff_free(&d->huff[i]);
     ac4_huff_free(&d->drc_hcb);
+    for (i = 0; i < 4; i++)
+        ac4_huff_free(&d->de_hcb[i]);
     free(d->lev);
     ac4_aspx_books_free(&d->abk);
     ac4_fb_tables_free(d->fbt);
@@ -986,6 +996,7 @@ static void rec_conceal(ac4dec *d, rec_t *r, int code)
     af_kinds(r, AC4_GRP_CONCEALED);
     for (k = 0; k < NPAIR; k++)
         r->af[k].has_tab = 0;
+    r->de.kind = AC4_DE_HOLD;
     r->seq_jump = 0;
 }
 
@@ -1504,6 +1515,21 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
                 r->meta.valid = 0;
         }
     }
+    /* dialogue enhancement data of the audio substream's metadata()
+       (stream.py _sub_metadata), read with the coded element's channel
+       mode */
+    r->de.kind = AC4_DE_NONE;
+    if (d->cfg.de_level != 0.0) {
+        static const int CM[7] = { 4, 4, 1, 0, 2, 3, 6 };
+        int cm = d->element == AC4DEC_ELEMENT_7X ? d->ch_mode
+                                                 : CM[d->element];
+        const ac4_huff *bks[4];
+        for (k = 0; k < 4; k++)
+            bks[k] = &d->de_hcb[k];
+        ac4_de_metadata(sub, sub_len,
+                        e->audio_start + 8 * e->audio_size, cm, ifr,
+                        &d->de_state, bks, &r->de);
+    }
     r->code = AC4E_NONE;
     r->seq_jump = brk;
     if (brk)
@@ -1702,6 +1728,11 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
         dc[1] = dcore[p][1];
         if (bursts(d, p, y, dc, &bad))
             o->aspx_flag = 1;
+        if (d->pair[p].de_on == 1 && !bad) {
+            /* dialogue enhancement: the frames the checks kept */
+            y[0] = d->pair[p].deout[0];
+            y[1] = d->pair[p].deout[1];
+        }
         memcpy(o->pcm[d->pair_ch[p][0]], y[0], sizeof(o->pcm[0]));
         memcpy(o->pcm[d->pair_ch[p][1]], y[1], sizeof(o->pcm[0]));
         if (p == 0 && d->pair[0].acpl_on) {
@@ -1786,6 +1817,20 @@ static void synth_one(ac4dec *d)
             if (p == 0 && d->acpl1 == AC4_ACPL1_5X && d->n_ch == 6
                 && d->element == AC4DEC_ELEMENT_5X)
                 d->pair[0].acpl_on = 3;
+            /* dialogue enhancement (decoder.py de_arg): on the upmix's
+               L / R / C, or on a pair of L, R or C */
+            if (d->cfg.de_level != 0.0) {
+                ac4_aspx_pair *pr = &d->pair[p];
+                pr->de_level = d->cfg.de_level;
+                if (p == 0 && pr->acpl_on) {
+                    pr->de_on = 2;
+                } else if (d->pair_ch[p][0] <= CH_C
+                           && d->pair_ch[p][1] <= CH_C) {
+                    pr->de_on = 1;
+                    pr->de_ch[0] = d->pair_ch[p][0];
+                    pr->de_ch[1] = d->pair_ch[p][1];
+                }
+            }
         }
         if (d->pair_active[p]) {
             const double *x[2];
@@ -1805,6 +1850,7 @@ static void synth_one(ac4dec *d)
             y[1] = hf[p][1];
             dc[0] = dcore[p][0];
             dc[1] = dcore[p][1];
+            f->de = r->de;
             have[p] = ac4_aspx_pair_push(&d->pair[p], d->qmf, x, f, y, dc);
         }
     }

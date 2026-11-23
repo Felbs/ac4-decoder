@@ -461,7 +461,7 @@ def extended_metadata(b, ch_mode, sus_ver, b_associated=0):
 
 
 def substream_metadata(sub, audio_start, audio_size, ch_mode, iframe, st,
-                       sus_ver=1):
+                       sus_ver=1, no_emdf=False):
     """metadata() of an audio substream (6.2.7.1), read at audio_start +
     8 * audio_size -> dict: basic, extended, de (config + data, or None),
     emdf (payload ids), and "error" when the tools block did not parse."""
@@ -495,6 +495,8 @@ def substream_metadata(sub, audio_start, audio_size, ch_mode, iframe, st,
     except (ValueError, EOFError, KeyError) as e:
         out["error"] = str(e)[:60]
     b.p = start + size
+    if no_emdf:
+        return out
     out["emdf"] = []
     if b.u(1):                                   # b_emdf_payloads_substream
         while True:

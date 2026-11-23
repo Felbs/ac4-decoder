@@ -44,7 +44,8 @@ this repository.
 | A-CPL | ASPX_ACPL_3 (clause 5.7.7.6.2): parameter decoding and dequantisation, interpolation, the three decorrelators with the transient ducker, the 5-channel upmix in the QMF domain. ASPX_ACPL_1/2 (5.7.7.6.1, one-channel A-CPL): in a channel pair, and ASPX_ACPL_2 in 5_X |
 | Output | 48 kHz (44,1 kHz) via the resampler of TS 103 190-1 Table 83 for the stream's frame rate (1001/960 at 29.97 fps; without it audio runs 4.27 % fast). Every channel is 577 samples (12 ms) after the MDCT core: the A-SPX channels through the QMF bank, the others (LFE, a pair without A-SPX) through a delay line of the same length, so all channels are time-aligned. Channel order checked on a public 2.0 channel-identification signal against its AAC version (envelope correlation L-L 0.947, R-R 0.949; crossed 0.90, 0.89) |
 | Loudness, DRC | applied (`ac4/loudness.py`, C `src/loudness.c`): dialnorm normalised to a target level (default -24 dB, `--target-level`), the stream's DRC decoder mode for that level (5.7.9.2): E-AC-3 profiles, transmitted curves, transmitted gains (`--drc auto|off|N`). The CLIs write this; `--legacy-level` / `--ref-peak` keep the old fixed-reference rule |
-| Metadata | parsed: further loudness information; dialogue enhancement config and parameters (DE is at its default user level 0: no change); EMDF payload ids (`tools/survey.py` reports them) |
+| Metadata | parsed: further loudness information; dialogue enhancement config and parameters; EMDF payload ids (`tools/survey.py` reports them) |
+| Dialogue enhancement | de_method 0 (parametric, channel independent, with the M/S form; TS 103 190-1 5.7.8.7) applied in the QMF domain at a user gain (`--de-level dB`, `Decoder(de_level=)`, C `de_level`; default 0: off, output unchanged), capped by the stream's maximum. Both broadcasters and the kit send method 0 (centre, or L/R). Methods 1 - 3 (cross-channel, hybrid) are parsed, not applied |
 | I-frames | decoding can start mid-stream; A-SPX starts at the first I-frame |
 | Damaged input | never raises, never changes the output length; damaged frames are concealed (see below) |
 
@@ -352,6 +353,15 @@ Where TS 103 190-1 leaves room, these are the readings both decoders take
 
 **Phase B2**
 
+* **Dialogue enhancement** (5.7.8): frame f's matrix acts on the QMF
+  slots of frame f's A-SPX / A-CPL interval (`TS_OFFSET`); QMF subbands
+  above Table 173's last (40) take parameter band 7; a frame without DE
+  data, or with another method, has the identity, a concealed frame holds
+  the previous matrix (the interpolation of 5.7.8.6 then runs from and to
+  it). DE acts on the A-CPL upmix's L / R / C, or on the channels of a
+  pair (L/R, the centre) before synthesis; the level checks (burst guard,
+  `aspx.level`) judge the output without it and the frames they keep take
+  the enhanced output. Gmax is (de_max_gain + 1) x 3 dB.
 * **The kit's "IMS" streams** (presentation_version 2, channel_mode 7.1
   3/4/0 in ac4_substream_info_chan): read as a 7_X_channel_element no
   frame parses (the LFE's sf_data fails at once); read as a
@@ -464,10 +474,11 @@ Where TS 103 190-1 leaves room, these are the readings both decoders take
   decoder sees a sequence-counter jump).
 * **Metadata of 7_X and above** (`basic_metadata`): ch_mode 5-6 and 11-15
   are read as 3/4/0 (`pre_upmixtyp_3_4`), 9-10 as 3/2/2, 7-8 as 5/2/0.
-  On the public immersive-stereo stream (signalled 7.1, sus_ver 1) this
-  reading gives tools_metadata_size 144 bits whose first bit
-  (b_de_data_present) is 0: the block does not close, so its dialogue
-  enhancement data is not read. Phase C (immersive) will look at it.
+  (Phase B2: the public immersive-stereo stream's metadata did not close
+  read as 7.1; its audio is a channel pair, and read with the stereo
+  channel mode every frame's metadata closes, with dialogue enhancement
+  data, method 0, no channels. The decoder reads an audio substream's
+  metadata with its coded element's channel mode.)
 
 **A-CPL (clause 5.7.7, ASPX_ACPL_3)**
 
@@ -592,9 +603,9 @@ are unchanged within the spread between runs.
 * **frame_rate_factor / frame_rate_fraction above 1** (high frame rates,
   efficient HFR) and 96/192 kHz substreams: concealed as
   `toc.unsupported_rate`.
-* **Dialogue enhancement** is parsed, not applied (its default user level
-  0 leaves the signal unchanged); DRC gains act on the output samples per
-  QMF slot, not on QMF samples (see Interpretations).
+* **Dialogue enhancement** methods 1 - 3 (cross-channel, waveform hybrid)
+  are not applied; DRC gains act on the output samples per QMF slot, not
+  on QMF samples (see Interpretations).
 * **Metadata of the public 5.1.4 and immersive-stereo streams**: their
   audio is an immersive_channel_element (phase C), so the substream
   metadata after it is not reached; on the immersive-stereo stream, which

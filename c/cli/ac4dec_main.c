@@ -54,7 +54,8 @@ static void usage(void)
             "                [--channels N]\n"
             "                [--presentation N|id:N] [--language xx]\n"
             "                [--seconds S] [--max-pass N] [--target-level L]\n"
-            "                [--drc auto|off|N] [--legacy-level] [--ref-peak X] "
+            "                [--drc auto|off|N] [--de-level dB] [--legacy-level]"
+            "\n                [--ref-peak X] "
             "[--no-guard]\n"
             "                [--lookahead N] [--f64 RAW] [--internal] "
             "[--status FILE] [-q]\n"
@@ -325,7 +326,7 @@ int main(int argc, char **argv)
     const char *el_arg = "auto", *pres = NULL, *lang = NULL;
     int channels = 0, quiet = 0, internal = 0, no_guard = 0, i, c, list = 0;
     long max_pass = 1800, lookahead = 0;
-    double seconds = -1.0, ref_peak = 0.0, t0, dt, target = -24.0;
+    double seconds = -1.0, ref_peak = 0.0, t0, dt, target = -24.0, de_level = 0.0;
     int legacy = 0, drc = 0;
     unsigned char *data;
     size_t len;
@@ -360,6 +361,8 @@ int main(int argc, char **argv)
             legacy = 1;
         else if (!strcmp(a, "--target-level") && i + 1 < argc)
             target = atof(argv[++i]);
+        else if (!strcmp(a, "--de-level") && i + 1 < argc)
+            de_level = atof(argv[++i]);
         else if (!strcmp(a, "--drc") && i + 1 < argc) {
             const char *v = argv[++i];
             drc = !strcmp(v, "auto") ? 0 : !strcmp(v, "off") ? -1
@@ -513,6 +516,7 @@ int main(int argc, char **argv)
     cfg.loudness = !legacy;
     cfg.target_level = target;
     cfg.drc = drc;
+    cfg.de_level = de_level;
     dec = ac4dec_open(&cfg);
     if (!dec) {
         fprintf(stderr, "cannot open the decoder (bad --lookahead?)\n");

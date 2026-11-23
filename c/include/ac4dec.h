@@ -137,6 +137,9 @@ typedef struct {
     int ch_mode;           /* 7_X: the channel mode (Table 88 ch_mode 5 -
                               10); 0 = from the stream (AUTO) or 6 (7.1
                               3/4/0) */
+    double de_level;       /* dialogue enhancement gain in dB (TS 103
+                              190-1 5.7.8, de_method 0; capped by the
+                              stream's maximum); 0 = off */
 } ac4dec_config;
 
 /* PRESENTATIONS (TS 103 190-2 4.8.2). The automatic choice is, per frame,

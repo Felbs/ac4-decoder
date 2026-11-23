@@ -572,6 +572,44 @@ void ac4_acpl_run(ac4_acpl_state *s, ac4_acpl_work *w,
  * delays the pair by 577 samples. */
 enum { AC4_GRP_NONE = 0, AC4_GRP_CONCEALED, AC4_GRP_DATA };
 
+/* ------------------------------------------------------------ dialogue
+ * enhancement (de.c; ac4/de.py, metadata.py): one frame's DE data */
+enum { AC4_DE_NONE = 0, AC4_DE_DATA, AC4_DE_HOLD };
+typedef struct {
+    int kind;                   /* AC4_DE_*: none = the identity */
+    int method, max_gain, channel_config, ms;
+    int par[3][8];
+} ac4_de_entry;
+
+typedef struct {                /* metadata.SubMetaState */
+    int has_cfg, method, max_gain, channel_config;
+    int has_prev, prev[3][8];
+} ac4_de_state;
+
+/* the DE matrix of a frame (de.frame_gains / _full): per front channel
+   (0 L, 1 R, 2 C) its own gain and the gain of its M/S partner */
+typedef struct {
+    int on;                     /* 0: the identity */
+    int has[3];
+    double g[3][64];
+    int ms, msa, msb;           /* de_ms_proc_flag on channels msa / msb */
+    double msg[64];
+} ac4_de_mat;
+
+/* The audio substream's metadata() up to its dialogue enhancement data
+   (metadata.substream_metadata, no_emdf): sub of len bytes, read at bit
+   pos with ch_mode (Table 88) -> *out (kind AC4_DE_NONE when absent or
+   not parsing); books: DE_HCB_ABS_0, DIFF_0, ABS_1, DIFF_1. */
+void ac4_de_metadata(const uint8_t *sub, size_t len, size_t pos,
+                     int ch_mode, int iframe, ac4_de_state *st,
+                     const ac4_huff *const books[4], ac4_de_entry *out);
+/* de.frame_gains: the matrix of a frame at level dB */
+void ac4_de_frame(const ac4_de_entry *e, double level, ac4_de_mat *m);
+/* de.apply on one frame's slots of n channels ch[] (0 L, 1 R, 2 C) */
+void ac4_de_apply(const ac4_de_mat *prev, const ac4_de_mat *cur, int n,
+                  const int *ch, double (*const re[3])[64],
+                  double (*const im[3])[64], int ns, int off, int nts);
+
 #define AC4_QRING 128           /* QMF slots kept (4 frames of 2048) */
 
 typedef struct {
@@ -583,6 +621,7 @@ typedef struct {
     ac4_acpl_frame acpl;        /* ASPX_ACPL_3 (pair 0 only) */
     int acpl1_kind;             /* ASPX_ACPL_1 / _2 (pair 0 only) */
     ac4_acpl1_frame acpl1[2];
+    ac4_de_entry de;            /* this frame's dialogue enhancement */
 } ac4_aspx_frame;
 
 typedef struct ac4_qmf_tables ac4_qmf_tables;
@@ -634,6 +673,18 @@ typedef struct {
     double tmp1r[2][AC4_MAX_NTS][64], tmp1i[2][AC4_MAX_NTS][64];
     double usyn[5][1280];
     double upout[5][AC4_MAX_FRAME];   /* the last output frame's upmix */
+    /* dialogue enhancement (de.c): de_on 1 = on the pair's own channels
+       (de_ch: 0 L, 1 R, 2 C per half), 2 = on the upmix's L, R, C;
+       de_level dB (0: off); de_prev the matrix of the last frame; the
+       pair's own output with DE goes to deout (dre / dim: its QMF ring,
+       valid up to slot de_valid), the output without it to y */
+    int de_on, de_ch[2];
+    double de_level;
+    ac4_de_mat de_prev;
+    double dre[2][AC4_QRING][64], dim[2][AC4_QRING][64];
+    double dsyn[2][1280];
+    long long de_valid;
+    double deout[2][AC4_MAX_FRAME];
 } ac4_aspx_pair;
 
 /* reset to the time grid of frame length 1536 / fl */

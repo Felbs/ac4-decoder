@@ -32,8 +32,9 @@ extern const ac4t_book AC4T_ASPX_BOOKS[AC4T_N_ASPX_BOOKS];
    GAMMA; q 0..1 = FINE, COARSE; h 0..2 = F0, DF, DT. */
 #define AC4T_N_ACPL_BOOKS 24
 extern const ac4t_book AC4T_ACPL_BOOKS[AC4T_N_ACPL_BOOKS];
-/* metadata books: 0 = DRC_HCB (cb_off 127) */
-#define AC4T_N_MISC_BOOKS 1
+/* metadata books: 0 = DRC_HCB (cb_off 127); 1 - 4 = DE_HCB_ABS_0 (0),
+   DE_HCB_DIFF_0 (31), DE_HCB_ABS_1 (30), DE_HCB_DIFF_1 (60) */
+#define AC4T_N_MISC_BOOKS 5
 extern const ac4t_book AC4T_MISC_BOOKS[AC4T_N_MISC_BOOKS];
 
 /* Table D.3 QMF prototype (640 taps) and Table D.2 ASPX_NOISE (re, im). */

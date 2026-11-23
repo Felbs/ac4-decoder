@@ -29,8 +29,9 @@ ASPX = ["ASPX_HCB_%s_%s" % (k, h)
         for k in ("ENV_LEVEL_15", "ENV_LEVEL_30", "ENV_BALANCE_15",
                   "ENV_BALANCE_30", "NOISE_LEVEL", "NOISE_BALANCE")
         for h in ("F0", "DF", "DT")]
-# metadata books: the DRC gains (DE books are not used by the C decoder)
-MISC = ["DRC_HCB"]
+# metadata books: the DRC gains, the dialogue enhancement parameters
+MISC = ["DRC_HCB", "DE_HCB_ABS_0", "DE_HCB_DIFF_0", "DE_HCB_ABS_1",
+        "DE_HCB_DIFF_1"]
 # A-CPL books: [ALPHA, BETA, BETA3, GAMMA] x [FINE, COARSE] x [F0, DF, DT]
 ACPL = ["ACPL_HCB_%s_%s_%s" % (k, q, h)
         for k in ("ALPHA", "BETA", "BETA3", "GAMMA")

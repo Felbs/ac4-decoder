@@ -1026,6 +1026,44 @@ static void test_loudness(void)
           < 1e-12, "normalisation -18 -> -24 dB: %g", buf[0][100]);
 }
 
+/* dialogue enhancement, de_method 0 (TS 103 190-1 5.7.8.7, Tables 171,
+   173, 209): the gains of a frame and one interpolated slot */
+static void test_de(void)
+{
+    ac4_de_entry e;
+    ac4_de_mat m, id;
+    int k, ch = 2;
+    double g = pow(10.0, 6.0 / 20.0) - 1.0;   /* G_max = (1 + 1) 3 dB */
+    double re[1][64], im[1][64];
+    double (*pre[3])[64], (*pim[3])[64];
+    memset(&e, 0, sizeof(e));
+    e.kind = AC4_DE_DATA;
+    e.max_gain = 1;
+    e.channel_config = 5;                     /* Left, Centre */
+    for (k = 0; k < 8; k++) {
+        e.par[0][k] = 3;                      /* 0.3 */
+        e.par[1][k] = k == 7 ? 16 : 10;       /* 1.0; band 7: 1.75 */
+    }
+    ac4_de_frame(&e, 12.0, &m);
+    CHECK(m.on && m.has[0] && !m.has[1] && m.has[2], "de channels");
+    CHECK(fabs(m.g[0][5] - (1 + g * 0.3)) < 1e-12, "de L gain");
+    CHECK(fabs(m.g[2][26] - (1 + g * 1.0)) < 1e-12
+          && fabs(m.g[2][27] - (1 + g * 1.75)) < 1e-12
+          && fabs(m.g[2][63] - (1 + g * 1.75)) < 1e-12, "de bands");
+    memset(&id, 0, sizeof(id));
+    for (k = 0; k < 64; k++) {
+        re[0][k] = 1.0;
+        im[0][k] = 0.0;
+    }
+    pre[0] = re;
+    pim[0] = im;
+    /* slot 3 of 24: (1 - 3.5 / 24) I + 3.5 / 24 H */
+    ac4_de_apply(&id, &m, 1, &ch, (double (*const *)[64])pre,
+                 (double (*const *)[64])pim, 1, 3, 24);
+    CHECK(fabs(re[0][0] - ((1 - 3.5 / 24) + 3.5 / 24 * (1 + g * 1.0)))
+          < 1e-12, "de interpolation");
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 2 && !strcmp(argv[1], "--dump-input"))
@@ -1053,6 +1091,7 @@ int main(int argc, char **argv)
     test_stereo_data();
     test_inputs();
     test_loudness();
+    test_de();
     if (fails) {
         printf("UNIT TESTS FAILED (%d)\n", fails);
         return 1;

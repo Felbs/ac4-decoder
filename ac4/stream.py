@@ -628,7 +628,7 @@ class Ac4Stream:
         try:
             md = MDm.substream_metadata(sub, r["audio_start"],
                                         r["audio_size"], cm, ifr,
-                                        self.sub_meta)
+                                        self.sub_meta, no_emdf=True)
         except Exception:                                      # noqa: BLE001
             self.sub_meta.de_par_prev = None
             return None

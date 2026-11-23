@@ -1370,6 +1370,70 @@ static void acpl_lead(ac4_aspx_pair *p)
         }
 }
 
+/* dialogue enhancement of frame f (de.apply, aspx_render._de_pair /
+   _de_up): its matrix on slots [nts f + TS_OFFSET, + nts) clipped to
+   nts_lim, from the previous frame's; on the pair's own channels (into
+   the dre ring, a copy of qre) or on the upmix's L, R, C (in place) */
+static void de_frame(ac4_aspx_pair *p, const ac4_aspx_frame *fr,
+                     long long f, long long nts_lim)
+{
+    ac4_de_mat cur;
+    long long a = (long long)p->nts * f + p->tso, z = a + p->nts, ts;
+    int c;
+    if (!p->de_on || p->de_level == 0.0)
+        return;
+    if (fr->de.kind == AC4_DE_HOLD)
+        cur = p->de_prev;
+    else
+        ac4_de_frame(&fr->de, p->de_level, &cur);
+    if (z > nts_lim)
+        z = nts_lim;
+    if (p->de_on == 1) {
+        for (ts = p->de_valid; ts < z; ts++)
+            for (c = 0; c < 2; c++) {
+                memcpy(p->dre[c][QI(ts)], p->qre[c][QI(ts)],
+                       sizeof(p->dre[0][0]));
+                memcpy(p->dim[c][QI(ts)], p->qim[c][QI(ts)],
+                       sizeof(p->dim[0][0]));
+            }
+        if (z > p->de_valid)
+            p->de_valid = z;
+    }
+    for (ts = a < 0 ? 0 : a; ts < z; ts++) {
+        double (*re[3])[64], (*im[3])[64];
+        int ch[3], n = 0;
+        if (p->de_on == 1) {
+            if (p->de_ch[0] == p->de_ch[1]) {
+                for (c = 0; c < 2; c++) {
+                    re[0] = &p->dre[c][QI(ts)];
+                    im[0] = &p->dim[c][QI(ts)];
+                    ac4_de_apply(&p->de_prev, &cur, 1, &p->de_ch[0],
+                                 (double (*const *)[64])re,
+                                 (double (*const *)[64])im, 1,
+                                 (int)(ts - a), p->nts);
+                }
+                continue;
+            }
+            for (c = 0; c < 2; c++) {
+                ch[n] = p->de_ch[c];
+                re[n] = &p->dre[c][QI(ts)];
+                im[n++] = &p->dim[c][QI(ts)];
+            }
+        } else {
+            for (c = 0; c < 3; c++) {
+                if ((p->acpl_on >= 2 && c == 2))
+                    continue;
+                ch[n] = c;
+                re[n] = &p->ure[c][QI(ts)];
+                im[n++] = &p->uim[c][QI(ts)];
+            }
+        }
+        ac4_de_apply(&p->de_prev, &cur, n, ch, (double (*const *)[64])re,
+                     (double (*const *)[64])im, 1, (int)(ts - a), p->nts);
+    }
+    p->de_prev = cur;
+}
+
 /* ------------------------------------------------------------ streaming */
 static void synth_frame(ac4_aspx_pair *p, const ac4_qmf_tables *q,
                         long long slot0, double *const y[2])
@@ -1381,6 +1445,13 @@ static void synth_frame(ac4_aspx_pair *p, const ac4_qmf_tables *q,
             qmf_synth_slot(q, p->syn[c], p->qre[c][QI(ts)],
                            p->qim[c][QI(ts)], y[c] + 64 * i);
         }
+    if (p->de_on == 1 && p->de_level != 0.0)
+        for (c = 0; c < 2; c++)
+            for (i = 0; i < p->nts; i++) {
+                long long ts = slot0 + i;
+                qmf_synth_slot(q, p->dsyn[c], p->dre[c][QI(ts)],
+                               p->dim[c][QI(ts)], p->deout[c] + 64 * i);
+            }
     if (p->acpl_on)
         for (c = 0; c < 5; c++) {
             if ((p->acpl_on == 2 && c >= 2) || (p->acpl_on == 3 && c == 2))
@@ -1450,6 +1521,7 @@ int ac4_aspx_pair_push(ac4_aspx_pair *p, const ac4_qmf_tables *q,
             else
                 acpl_frame(p, &p->prev, j - 1, s0 + nt);
         }
+        de_frame(p, &p->prev, j - 1, s0 + nt);
         synth_frame(p, q, s0 - nt, y);
         delayed_core(p, dc);
         out = 1;
@@ -1480,6 +1552,7 @@ int ac4_aspx_pair_finish(ac4_aspx_pair *p, const ac4_qmf_tables *q,
         else
             acpl_frame(p, &p->prev, p->n_in - 1, s0);
     }
+    de_frame(p, &p->prev, p->n_in - 1, s0);
     synth_frame(p, q, s0 - p->nts, y);
     delayed_core(p, dc);
     return 1;
