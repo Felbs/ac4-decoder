@@ -188,7 +188,7 @@ def t_for(cfg, xover=0):
 
 def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
                   acpl_groups=None, acpl_state0=None, acpl_log=None,
-                  frame_len=1536, t_start=None, acpl_1ch=None):
+                  frame_len=1536, t_start=None, acpl_1ch=None, de=None):
     """Steps 2-5 for the L/R pair, JOINTLY.
 
     Three things run on from one frame to the next: the noise-table index
@@ -229,6 +229,11 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
     A-SPX output of L (and, five, of R) as x0 and the residual's analysis
     as x1 (acpl.render_1ch); out["up"] receives L and R (a pair: z0, z1)
     or L, Ls, R, Rs (five: z0 / z1 of each module, z1 times sqrt 2).
+
+    de (dialogue enhancement, de.py): dict(frames=[per group the DE entry,
+    None or de.HOLD], level=dB, pair=names of the pair's two channels to
+    enhance (("L", "R"), ("C", "C") or ()), up=True to enhance the
+    upmix's L, R, C instead).
     """
     geo = A.geometry(frame_len)
     NT, TIA, TSO, NATS = geo["nts"], geo["tia"], geo["ts_offset"], geo["nats"]
@@ -244,10 +249,12 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
         for k, x in (("L", pcmL), ("R", pcmR)):
             xx = x[:(len(x) // Q.NSB) * Q.NSB]
             Qa[k] = Q.analyse(xx, w, Q.analysis_matrix())
-            out[k] = Q.synthesise(Qa[k], w, Q.synthesis_matrix(255))
         if acpl_groups is not None:
             out["up"] = _upmix(Qa["L"], Qa["R"], acpl_groups, acpl_state0,
-                               acpl_log, w, geo, acpl_1ch)
+                               acpl_log, w, geo, acpl_1ch, de)
+        for k in ("L", "R"):
+            out[k] = Q.synthesise(Qa[k], w, Q.synthesis_matrix(255))
+        _de_pair(Qa, de, geo, out, w)
         return out, 0
     # the tables of each frame: those its A-SPX blocks were sent with
     # (aspx_xover_subband_offset of the last I-frame, Pseudocode 68), held
@@ -459,16 +466,47 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
         state_log.append((idx_noise, (prev[0], prev[1]),
                           (nprev[0], nprev[1]),
                           [TL.copy_state(x) for x in tools]))
-    for k in ("L", "R"):
-        out[k] = Q.synthesise(Qh[k], w, Q.synthesis_matrix(255))
     if acpl_groups is not None:
         out["up"] = _upmix(Qh["L"], Qh["R"], acpl_groups, acpl_state0,
-                           acpl_log, w, geo, acpl_1ch)
+                           acpl_log, w, geo, acpl_1ch, de)
+    for k in ("L", "R"):
+        out[k] = Q.synthesise(Qh[k], w, Q.synthesis_matrix(255))
+    _de_pair(Qh, de, geo, out, w)
     out["t_before"] = before
     return out, applied
 
 
-def _upmix(QL, QR, acpl_groups, state0, log, w, geo, acpl_1ch=None):
+def _de_pair(Qd, de, geo, out, w):
+    """Dialogue enhancement on the pair's own channels: their names
+    de["pair"]; a pair of the same channel (the centre) is enhanced in
+    each half alone. out["L"] / out["R"] stay the output without it (the
+    decoder's level checks judge those); out["de_L"] / out["de_R"] get
+    the enhanced output."""
+    if not de or not de.get("pair") or not de.get("level"):
+        return
+    from . import de as DE
+    na, nb = de["pair"]
+    if na == nb:
+        for k in ("L", "R"):
+            DE.apply({na: Qd[k]}, de["frames"], de["level"], geo["nts"],
+                     geo["ts_offset"])
+    else:
+        DE.apply({na: Qd["L"], nb: Qd["R"]}, de["frames"], de["level"],
+                 geo["nts"], geo["ts_offset"])
+    for k in ("L", "R"):
+        out["de_" + k] = Q.synthesise(Qd[k], w, Q.synthesis_matrix(255))
+
+
+def _de_up(up, de, geo):
+    if not de or not de.get("up") or not de.get("level"):
+        return
+    from . import de as DE
+    DE.apply({k: up[k] for k in ("L", "R", "C") if k in up}, de["frames"],
+             de["level"], geo["nts"], geo["ts_offset"])
+
+
+def _upmix(QL, QR, acpl_groups, state0, log, w, geo, acpl_1ch=None,
+           de=None):
     """A-CPL (acpl.render, or acpl.render_1ch) on the pair's QMF matrices,
     then synthesis of the output channels."""
     from . import acpl as ACPL
@@ -487,10 +525,12 @@ def _upmix(QL, QR, acpl_groups, state0, log, w, geo, acpl_1ch=None):
                   "R": zs[1][0], "Rs": zs[1][1] * ACPL.SQRT2}
         else:
             up = {"L": zs[0][0], "R": zs[0][1]}
+        _de_up(up, de, geo)
         return {k: Q.synthesise(v, w, Q.synthesis_matrix(255))
                 for k, v in up.items()}
     up = ACPL.render(QL, QR, acpl_groups, state0=state0, state_log=log,
                      ts_offset=geo["ts_offset"], nts=geo["nts"])
+    _de_up(up, de, geo)
     return {k: Q.synthesise(v, w, Q.synthesis_matrix(255))
             for k, v in up.items()}
 

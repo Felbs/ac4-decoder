@@ -36,6 +36,7 @@ from . import acpl_parse as AP                                      # noqa: E402
 from . import rates as RT                                           # noqa: E402
 from . import multichannel as MC                                    # noqa: E402
 from . import elements as EL                                        # noqa: E402
+from . import de as DE                                              # noqa: E402
 
 # Marks a CONCEALED frame in the A-SPX group lists (where None means "no
 # A-SPX data for this frame"). The renderer mutes the high band for it and
@@ -77,6 +78,8 @@ class Ac4Stream:
         # A-CPL books, for bit accounting of ASPX_ACPL_3 frames only
         self.acpl_books = AP.load_books(arrays)
         self.acpl_cfg = None        # acpl_config_2ch, from the last I-frame
+        from . import metadata as MDm
+        self.sub_meta = MDm.SubMetaState()  # the audio substream's DE state
         # acpl_<SET>_q_prev of the eleven sets (Pseudocode 121), rolled back
         # with a concealed frame like the A-SPX framing state
         self.acpl_q = [None] * 11
@@ -161,7 +164,8 @@ class Ac4Stream:
         # window lists do not align positionally when framings diverge
         # "acpl": per frame the A-CPL parameters of an ASPX_ACPL_3 frame
         # (acpl.render's frame dict), None without, CONCEALED
-        groups = {"lr": [], "sr": [], "c": [], "xr": [], "acpl": []}
+        groups = {"lr": [], "sr": [], "c": [], "xr": [], "acpl": [],
+                  "de": []}
         self.status = []
         self.seq_break = []
         self.meta = []
@@ -528,6 +532,7 @@ class Ac4Stream:
                 if acpl1:
                     self.acpl1 = acpl1
                 self.meta.append(self._pres_metadata(f, st, pi, sel))
+                got_de = self._sub_metadata(sub, r, ifr, sel)
                 self.n_ok += 1
                 self.status.append(None)
                 self.seq_break.append(brk)
@@ -549,6 +554,7 @@ class Ac4Stream:
                 u = {k: [np.zeros(fl)] for k in chans}
                 seq_l = {k: [fl] for k in chans}
                 got_lr = got_sr = got_c = got_x = got_acpl = CONCEALED
+                got_de = DE.HOLD
                 self.meta.append(None)
                 self.n_bad += 1
                 self.damage.add(reason)
@@ -576,6 +582,7 @@ class Ac4Stream:
             groups["sr"].append(got_sr)
             groups["c"].append(got_c)
             groups["xr"].append(got_x)
+            groups["de"].append(got_de)
             groups["acpl"].append(got_acpl)
         if early and self.frame_len not in (None, RT.DEFAULT_FRAME):
             # frames concealed before the rate was learnt in this pass take
@@ -606,6 +613,30 @@ class Ac4Stream:
                                               b_iframe=ifr)
         return C.decode_element(sub, self.Tf, b_iframe=ifr,
                                 has_lfe=el != "5_0")
+
+    # the channel mode the audio substream's metadata() is read with: the
+    # coded element's (an IMS stream signals 7.1 but carries a pair, and
+    # its metadata closes only when read as stereo)
+    META_CH_MODE = {"mono": 0, "pair": 1, "3_0": 2, "5_0": 3, "5_X": 4}
+
+    def _sub_metadata(self, sub, r, ifr, sel):
+        """The dialogue enhancement data of the audio substream's
+        metadata() (TS 103 190-2 6.2.7; metadata.py) -> dict(config, par,
+        ms), or None (none, or the metadata does not parse)."""
+        from . import metadata as MDm
+        cm = self.META_CH_MODE.get(self.element, sel.get("channel_mode"))
+        try:
+            md = MDm.substream_metadata(sub, r["audio_start"],
+                                        r["audio_size"], cm, ifr,
+                                        self.sub_meta)
+        except Exception:                                      # noqa: BLE001
+            self.sub_meta.de_par_prev = None
+            return None
+        d = md.get("de")
+        if md.get("error") or not d or d["data"].get("par") is None:
+            return None
+        return dict(config=d["config"], par=d["data"]["par"],
+                    ms=d["data"].get("ms", 0))
 
     def _pres_metadata(self, f, st, pi, sel):
         """dialnorm and the DRC frame of the presentation substream of
@@ -706,6 +737,8 @@ class Ac4Stream:
             for key in ("lr", "sr", "c", "xr", "acpl"):
                 if key in groups:
                     groups[key][fi] = CONCEALED
+            if "de" in groups:
+                groups["de"][fi] = DE.HOLD
             self.status[fi] = "audio_size.late"
             self.n_bad += 1
             self.n_ok -= 1

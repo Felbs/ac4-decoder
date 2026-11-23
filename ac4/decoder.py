@@ -137,7 +137,7 @@ class Decoder:
 
     def __init__(self, element="5_X", channels=None, burst_limit=None,
                  guard=True, presentation=None, language=None,
-                 target_level=None, drc="auto", ch_mode=None):
+                 target_level=None, drc="auto", ch_mode=None, de_level=0.0):
         """The frame length follows the stream (TS 103 190-1 Table 83):
         `frame` is FRAME (1536) until the first frame whose rate the
         decoder takes (see Ac4Stream), then that frame_len_base; out_rate
@@ -186,6 +186,10 @@ class Decoder:
         # for the A-SPX pairs
         self.lead_acpl = []
         self.acpl_state = [None]
+        # dialogue enhancement (de.py): the user gain in dB (0 = off) and
+        # the lead-in frames' DE entries
+        self.de_level = float(de_level)
+        self.lead_de = []
         self.log = []               # human-readable notes, in order
         # damaged input (robust.py): frames concealed, by reason
         self.guard = RB.OutputGuard(REF_PEAK[element], FRAME) if guard \
@@ -232,6 +236,7 @@ class Decoder:
         self.lead_core = {}
         self.lead_groups = {k: [] for k in self.lead_groups}
         self.lead_acpl = []
+        self.lead_de = []
         self.hf_state = {k: [None] for k in self.hf_state}
         self.t_hold = {k: None for k in self.t_hold}
         self.acpl_state = [None]
@@ -391,6 +396,25 @@ class Decoder:
         if up1:
             upmix = True
         ga = grp.get("acpl") or [None] * len(grp["lr"])
+        gde = grp.get("de") or [None] * len(grp["lr"])
+        de_frames = self.lead_de[-LEAD:] + gde
+        self.lead_de = (self.lead_de + gde)[-LEAD:]
+
+        def de_arg(gkey, up):
+            """Dialogue enhancement on this render call (de.py): on the
+            upmix's L / R / C, or on the pair's own channels."""
+            if not self.de_level:
+                return None
+            pair = dict((g, p) for p, g in self.pairs)[gkey]
+            if up:
+                return dict(frames=de_frames, level=self.de_level, up=True)
+            if gkey == "lr" and a1 == "pair":
+                pair = ("L", "R")
+            if not set(pair) & {"L", "R", "C"}:
+                return None
+            if gkey == "lr" and up1:
+                return None
+            return dict(frames=de_frames, level=self.de_level, pair=pair)
         for (ka, kb), gkey in self.pairs:
             # the centre (aspx_data_1ch) goes through the pair renderer as
             # the same channel twice: with balance 0 each half is decoded
@@ -427,7 +451,7 @@ class Decoder:
                                      if up else None),
                         acpl_log=alog if up else None,
                         frame_len=FRAME, t_start=self.t_hold[gkey],
-                        acpl_1ch=a1ch)
+                        acpl_1ch=a1ch, de=de_arg(gkey, up))
                     bad = np.zeros(len(gl) + 1, dtype=bool)
                     pcm[ka], pcm[kb], nb_, self.hf_hot[gkey] = \
                         core_for_bursts(hf["L"][lead:], hf["R"][lead:],
@@ -439,6 +463,13 @@ class Decoder:
                                         flagged=self._aspx_flag,
                                         hf_floor=self.hf_floor,
                                         bad_out=bad, FRAME=FRAME)
+                    if "de_L" in hf:
+                        # dialogue enhancement: the frames the checks kept
+                        n = len(pcm[ka])
+                        keep = ~np.repeat(bad, FRAME)[:n]
+                        for k_, h_ in ((ka, "de_L"), (kb, "de_R")):
+                            pcm[k_] = np.where(keep, hf[h_][lead:lead + n],
+                                               pcm[k_])
                     via_qmf |= {ka, kb}
                     if up:
                         # the channels of the upmix; a frame whose
@@ -559,7 +590,8 @@ def probe_element(frames, limit=64, presentation=None, language=None):
 
 
 def decode(frames, element=None, channels=None, max_pass=1800,
-           presentation=None, language=None, target_level=None, drc="auto"):
+           presentation=None, language=None, target_level=None, drc="auto",
+           de_level=0.0):
     """Batch convenience: -> (pcm float64 (n, ch) at the external rate,
     Decoder.out_rate (48 kHz, or 44,1 kHz for fs_index 0), decoder scale,
     Decoder). The resampler ratio is the stream's (Table 83: 1001/960,
@@ -578,7 +610,7 @@ def decode(frames, element=None, channels=None, max_pass=1800,
                              language=language) if element == "7_X" else None)
     dec = Decoder(element, channels, presentation=presentation,
                   language=language, target_level=target_level, drc=drc,
-                  ch_mode=ch_mode)
+                  ch_mode=ch_mode, de_level=de_level)
     rs = StreamResampler(up, down)
     out = []
     for i in range(0, len(frames), max(1, max_pass)):

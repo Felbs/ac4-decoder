@@ -131,7 +131,7 @@ def list_presentations(src, out=print):
 def decode_file(src, dst, element="auto", channels=None, seconds=None,
                 max_pass=1800, ref_peak=0.0, quiet=False, guard=True,
                 presentation=None, language=None, target_level=-24.0,
-                drc="auto"):
+                drc="auto", de_level=0.0):
     from . import container
     from . import rates as RT
     from .decoder import Decoder, probe_element, probe_rate
@@ -175,7 +175,7 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
         dec = Decoder(element, channels, guard=guard,
                       presentation=presentation, language=language,
                       target_level=None if legacy else target_level, drc=drc,
-                      ch_mode=ch_mode)
+                      ch_mode=ch_mode, de_level=de_level)
     except ValueError as e:
         say(str(e))
         return 1
@@ -259,6 +259,9 @@ def main(argv=None):
     ap.add_argument("--drc", default="auto",
                     help="DRC decoder mode: auto (the stream's mode for "
                          "the target level), off, or a mode ID 0-7")
+    ap.add_argument("--de-level", type=float, default=0.0,
+                    help="dialogue enhancement gain in dB (0 = off, the "
+                         "default; capped by the stream's maximum)")
     ap.add_argument("--ref-peak", type=float, default=0.0,
                     help="use the old fixed-reference level rule instead: "
                          "decoder-scale level written at 0.9 of full scale")
@@ -279,7 +282,7 @@ def main(argv=None):
                        guard=not a.no_guard, presentation=pres,
                        language=a.language, target_level=a.target_level,
                        drc=a.drc if a.drc in ("auto", "off") else
-                       int(a.drc))
+                       int(a.drc), de_level=a.de_level)
 
 
 if __name__ == "__main__":
