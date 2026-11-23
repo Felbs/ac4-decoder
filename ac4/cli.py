@@ -3,7 +3,8 @@
 
     ac4dec IN OUT.wav [--element auto|5_X|pair] [--channels 2|6]
                       [--presentation N|id:N] [--language xx]
-                      [--seconds S] [--max-pass N] [--ref-peak X]
+                      [--seconds S] [--max-pass N]
+                      [--target-level L] [--drc auto|off|N] [--ref-peak X]
                       [--no-guard]
     ac4dec IN --list        list the presentations and exit
 
@@ -27,12 +28,14 @@ OUT is 16-bit PCM at 48 kHz (44,1 kHz for a 44,1 kHz stream), every
 frame rate of TS 103 190-1 Table 83 resampled as the table says: 6 channels in WAV 5.1 order (L R C LFE Ls Rs)
 for a 5.1 element, 2 for stereo.
 
-OUTPUT LEVEL. The decoder's true full scale is not established, so the
-level policy of the receiver this decoder came from is kept, unchanged:
-samples are multiplied by 0.9 / ref_peak, where ref_peak starts at a fixed
-per-element reference (9e5 for 5.1, 2e5 for stereo, decoder units) and only
-ever rises, to the loudest sample seen so far, capped at twice the start.
-Anything above the cap is clipped. --ref-peak overrides the start value.
+OUTPUT LEVEL. Loudness normalisation (TS 103 190-1 5.7.9): the stream's
+reference level (dialnorm) is brought to --target-level (default -24 dB,
+the "flat panel TV" output range), and the DRC decoder mode the stream
+configures for that level is applied (--drc auto; off; or a mode ID 0-7).
+Full scale is IMDCT_K * 2^14.5 decoder units (see README); samples beyond
+it are clipped and counted. --ref-peak X restores the old receiver rule
+instead (samples x 0.9 / ref_peak, ref_peak rising with the loudest
+sample, capped at 2 X).
 """
 from __future__ import annotations
 
@@ -126,7 +129,8 @@ def list_presentations(src, out=print):
 
 def decode_file(src, dst, element="auto", channels=None, seconds=None,
                 max_pass=1800, ref_peak=0.0, quiet=False, guard=True,
-                presentation=None, language=None):
+                presentation=None, language=None, target_level=-24.0,
+                drc="auto"):
     from . import container
     from . import rates as RT
     from .decoder import Decoder, probe_element, probe_rate
@@ -162,9 +166,12 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
                 "pass --element")
             return 1
     t0 = time.time()
+    legacy = bool(ref_peak)
     dec = Decoder(element, channels, guard=guard,
-                  presentation=presentation, language=language)
-    lvl = LevelPolicy(element, ref_peak)
+                  presentation=presentation, language=language,
+                  target_level=None if legacy else target_level, drc=drc)
+    lvl = LevelPolicy(element, ref_peak) if legacy else None
+    n_clip = 0
     rs = StreamResampler(*RT.ratio(*rate))
     n_ch = len(dec.chans)
     n_out = 0
@@ -177,14 +184,22 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
         for i in range(0, len(frames), step):
             y = dec.decode_pass(frames[i:i + step])
             if len(y):
-                y = rs.push(lvl.apply(y))
+                y = rs.push(lvl.apply(y) if lvl else y)
+                n_clip += int((np.abs(y) > 1.0).sum())
                 w.writeframes(to_int16(y))
                 n_out += len(y)
     finally:
         w.close()
     dt = time.time() - t0
-    for line in dec.log + lvl.notes:
+    for line in dec.log + (lvl.notes if lvl else []):
         say("  " + line)
+    if not lvl and dec.leveler is not None:
+        lv = dec.leveler
+        say(f"  loudness: dialnorm "
+            f"{'-' if lv.lin is None else f'{lv.lin:g}'} dB -> "
+            f"{lv.target:g} dB, DRC mode "
+            f"{'off' if lv.mode_id is None else lv.mode_id}"
+            f"{f', {n_clip} samples clipped' if n_clip else ''}")
     secs = n_out / out_fs
     if dec.n_concealed:
         why = ", ".join(f"{k} {v}" for k, v in
@@ -226,9 +241,15 @@ def main(argv=None):
                     help="frames per decode pass (bounds memory). The output "
                          "can differ slightly with it; see README, Known "
                          "issues")
+    ap.add_argument("--target-level", type=float, default=-24.0,
+                    help="output loudness: dialnorm is normalised to this "
+                         "level, dB (default -24)")
+    ap.add_argument("--drc", default="auto",
+                    help="DRC decoder mode: auto (the stream's mode for "
+                         "the target level), off, or a mode ID 0-7")
     ap.add_argument("--ref-peak", type=float, default=0.0,
-                    help="decoder-scale level written at 0.9 of full scale "
-                         "(0 = the per-element default)")
+                    help="use the old fixed-reference level rule instead: "
+                         "decoder-scale level written at 0.9 of full scale")
     ap.add_argument("--no-guard", action="store_true",
                     help="turn off the output level guard (damaged-frame "
                          "safety net; see README)")
@@ -244,7 +265,9 @@ def main(argv=None):
     return decode_file(a.src, a.dst, a.element, a.channels, a.seconds,
                        a.max_pass, a.ref_peak, a.quiet,
                        guard=not a.no_guard, presentation=pres,
-                       language=a.language)
+                       language=a.language, target_level=a.target_level,
+                       drc=a.drc if a.drc in ("auto", "off") else
+                       int(a.drc))
 
 
 if __name__ == "__main__":

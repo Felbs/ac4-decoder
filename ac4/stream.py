@@ -83,6 +83,12 @@ class Ac4Stream:
         self.frame_len = None
         self.Tf = self.T
         self.xover0 = {}
+        # loudness / DRC metadata (presentation substream): the DRC
+        # configuration from the last I-frame, and per frame of the last
+        # decode_frames call a dict (dialnorm, drc) or None
+        from . import metadata as MDm
+        self.drc_state = MDm.DrcState()
+        self.meta = []
         self.nats = A.num_aspx_timeslots()
         self.cfg = None
         self.fstate = {}
@@ -148,6 +154,7 @@ class Ac4Stream:
         groups = {"lr": [], "sr": [], "c": [], "acpl": []}
         self.status = []
         self.seq_break = []
+        self.meta = []
         pending = []            # frames decoded before any aspx_config
         early = []              # concealed before the rate was known
         for fi, f in enumerate(frames):
@@ -490,6 +497,7 @@ class Ac4Stream:
                     got_acpl = None
                 if acpl1:
                     self.acpl1 = acpl1
+                self.meta.append(self._pres_metadata(f, st, pi, sel))
                 self.n_ok += 1
                 self.status.append(None)
                 self.seq_break.append(brk)
@@ -511,6 +519,7 @@ class Ac4Stream:
                 u = {k: [np.zeros(fl)] for k in chans}
                 seq_l = {k: [fl] for k in chans}
                 got_lr = got_sr = got_c = got_acpl = CONCEALED
+                self.meta.append(None)
                 self.n_bad += 1
                 self.damage.add(reason)
                 self.status.append(reason)
@@ -550,6 +559,25 @@ class Ac4Stream:
         if pending and self.cfg and RB.CHECKS:
             self._late_closure(pending, wins, lengths, counts, groups)
         return wins, lengths, groups, counts
+
+    def _pres_metadata(self, f, st, pi, sel):
+        """dialnorm and the DRC frame of the presentation substream of
+        presentation pi (TS 103 190-2 6.2.2.3; metadata.py), or None when
+        there is none or it does not parse."""
+        from . import metadata as MDm
+        try:
+            p = st["presentations"][pi]
+            idx = p.get("pres_substream")
+            if idx is None or idx >= len(st["substream_sizes"]):
+                return None
+            psub = M.substream_bytes(f, st, idx)
+            md = MDm.presentation_substream(
+                psub, p.get("b_alternative", 0), p.get("b_pres_ndot", 0),
+                st.get("n_substreams", 0), self.drc_state,
+                sel.get("channel_mode", 1), self.frame_len or 1536)
+            return dict(dialnorm=md.get("dialnorm"), drc=md.get("drc"))
+        except Exception:                                      # noqa: BLE001
+            return None
 
     def _set_rate(self, rate):
         """Adopt the stream's rate: its frame length (Table 83), the

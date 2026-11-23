@@ -134,11 +134,17 @@ class Decoder:
     """
 
     def __init__(self, element="5_X", channels=None, burst_limit=None,
-                 guard=True, presentation=None, language=None):
+                 guard=True, presentation=None, language=None,
+                 target_level=None, drc="auto"):
         """The frame length follows the stream (TS 103 190-1 Table 83):
         `frame` is FRAME (1536) until the first frame whose rate the
         decoder takes (see Ac4Stream), then that frame_len_base; out_rate
-        and ratio give the output rate and the resampler ratio."""
+        and ratio give the output rate and the resampler ratio.
+
+        target_level (dB, e.g. -24): the output is in units of full scale
+        (loudness.FULL_SCALE), normalised from dialnorm to this level and
+        compressed by the stream's DRC mode for it (drc "auto"; "off"; or
+        a mode ID) -- loudness.Leveler. None: decoder scale, untouched."""
         if element not in ("5_X", "pair"):
             raise ValueError(f"element {element!r}: '5_X' or 'pair'")
         if channels is None:
@@ -186,6 +192,9 @@ class Decoder:
         self._aspx_flag = np.zeros(0, dtype=bool)
         self.n_frames = 0
         self.frame = FRAME
+        self.target_level = target_level
+        self.drc_mode = drc
+        self.leveler = None
 
     @property
     def rate(self):
@@ -310,6 +319,16 @@ class Decoder:
         fired = fired | hf_flag
         self.n_concealed += int((bad | fired).sum())
         self.n_frames += len(frames)
+        if self.target_level is not None:
+            if self.leveler is None:
+                from .loudness import Leveler
+                up, down = self.ratio
+                self.leveler = Leveler(self.chans, self.target_level,
+                                       self.drc_mode,
+                                       rate=self.out_rate * down / up)
+            meta = list(self.stream.meta)
+            meta = (meta + [None] * len(frames))[:len(frames)]
+            y = self.leveler.process(y, meta, self.frame)
         self.last_status = status            # per frame of this pass
         self.last_concealed = bad | fired
         return y
@@ -507,7 +526,7 @@ def probe_element(frames, limit=64, presentation=None, language=None):
 
 
 def decode(frames, element=None, channels=None, max_pass=1800,
-           presentation=None, language=None):
+           presentation=None, language=None, target_level=None, drc="auto"):
     """Batch convenience: -> (pcm float64 (n, ch) at the external rate,
     Decoder.out_rate (48 kHz, or 44,1 kHz for fs_index 0), decoder scale,
     Decoder). The resampler ratio is the stream's (Table 83: 1001/960,
@@ -523,7 +542,7 @@ def decode(frames, element=None, channels=None, max_pass=1800,
         raise ValueError("cannot tell the element from the stream; pass "
                          "element='5_X' or 'pair'")
     dec = Decoder(element, channels, presentation=presentation,
-                  language=language)
+                  language=language, target_level=target_level, drc=drc)
     rs = StreamResampler(up, down)
     out = []
     for i in range(0, len(frames), max(1, max_pass)):
