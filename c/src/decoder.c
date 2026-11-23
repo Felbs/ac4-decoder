@@ -865,6 +865,30 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         if (r->mask & (1 << k))
             d->spec_n[k] = ac4_packed_spectrum(chan_src(e, k), d->spec[k],
                                                &jb);
+    /* spectral noise fill: one generator per frame, reset from
+       sequence_counter, through the element's sf_data blocks in bitstream
+       order (pair: L R; 5_X: LFE L R Ls Rs C; ASPX_ACPL_3: LFE L R) */
+    {
+        static const int ORDER_PAIR[] = { CH_L, CH_R };
+        static const int ORDER_5X[] = { CH_LFE, CH_L, CH_R, CH_LS, CH_RS,
+                                        CH_C };
+        const int *ord = ORDER_5X;
+        int n_ord = acpl3 ? 3 : 6, i;
+        ac4_snf_rng rng;
+        if (d->element == AC4DEC_ELEMENT_PAIR) {
+            ord = ORDER_PAIR;
+            n_ord = 2;
+        }
+        ac4_snf_reset(&rng, t.sequence_counter);
+        for (i = 0; i < n_ord; i++) {
+            k = ord[i];
+            if (r->mask & (1 << k))
+                ac4_noise_fill(chan_src(e, k), d->spec[k], d->spec_n[k],
+                               &rng, &jb);
+            else
+                ac4_noise_fill(chan_src(e, k), NULL, 0, &rng, &jb);
+        }
+    }
     if (changed != AC4E_NONE) {
         int at_i = ifr;
         if (ifr && changed != AC4E_ELEMENT_MODE) {

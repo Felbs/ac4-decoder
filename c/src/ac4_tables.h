@@ -36,6 +36,8 @@ extern const ac4t_book AC4T_ACPL_BOOKS[AC4T_N_ACPL_BOOKS];
 /* Table D.3 QMF prototype (640 taps) and Table D.2 ASPX_NOISE (re, im). */
 extern const double AC4T_QWIN[640];
 extern const double AC4T_ASPX_NOISE[512][2];
+/* Table C.10 RANDOM_NOISE_TABLE (float32): spectral noise fill */
+extern const float AC4T_RANDOM_NOISE[256];
 
 /* Index 0..4 = transform length 1536, 768, 384, 192, 96. */
 #define AC4T_N_SFB 5

@@ -12,7 +12,11 @@
  *   samples late, with a negative control; the A-SPX tables obey the
  *   structural rules of clause 5.7.6.3.1; channel_mode decodes every code
  *   of TS 103 190-2 table 56 and ac4_substream_info_chan reads the
- *   top-channel fields of 7.0.4 .. 9.1.4.
+ *   top-channel fields of 7.0.4 .. 9.1.4; the spectral noise fill's
+ *   generator (Pseudocodes 24, 57) and levels (Pseudocodes 22, 23).
+ *
+ *   tests/unit_test --dump-snf    prints random channels noise-filled
+ *   (c/tests/check_noise_fill.py compares them with the Python).
  *
  *   tests/unit_test --dump-aspx   prints the A-SPX tables for every
  *   aspx_config (c/tests/check_aspx_tables.py compares them with the
@@ -456,14 +460,277 @@ static void test_channel_mode(void)
     }
 }
 
+/* ------------------------------------------------------------ noise fill */
+void ac4_spectra_init(void);            /* src/spectra.c */
+/* GetRandomNoiseValue after ResetRandGenStateSnf: state and first values
+   (the same numbers as tests/test_units.py SNF_FIRST) */
+static void test_snf_rng(void)
+{
+    static const struct {
+        int seq;
+        unsigned st[4];
+        double v[6];
+    } T[] = {
+        {0, {0, 0, 1, 0}, {1.6131210327148438, 0.3268809914588928,
+                           -0.3108939826488495, 1.3197810649871826,
+                           1.1259419918060303, -0.547692060470581}},
+        {1, {0, 1, 130, 130}, {-0.04938599839806557, 1.502228021621704,
+                               -0.13683800399303436, -0.9735279679298401,
+                               1.7364200353622437, -0.6638969779014587}},
+        {255, {0, 255, 255, 126}, {-0.05372801423072815, 0.9366300106048584,
+                                   -1.3645939826965332, -1.0417840480804443,
+                                   -0.7589679956436157, -1.3996400833129883}},
+        {1020, {0, 252, 115, 248}, {2.1083831787109375, -0.534654974937439,
+                                    -0.47258099913597107, 0.04947199672460556,
+                                    -0.47846800088882446, 1.1031620502471924}},
+    };
+    size_t i;
+    int j;
+    for (i = 0; i < sizeof(T) / sizeof(T[0]); i++) {
+        ac4_snf_rng r;
+        double m = 0.0, v2 = 0.0;
+        ac4_snf_reset(&r, T[i].seq);
+        CHECK(r.a == T[i].st[0] && r.b == T[i].st[1]
+              && r.state == T[i].st[2] && r.cur == T[i].st[3],
+              "snf reset %d: state %u %u %u %u", T[i].seq, r.a, r.b,
+              r.state, r.cur);
+        for (j = 0; j < 6; j++) {
+            double v = ac4_snf_next(&r);
+            CHECK(v == T[i].v[j], "snf %d value %d: %.17g", T[i].seq, j, v);
+        }
+        ac4_snf_reset(&r, T[i].seq);
+        for (j = 0; j < 65280; j++) {
+            double v = ac4_snf_next(&r);
+            m += v;
+            v2 += v * v;
+        }
+        m /= 65280.0;
+        v2 = v2 / 65280.0 - m * m;
+        CHECK(fabs(m) < 0.02 && fabs(v2 - 1.0) < 0.05,
+              "snf %d: mean %g variance %g", T[i].seq, m, v2);
+    }
+}
+
+/* a random channel for the noise fill: framing bits (returned as a 0/1
+   string), lines, scale factors and noise fill deltas */
+static const int SHORTL[4] = { 96, 192, 384, 768 };
+static const int NGRP[4][4] = { {15, 10, 8, 7}, {10, 7, 4, 3},
+                                {8, 4, 3, 1}, {7, 3, 1, 1} };
+static int msfb_bits(int len) { return len >= 384 ? 6 : len == 192 ? 5 : 4; }
+static int nsfb(int len)
+{
+    int i;
+    for (i = 0; i < AC4T_N_SFB; i++)
+        if (AC4T_SFB[i].length == len)
+            return AC4T_SFB[i].num_sfb;
+    return 0;
+}
+static unsigned rnd_u(unsigned n) { return (unsigned)((urand() + 1.0) * 0.5 * n) % n; }
+static void put(char *s, int *n, unsigned v, int bits)
+{
+    int i;
+    for (i = bits - 1; i >= 0; i--)
+        s[(*n)++] = (char)('0' + ((v >> i) & 1));
+    s[*n] = 0;
+}
+
+static int framing_from(const uint8_t *buf, ac4_framing *f)
+{
+    ac4_bits b;
+    jmp_buf jb;
+    b.d = buf;
+    b.nbits = 128;
+    b.p = 0;
+    b.jb = &jb;
+    b.eof_code = AC4E_ELEMENT_PARSE;
+    if (setjmp(jb))
+        return -1;
+    ac4_framing_parse(&b, f);
+    return 0;
+}
+
+/* packed spectrum + noise fill (generator reset from seq); -> lines, or
+   -1 when a level check raised */
+static int spec_fill(const ac4_chan *c, double *spec, int seq,
+                     ac4_snf_rng *r)
+{
+    jmp_buf jb;
+    int n;
+    if (setjmp(jb))
+        return -1;
+    n = ac4_packed_spectrum(c, spec, &jb);
+    ac4_snf_reset(r, seq);
+    ac4_noise_fill(c, spec, n, r, &jb);
+    return n;
+}
+
+static void snf_case(char *bits, ac4_framing *f, ac4_chan *c, uint8_t *buf)
+{
+    int n = 0, tl0, tl1, i, g, sfb, k;
+    if (rnd_u(3) == 0) {
+        put(bits, &n, 1, 1);
+        put(bits, &n, rnd_u((unsigned)nsfb(1536) + 1), 6);
+    } else {
+        tl0 = (int)rnd_u(4);
+        tl1 = rnd_u(3) ? tl0 : (int)rnd_u(4);
+        put(bits, &n, 0, 1);
+        put(bits, &n, (unsigned)tl0, 2);
+        put(bits, &n, (unsigned)tl1, 2);
+        put(bits, &n, rnd_u((unsigned)nsfb(SHORTL[tl0]) + 1),
+            msfb_bits(SHORTL[tl0]));
+        if (tl0 != tl1)
+            put(bits, &n, rnd_u((unsigned)nsfb(SHORTL[tl1]) + 1),
+                msfb_bits(SHORTL[tl1]));
+        for (i = 0; i < NGRP[tl0][tl1]; i++)
+            put(bits, &n, rnd_u(2), 1);
+    }
+    memset(buf, 0, 16);
+    for (i = 0; i < n; i++)
+        if (bits[i] == '1')
+            buf[i / 8] |= (uint8_t)(0x80 >> (i & 7));
+    memset(c, 0, sizeof(*c));
+    if (framing_from(buf, f) != 0)
+        return;
+    c->fr = f;
+    c->has_snf = 1;
+    c->n_lines = 0;
+    for (g = 0; g < f->num_groups; g++) {
+        const ac4t_sfb *t = f->gtab[g];
+        int nw = f->nwin[g], base = f->gbase[g];
+        int m = f->gmax[g] < t->num_sfb ? f->gmax[g] : t->num_sfb;
+        for (sfb = 0; sfb < m; sfb++) {
+            int lo = base + t->off[sfb] * nw, hi = base + t->off[sfb + 1] * nw;
+            c->sfs[g][sfb] = AC4_SF_NONE;
+            c->snf[g][sfb] = AC4_SF_NONE;
+            if (rnd_u(5) < 2) {                      /* coded band */
+                c->sfs[g][sfb] = (int16_t)(80 + rnd_u(40));
+                for (k = lo; k < hi; k++)
+                    c->lines[k] = (int32_t)rnd_u(9) - 4;
+                c->lines[lo] = 1 + (int32_t)rnd_u(5);
+            } else {                                 /* noise band */
+                c->snf[g][sfb] = (int16_t)((int)rnd_u(22) - 17);
+            }
+            if (hi > c->n_lines)
+                c->n_lines = hi;
+        }
+    }
+}
+
+/* the noise fill against its pseudocode, on fixed bands of a long block:
+   band 0 coded, band 1 noise at +2, band 2 escaped, band 3 noise at -1,
+   band 4 coded; and spec NULL advances the generator as filling does */
+static void test_noise_fill(void)
+{
+    uint8_t buf[16];
+    ac4_framing f;
+    ac4_chan c;
+    ac4_snf_rng r1, r2;
+    double spec[1536], plain[1536], lev0, e = 0.0;
+    const int16_t *off;
+    int k, sfb, ok = 1;
+    jmp_buf jb;
+    ac4_spectra_init();
+    memset(buf, 0, sizeof(buf));
+    buf[0] = 0x8a;                       /* 1 000101: long, max_sfb 5 */
+    if (framing_from(buf, &f) != 0) {
+        CHECK(0, "noise fill: framing raised");
+        return;
+    }
+    memset(&c, 0, sizeof(c));
+    c.fr = &f;
+    off = f.gtab[0]->off;
+    c.n_lines = off[5];
+    for (sfb = 0; sfb < 5; sfb++)
+        c.sfs[0][sfb] = c.snf[0][sfb] = AC4_SF_NONE;
+    c.lines[off[0]] = 1;
+    c.lines[off[0] + 1] = -1;
+    c.lines[off[0] + 2] = 2;
+    c.lines[off[4]] = 3;
+    c.sfs[0][0] = 100;
+    c.sfs[0][4] = 104;
+    c.has_snf = 0;
+    CHECK(spec_fill(&c, plain, 5, &r1) == off[5], "noise fill: no snf");
+    c.has_snf = 1;
+    c.snf[0][1] = 2;
+    c.snf[0][2] = -17;
+    c.snf[0][3] = -1;
+    CHECK(spec_fill(&c, spec, 5, &r1) == off[5], "noise fill raised");
+    for (k = off[0]; k < off[1]; k++)
+        e += plain[k] * plain[k];
+    lev0 = 1.44269504 * log(e / (double)(off[1] - off[0]));
+    ac4_snf_reset(&r2, 5);
+    for (k = 0; k < off[5]; k++) {
+        double want = plain[k];
+        if (k >= off[1] && k < off[2])
+            want = ac4_snf_next(&r2) * pow(2.0, 0.5 * (lev0 + 2));
+        else if (k >= off[3] && k < off[4])
+            want = ac4_snf_next(&r2) * pow(2.0, 0.5 * (lev0 + 1));
+        ok &= fabs(spec[k] - want) <= 1e-12 * fabs(want);
+    }
+    CHECK(ok && plain[off[4]] == pow(3.0, 4.0 / 3.0) * 2.0,
+          "noise fill levels / escape / order");
+    /* spec NULL: the generator advances exactly as filling does */
+    ac4_snf_reset(&r2, 5);
+    if (!setjmp(jb))
+        ac4_noise_fill(&c, NULL, 0, &r2, &jb);
+    CHECK(r1.a == r2.a && r1.b == r2.b && r1.state == r2.state
+          && r1.cur == r2.cur, "noise fill: spec NULL advances alike");
+}
+
+/* random channels, noise-filled, printed for c/tests/check_noise_fill.py */
+static void dump_snf(void)
+{
+    int i, g, sfb, k;
+    ac4_spectra_init();
+    for (i = 0; i < 400; i++) {
+        char bits[64];
+        uint8_t buf[16];
+        ac4_framing f;
+        ac4_chan c;
+        ac4_snf_rng r;
+        double spec[1536];
+        int seq = (int)rnd_u(1021), n;
+        snf_case(bits, &f, &c, buf);
+        printf("case %d %s %d %d\n", i, bits, seq, c.n_lines);
+        printf("lines");
+        for (k = 0; k < c.n_lines; k++)
+            if (c.lines[k])
+                printf(" %d:%d", k, c.lines[k]);
+        printf("\n");
+        for (g = 0; g < f.num_groups; g++) {
+            int m = f.gmax[g] < f.gtab[g]->num_sfb ? f.gmax[g]
+                                                    : f.gtab[g]->num_sfb;
+            printf("group %d", g);
+            for (sfb = 0; sfb < m; sfb++)
+                printf(" %d,%d", c.sfs[g][sfb], c.snf[g][sfb]);
+            printf("\n");
+        }
+        n = spec_fill(&c, spec, seq, &r);
+        if (n < 0) {
+            printf("raised\n");
+            continue;
+        }
+        printf("spec");
+        for (k = 0; k < n; k++)
+            printf(" %.17g", spec[k]);
+        printf("\n");
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--dump-aspx")) {
         dump_aspx();
         return 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "--dump-snf")) {
+        dump_snf();
+        return 0;
+    }
     test_bits();
     test_channel_mode();
+    test_snf_rng();
+    test_noise_fill();
     test_huffman();
     test_aspx_books();
     test_sfb();

@@ -305,3 +305,122 @@ def test_pair_without_stereo_processing_uses_each_channels_framing(
     assert lengths["L"] == [1536] and counts["L"] == [1]
     assert lengths["R"] == [384] * 4 and counts["R"] == [4]
     assert [len(w) for w in wins["R"]] == [384] * 4
+
+
+# ---------------------------------------------------------- noise fill
+# GetRandomNoiseValue (TS 103 190-1 Pseudocode 57) after
+# ResetRandGenStateSnf (Pseudocode 24): the state and the first values for
+# a few sequence counters (float32 results, exact). c/tests/unit_test.c
+# checks the same numbers. sequence_counter 0 by hand: state (0, 0, 1, 0);
+# T[0] + T[1] = 0.643120 + 0.970001; then uiOffsetA 1, uiStateIdx
+# 2 + 0 + 1 = 3, uiCurrentIdx 0 + 1 = 1: T[1] + T[3] = 0.970001 - 0.643120.
+SNF_FIRST = {
+    0: ((0, 0, 1, 0), [1.6131210327148438, 0.3268809914588928,
+                       -0.3108939826488495, 1.3197810649871826,
+                       1.1259419918060303, -0.547692060470581]),
+    1: ((0, 1, 130, 130), [-0.04938599839806557, 1.502228021621704,
+                           -0.13683800399303436, -0.9735279679298401,
+                           1.7364200353622437, -0.6638969779014587]),
+    255: ((0, 255, 255, 126), [-0.05372801423072815, 0.9366300106048584,
+                               -1.3645939826965332, -1.0417840480804443,
+                               -0.7589679956436157, -1.3996400833129883]),
+    1020: ((0, 252, 115, 248), [2.1083831787109375, -0.534654974937439,
+                                -0.47258099913597107, 0.04947199672460556,
+                                -0.47846800088882446, 1.1031620502471924]),
+}
+
+
+def test_snf_generator_state_and_statistics():
+    from ac4 import audio as R
+    for seq, (state, first) in SNF_FIRST.items():
+        r = R.SnfRandom(seq)
+        assert (r.a, r.b, r.state, r.cur) == state, seq
+        assert [r.next() for _ in range(len(first))] == first, seq
+    # 65280 draws (a full uiOffsetA/uiOffsetB cycle) are zero-mean,
+    # unit-variance noise ("normal distributed with unit variance")
+    for seq in (0, 1, 77, 255, 1020):
+        r = R.SnfRandom(seq)
+        x = np.array([r.next() for _ in range(65280)])
+        assert abs(x.mean()) < 0.02 and abs(x.var() - 1.0) < 0.05, seq
+        assert np.all(x == x.astype(np.float32))
+
+
+def _snf_channel(fr, lines, sfs, snf):
+    return dict(lines=np.asarray(lines, dtype=np.int32), sfs=sfs[0],
+                sfs_all=sfs, snf=snf, framing=fr)
+
+
+def test_noise_fill_levels_escape_and_order():
+    """Pseudocodes 22/23 on a long block: band 0 coded, band 1 noise at
+    +2 (log2 mean square), band 2 escaped (-17: zero, level held), band 3
+    noise at -1 against band 1's level; band 4 coded again."""
+    from ac4 import audio as R
+    fr = _framing("1" + "000101")                    # long, max_sfb 5
+    off = fr.sect_sfb_offset(0)
+    lines = np.zeros(off[5], dtype=np.int32)
+    lines[off[0]:off[1]] = [1, -1, 2, 0][:off[1] - off[0]]
+    lines[off[4]] = 3
+    sfs = [[100, None, None, None, 104]]
+    snf = [[None, 2, -17, -1, None]]
+    ch = _snf_channel(fr, lines, sfs, snf)
+    plain = R.packed_spectrum(ch, fr)
+    spec = R.packed_spectrum(ch, fr, R.SnfRandom(5))
+    b = [slice(off[i], off[i + 1]) for i in range(5)]
+    assert np.array_equal(spec[b[0]], plain[b[0]])
+    assert np.array_equal(spec[b[4]], plain[b[4]])
+    assert not plain[b[1]].any() and not spec[b[2]].any()
+    lev0 = 1.44269504 * np.log(np.mean(plain[b[0]] ** 2))
+    rnd = R.SnfRandom(5)
+    want1 = np.array([rnd.next() for _ in range(off[2] - off[1])]) \
+        * 2.0 ** (0.5 * (lev0 + 2))
+    want3 = np.array([rnd.next() for _ in range(off[4] - off[3])]) \
+        * 2.0 ** (0.5 * (lev0 + 2 - 1))
+    assert np.allclose(spec[b[1]], want1, rtol=1e-12, atol=0)
+    assert np.allclose(spec[b[3]], want3, rtol=1e-12, atol=0)
+    # no noise data: unchanged
+    ch0 = _snf_channel(fr, lines, sfs, None)
+    assert np.array_equal(R.packed_spectrum(ch0, fr, R.SnfRandom(5)), plain)
+
+
+def test_noise_fill_is_applied_by_the_stream(monkeypatch):
+    """Ac4Stream.decode_frames applies the noise fill of a frame that
+    carries asf_snf_data (before the fix the rng was ignored and the
+    bands stayed silent), with one generator per frame reset from
+    sequence_counter and run L then R (bitstream order)."""
+    from ac4 import audio as R
+    from ac4 import pair as PAIR
+    from ac4 import robust as RB
+    from ac4 import stream as ST
+    fr = _framing("1" + "000101")
+    off = fr.sect_sfb_offset(0)
+    lines = np.zeros(off[5], dtype=np.int32)
+    lines[off[0]] = 4
+
+    def ch():
+        return _snf_channel(fr, lines, [[100, None, None, None, None]],
+                            [[None, 0, 0, 0, 0]])
+
+    def fake_pair(sub, T, b_iframe=False):
+        return dict(L=ch(), R=ch(),
+                    st_lr=dict(sap_mode=None, ms_used=None, sap=None,
+                               max_sfb=5, framing=fr),
+                    aspx=None, codec_mode=0, bits=8, nbits=64,
+                    audio_size=1, audio_start=0, mode=("pair", 0))
+
+    monkeypatch.setattr(PAIR, "decode_pair", fake_pair)
+    monkeypatch.setattr(ST.M, "parse", lambda f: dict(
+        sequence_counter=9, toc_bytes=0, payload_base=0,
+        substream_sizes=[0, 8], b_iframe_global=1))
+    monkeypatch.setattr(RB, "CHECKS", False)
+    s = ST.Ac4Stream("pair")
+    wins, _l, _g, _c = s.decode_frames([bytes(16)])
+    L, Rr = wins["L"][0], wins["R"][0]
+    n = off[5] - off[1]
+    assert np.sum(L[off[1]:off[5]] ** 2) > 0
+    assert np.sum(Rr[off[1]:off[5]] ** 2) > 0
+    rnd = R.SnfRandom(9)
+    seq = np.array([rnd.next() for _ in range(2 * n)])
+    amp = 2.0 ** (0.5 * 1.44269504 * np.log(
+        np.mean(L[off[0]:off[1]] ** 2)))
+    assert np.allclose(L[off[1]:off[5]], seq[:n] * amp, rtol=1e-12)
+    assert np.allclose(Rr[off[1]:off[5]], seq[n:] * amp, rtol=1e-12)

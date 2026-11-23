@@ -125,7 +125,7 @@ static int n_sect_bits(const ac4_framing *f, int g)
     return f->tl[half] <= 2 ? 3 : 5;
 }
 
-static void framing_parse(ac4_bits *b, ac4_framing *f)
+void ac4_framing_parse(ac4_bits *b, ac4_framing *f)
 {
     int n_grp, i, sfg[AC4_MAX_WIN + 1];
     memset(f, 0, sizeof(*f));
@@ -421,12 +421,12 @@ static void two_channel_data(ac4_bits *b, const ac4_books *bk, ac4_pair *p)
 {
     p->st.sap_mode = -1;
     if (ac4_bit(b)) {                     /* b_enable_mdct_stereo_proc */
-        framing_parse(b, &p->fr[0]);
+        ac4_framing_parse(b, &p->fr[0]);
         chparam_info(b, bk, &p->fr[0], &p->st);
         p->fr[1] = p->fr[0];
     } else {
-        framing_parse(b, &p->fr[0]);
-        framing_parse(b, &p->fr[1]);
+        ac4_framing_parse(b, &p->fr[0]);
+        ac4_framing_parse(b, &p->fr[1]);
     }
     sf_data(b, bk, &p->fr[0], &p->ch[0]);
     sf_data(b, bk, &p->fr[1], &p->ch[1]);
@@ -440,7 +440,7 @@ static void mono_data(ac4_bits *b, const ac4_books *bk, int lfe,
     } else {
         if (ac4_bit(b) != 0)              /* spec_frontend: SSF */
             ac4_fail(b, AC4E_ELEMENT_PARSE);
-        framing_parse(b, &m->fr);
+        ac4_framing_parse(b, &m->fr);
     }
     sf_data(b, bk, &m->fr, &m->ch);
 }

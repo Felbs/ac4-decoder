@@ -256,9 +256,10 @@ class Ac4Stream:
                             fi=fi, sub=sub, bits=r["bits"], ifr=ifr,
                             start=r["audio_start"], size=r["audio_size"],
                             acpl3=acpl3, five=five, wpos=wpos))
-                # noise fill seeded by the stream's own sequence counter,
-                # exactly as the batch render does
-                rng = np.random.default_rng(st["sequence_counter"])
+                # spectral noise fill (TS 103 190-1 5.1.4): one generator
+                # per frame, reset from sequence_counter (Pseudocode 24),
+                # run through the element's channels in bitstream order
+                rng = R.SnfRandom(st["sequence_counter"])
                 # each channel's OWN framing: with b_enable_mdct_stereo_proc
                 # = 0 the two channels of a pair carry separate sf_info and
                 # can differ (with it on, both are the shared one)
@@ -284,8 +285,15 @@ class Ac4Stream:
                                "Rs": r["Rs"]["framing"],
                                "C": r["C"]["framing"],
                                "lfe": r["lfe"]["framing"]})
-                pk = {k: R.packed_spectrum(r[k], fm[k], rng)
-                      for k in chans}
+                order = R.BITSTREAM_ORDER["pair" if self.element == "pair"
+                                          else ("acpl3" if acpl3
+                                                else "5_X")]
+                pk = {}
+                for k in order:
+                    if k in chans:
+                        pk[k] = R.packed_spectrum(r[k], fm[k], rng)
+                    else:           # not rendered: the generator runs on
+                        R.noise_fill(None, r[k], r[k]["framing"], rng)
                 if on:
                     for k, v in pk.items():
                         if len(v) and not (np.abs(v).max()

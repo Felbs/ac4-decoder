@@ -45,6 +45,7 @@ identical (real stereo separation).  A broken M/S step gives one or the other.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import struct
 import sys
@@ -68,7 +69,8 @@ CODED_HZ = 12000.0                 # sfb_offset[43] / 1536 * 24000
 
 
 def packed_spectrum(ch, fr, rng=None):
-    """Dequantise into the PACKED (bitstream-order) spectrum.
+    """Dequantise into the PACKED (bitstream-order) spectrum; with `rng`
+    (a SnfRandom) the spectral noise fill is applied (clause 5.1.4).
 
     For a long frame this is the 1536-line spectrum and nothing else happens.
     For a short frame the groups are laid out contiguously by
@@ -95,6 +97,8 @@ def packed_spectrum(ch, fr, rng=None):
             q = lines[lo:hi].astype(float)
             rec = np.sign(q) * np.abs(q) ** QUANT_EXP
             spec[lo:hi] = rec * (2.0 ** (0.25 * (sfs[sfb] - SF_OFFSET)))
+    if rng is not None:
+        noise_fill(spec, ch, fr, rng)
     return spec
 
 
@@ -129,83 +133,125 @@ def ungroup(packed, fr):
     return out, lengths
 
 
-def spectrum(ch, max_sfb, rng=None):
-    """One decoded channel -> a 1536-line dequantised spectrum.
-
-    Clause 5.1.3.2 / Pseudocode 21, both verified verbatim:
-        rec_spec    = sign(quant_spec) * |quant_spec| ** (4/3)
-        sf_gain     = pow(2.0, 0.25 * (scale_factor - 100))
-
-    With `rng`, spectral noise fill (clause 5.1.4, Pseudocode 22/23) is applied
-    on top.  Bands the encoder left empty are meant to be REPLACED by noise at
-    a transmitted level, not left as digital silence -- silence leaves audible
-    spectral holes where the codec intended noise.
-    """
-    spec = np.zeros(N)
-    lines, sfs = ch["lines"], ch["sfs"]
-    off = B.SFB_OFFSET_1536
-    for sfb in range(min(max_sfb, len(sfs))):
-        if sfs[sfb] is None:
-            continue
-        lo, hi = off[sfb], off[sfb + 1]
-        if lo >= len(lines):
-            break
-        q = lines[lo:min(hi, len(lines))].astype(float)
-        rec = np.sign(q) * np.abs(q) ** QUANT_EXP
-        spec[lo:lo + len(rec)] = rec * (2.0 ** (0.25 * (sfs[sfb] - SF_OFFSET)))
-    if rng is not None:
-        noise_fill(spec, ch, max_sfb, rng)
-    return spec
+# ---------------------------------------------------------------- noise fill
+_RNT = None
 
 
-def noise_fill(spec, ch, max_sfb, rng):
-    """Clause 5.1.4.  Pseudocode 22 finds the reference level, 23 inserts.
+def random_noise_table():
+    """Table C.10, RANDOM_NOISE_TABLE: 256 float32 values."""
+    global _RNT
+    if _RNT is None:
+        import json
+        path = os.path.join(HERE, "tables", "ac4_random_noise.json")
+        with open(path, encoding="utf-8") as fh:
+            vals = json.load(fh)["values"]
+        if len(vals) != 256:
+            raise ValueError("RANDOM_NOISE_TABLE must have 256 entries")
+        _RNT = np.array(vals, dtype=np.float32)
+    return _RNT
 
-    previous_rms is log2 of the band's MEAN SQUARE (1.44269504 = 1/ln 2), the
-    transmitted delta is added in that log domain, and the amplitude is
-    2 ** (0.5 * noise_rms) -- i.e. an RMS, which is why the exponent is halved.
 
-    HONEST DEVIATION: the spec's GetRandomNoiseValue() is a specific table-driven
-    generator seeded from sequence_counter (Pseudocode 24), and that table lives
-    in the speech front end, which is not implemented here.  The spec states its
-    output is "normal distributed with unit variance and zero mean", so a normal
-    RNG seeded from the same sequence_counter is used instead.  The statistics
-    are as specified and the levels are exact; the particular noise realisation
-    differs from a reference decoder.  This is noise by construction, so it is
-    perceptually equivalent -- but it is NOT bit-exact and must not be described
-    as conformant.
-    """
-    snf = ch.get("snf")
-    if not snf:
+class SnfRandom:
+    """nRndStateSnf: the ssf_rndgen_state of the spectral noise fill.
+
+    reset (Pseudocode 24, ResetRandGenStateSnf) from sequence_counter at the
+    start of each frame; next() is GetRandomNoiseValue (Pseudocode 57): the
+    float32 sum of two RANDOM_NOISE_TABLE entries, then the state update
+    with every field a uint8 (the spec's "implicit modulo 256"). The
+    pseudocode's `x = x++` statements are read as increments."""
+
+    def __init__(self, sequence_counter):
+        self.tab = random_noise_table()
+        start = 255 * (sequence_counter % 256)
+        a = start % 255
+        b = (start // 255) % 256
+        state = ((a + 1) * ((a + 2) + 2 * b) // 2
+                 + 255 * b * (255 + b) // 2)
+        if start % 130560 >= 65280:
+            state += 128
+        self.a, self.b = a & 255, b & 255
+        self.state = state % 256
+        self.cur = (a * (a + 1) // 2 + b * 32386) % 256
+
+    def next(self):
+        v = self.tab[self.cur] + self.tab[self.state]   # float32 + float32
+        self.a = (self.a + 1) & 255
+        self.state = (self.state + 1) & 255
+        if self.a == 255:
+            self.cur = (self.cur + 1) & 255
+            self.b = (self.b + 1) & 255
+            self.a = 0
+        self.cur = (self.cur + self.a) & 255
+        self.state = (self.state + self.b + self.a) & 255
+        return float(v)
+
+    def skip(self, n):
+        for _ in range(n):
+            self.next()
+
+
+def _snf_bands(ch, fr):
+    """(g, sfb, lo, hi, delta) of every band in bitstream order of the
+    packed spectrum, delta = dpcm_snf - 17 or None where none was sent."""
+    snf = ch.get("snf") or []
+    for g in range(fr.num_groups):
+        offs = fr.sect_sfb_offset(g)
+        d = snf[g] if g < len(snf) else []
+        for sfb in range(min(fr.max_sfb_g(g), len(offs) - 1)):
+            yield (g, sfb, offs[sfb], offs[sfb + 1],
+                   d[sfb] if sfb < len(d) else None)
+
+
+def noise_fill(spec, ch, fr, rnd):
+    """TS 103 190-1 5.1.4, Pseudocodes 22 and 23, on the PACKED spectrum
+    (bitstream order: band sfb of group g holds its num_win_in_group[g]
+    windows back to back, which is how both pseudocodes walk k).
+
+    Bands with no energy (sfb_cb 0 or max_quant_idx 0: exactly the bands
+    that carry a dpcm_snf) are replaced by noise at previous_rms + delta,
+    previous_rms being log2 of the mean square of the last band with
+    energy, or of the last noise band (Pseudocode 23); the first band with
+    energy sets the initial reference (Pseudocode 22, -1000 if none).
+    delta -17 is the escape: no noise, level not updated. With spec=None
+    only the generator advances (a channel that is not rendered)."""
+    if not ch.get("snf"):
         return
-    snf0 = snf[0]
-    off = B.SFB_OFFSET_1536
-    n = min(max_sfb, len(snf0))
-
-    # Pseudocode 22: the reference level is the first band with any energy
-    prev = None
-    for sfb in range(n):
-        lo, hi = off[sfb], off[sfb + 1]
-        ms = float((spec[lo:hi] ** 2).mean()) if hi > lo else 0.0
-        if ms > 0:
-            prev = 1.44269504 * np.log(ms)
-            break
-    if prev is None:
-        return
-
-    for sfb in range(n):
-        lo, hi = off[sfb], off[sfb + 1]
+    bands = list(_snf_bands(ch, fr))
+    prev = -1000.0
+    if spec is not None:
+        for _g, _sfb, lo, hi, _d in bands:
+            e = float(np.sum(spec[lo:hi] ** 2))
+            if e > 0:
+                prev = 1.44269504 * math.log(e / (hi - lo))
+                break
+    for _g, _sfb, lo, hi, d in bands:
         if hi <= lo:
             continue
-        ms = float((spec[lo:hi] ** 2).mean())
-        if ms > 0:
-            prev = 1.44269504 * np.log(ms)
-            continue
-        d = snf0[sfb]
-        if d is None or d == -17:          # -17 escapes: no fill, level held
+        if spec is not None:
+            e = float(np.sum(spec[lo:hi] ** 2))
+            if e > 0:
+                prev = 1.44269504 * math.log(e / (hi - lo))
+                continue
+        elif d is None:
+            continue                    # a band with energy
+        if d is None or d == -17:       # -17: no noise, level held
             continue
         prev = prev + d
-        spec[lo:hi] = rng.standard_normal(hi - lo) * (2.0 ** (0.5 * prev))
+        if spec is None:
+            rnd.skip(hi - lo)
+            continue
+        amp = 2.0 ** (0.5 * prev)
+        for k in range(lo, hi):
+            spec[k] = rnd.next() * amp
+
+
+# the element's sf_data blocks in bitstream order (Table 22 / Table 25):
+# the noise fill generator runs through them in this order every frame
+BITSTREAM_ORDER = {
+    "pair": ("L", "R"),
+    "5_X": ("lfe", "L", "R", "Ls", "Rs", "C"),
+    "acpl3": ("lfe", "L", "R"),
+}
 
 
 def unmix(m, s, st, fr):

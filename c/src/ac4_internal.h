@@ -393,6 +393,24 @@ double ac4_np_sum(const double *x, long n);
 /* Dequantise into the packed spectrum (returns its length). Raises
    AC4E_LEVEL through jb when a line exceeds the sanity bound. */
 int ac4_packed_spectrum(const ac4_chan *ch, double *spec, jmp_buf *jb);
+
+/* Spectral noise fill, TS 103 190-1 5.1.4. nRndStateSnf: reset from
+   sequence_counter at the start of every frame (Pseudocode 24), then
+   GetRandomNoiseValue (Pseudocode 57) through the element's channels in
+   bitstream order. ac4_noise_fill fills the packed spectrum spec (n lines)
+   of channel ch (Pseudocodes 22, 23), raising AC4E_LEVEL through jb on a
+   line above the level limit; spec NULL only advances the generator by the
+   lines the channel would fill (a channel that is not rendered). */
+typedef struct {
+    unsigned a, b, state, cur;  /* uiOffsetA, uiOffsetB, uiStateIdx,
+                                   uiCurrentIdx (uint8 in the spec) */
+} ac4_snf_rng;
+void ac4_snf_reset(ac4_snf_rng *r, int sequence_counter);
+double ac4_snf_next(ac4_snf_rng *r);
+void ac4_noise_fill(const ac4_chan *ch, double *spec, int n,
+                    ac4_snf_rng *r, jmp_buf *jb);
+/* sf_info (asf_transform_info + asf_psy_info), for the unit tests */
+void ac4_framing_parse(ac4_bits *b, ac4_framing *f);
 void ac4_unmix(double *m, double *s, int n, const ac4_stereo *st,
                const ac4_framing *fr);
 /* Packed -> per-window spectra. win[w] (w < num_windows) must hold at

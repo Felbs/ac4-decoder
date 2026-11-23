@@ -7,8 +7,9 @@
 The ASF spectral, scale factor and noise fill Huffman codebooks, the scale
 factor band offsets for the transform lengths that occur at 48 kHz with a
 1536-sample frame, the A-SPX and A-CPL Huffman codebooks, the 640-tap QMF
-prototype (ac4/tables/ac4_qwin.json) and the A-SPX noise table
-(ac4/tables/ac4_aspx_noise.json). The generated file is
+prototype (ac4/tables/ac4_qwin.json), the A-SPX noise table
+(ac4/tables/ac4_aspx_noise.json) and the spectral noise fill's
+RANDOM_NOISE_TABLE (ac4/tables/ac4_random_noise.json). The generated file is
 committed, so building the C library needs no Python.
 """
 import json
@@ -87,6 +88,15 @@ def main():
     out.append("const double AC4T_ASPX_NOISE[512][2] = {")
     for r, m in zip(nz["re"], nz["im"]):
         out.append("    { %r, %r }," % (float(r), float(m)))
+    out.append("};")
+    out.append("")
+    rn = json.load(open(os.path.join(TAB, "ac4_random_noise.json")))["values"]
+    if len(rn) != 256:
+        sys.exit("RANDOM_NOISE_TABLE size")
+    out.append("const float AC4T_RANDOM_NOISE[256] = {")
+    for i in range(0, 256, 8):
+        out.append("    " + ", ".join("%rf" % float(v) for v in rn[i:i + 8])
+                   + ",")
     out.append("};")
     out.append("")
     for L in LENGTHS:
