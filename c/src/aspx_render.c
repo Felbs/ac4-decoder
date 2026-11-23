@@ -505,8 +505,11 @@ static void adjust(const ac4_aspx_tab *t, int n_sb, int n_env, mat_t sig,
             maxg[k][e] = 0.0;
             boost[k][e] = 1.0;
         }
+    /* Pseudocode 96: limiter group i is subbands lim[i] .. lim[i+1] - 1
+       (V1.4.1; V1.3.1's loops stop at lim[i+1] - 2, leaving the top
+       subband of each group out) */
     for (i = 0; i < t->n_lim - 1; i++) {
-        int lo = t->lim[i] - t->sbx, hi = t->lim[i + 1] - 1 - t->sbx;
+        int lo = t->lim[i] - t->sbx, hi = t->lim[i + 1] - t->sbx;
         if (lo < 0)
             lo = 0;
         if (hi > n_sb)
@@ -539,7 +542,7 @@ static void adjust(const ac4_aspx_tab *t, int n_sb, int n_env, mat_t sig,
                                      noise_lev[k][e] * ratio);
         }
     for (i = 0; i < t->n_lim - 1; i++) {
-        int lo = t->lim[i] - t->sbx, hi = t->lim[i + 1] - 1 - t->sbx;
+        int lo = t->lim[i] - t->sbx, hi = t->lim[i + 1] - t->sbx;
         if (lo < 0)
             lo = 0;
         if (hi > n_sb)

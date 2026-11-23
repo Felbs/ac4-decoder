@@ -553,3 +553,67 @@ def test_aspx_noise_index_runs_on_across_envelopes(monkeypatch):
             idx = (n_sb * 16 * (f - 1) + n_sb * (ts - t0)
                    + np.arange(n_sb) + 1) % 512
             assert np.allclose(Qh[sbx:sbx + n_sb, ts], nt[idx]), (f, ts)
+
+
+def _limiter_reference(sig, est, noise, lim, sbx):
+    """TS 103 190-1 V1.4.1 Pseudocodes 94, 95 (no sines), 96-101, written
+    out loop by loop; limiter group sbg = subbands sbg_lim[sbg] - sbx ..
+    sbg_lim[sbg+1] - sbx - 1."""
+    EPS, EPS0 = 1.0, 1e-12
+    LIM_GAIN, MAX_SIG_GAIN, MAX_BOOST = 1.41254, 1e5, 1.584893192
+    n_sb, n_env = sig.shape
+    out_g = np.zeros_like(sig)
+    out_n = np.zeros_like(sig)
+    for a in range(n_env):
+        gain = [np.sqrt(sig[s, a] / ((EPS + est[s, a]) * (1 + noise[s, a])))
+                for s in range(n_sb)]
+        nlev = [np.sqrt(sig[s, a] / (1 + noise[s, a]) * noise[s, a])
+                for s in range(n_sb)]
+        maxg_g, boost_g = [], []
+        for g in range(len(lim) - 1):
+            r = range(lim[g] - sbx, lim[g + 1] - sbx)
+            maxg_g.append(np.sqrt(sum(sig[s, a] for s in r)
+                                  / (EPS0 + sum(est[s, a] for s in r)))
+                          * LIM_GAIN)
+        grp, g = [], 0
+        for s in range(n_sb):
+            if s == lim[g + 1] - sbx:
+                g += 1
+            grp.append(g)
+        maxg = [min(maxg_g[grp[s]], MAX_SIG_GAIN) for s in range(n_sb)]
+        nlim = [min(nlev[s], nlev[s] * maxg[s] / gain[s]) for s in range(n_sb)]
+        glim = [min(gain[s], maxg[s]) for s in range(n_sb)]
+        for g in range(len(lim) - 1):
+            r = range(lim[g] - sbx, lim[g + 1] - sbx)
+            nom = EPS0 + sum(sig[s, a] for s in r)
+            den = EPS0 + sum(est[s, a] * glim[s] ** 2 + nlim[s] ** 2
+                             for s in r)
+            boost_g.append(np.sqrt(nom / den))
+        for s in range(n_sb):
+            b = min(boost_g[grp[s]], MAX_BOOST)
+            out_g[s, a] = glim[s] * b
+            out_n[s, a] = nlim[s] * b
+    return out_g, out_n
+
+
+def test_aspx_limiter_groups_include_their_top_subband():
+    """Pseudocodes 96-101 (TS 103 190-1 V1.4.1): the limiter's sums run
+    over every subband of a group (V1.3.1's loops, and the decoders before
+    the fix, stop one short: the top subband of a group was in neither
+    sum, kept the MAX_SIG_GAIN ceiling and got no boost). Checked against
+    the pseudocode written out loop by loop, with a loud top subband in
+    the first group."""
+    from ac4 import aspx_envadj as E
+    sbx = 20
+    lim = [20, 23, 25, 29]
+    t = {"sbx": sbx}
+    n_sb = lim[-1] - sbx
+    rng = np.random.default_rng(5)
+    sig = rng.uniform(0.5, 2.0, (n_sb, 2))
+    sig[2, :] = 100.0                      # top subband of group 0
+    est = rng.uniform(0.5, 2.0, (n_sb, 2))
+    est[2, :] = 1.0
+    noise = rng.uniform(0.0, 0.3, (n_sb, 2))
+    g, nl = E.adjust(None, t, sig, est, lim, noise)
+    rg, rn = _limiter_reference(sig, est, noise, lim, sbx)
+    assert np.allclose(g, rg, rtol=1e-12) and np.allclose(nl, rn, rtol=1e-12)

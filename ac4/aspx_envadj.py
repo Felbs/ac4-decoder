@@ -218,11 +218,15 @@ def adjust(Qh, t, sig_sb, est, lim, noise_sb=None):
     sig_noise_fact = sig_sb / (1.0 + noise_sb)
     noise_lev = np.sqrt(sig_noise_fact * noise_sb)
 
-    # Pseudocode 96: per limiter subband group ceiling
+    # Pseudocode 96: per limiter subband group ceiling. Group i is the
+    # subbands lim[i] .. lim[i+1] - 1 (the mapping loop's sb == sbg_lim
+    # [sbg+1] - sbx rule); V1.3.1 sums to lim[i+1] - 2 only, which leaves
+    # the top subband of each group out of its sums and unlimited --
+    # corrected in V1.4.1 (2025), whose loops run to sbg_lim[sbg+1] - sbx
     maxg = np.zeros_like(gain)
     for i in range(len(lim) - 1):
         lo = max(lim[i] - t["sbx"], 0)
-        hi = min(lim[i + 1] - 1 - t["sbx"], n_sb)
+        hi = min(lim[i + 1] - t["sbx"], n_sb)
         if hi <= lo:
             continue
         nom = sig_sb[lo:hi].sum(axis=0)
@@ -239,7 +243,7 @@ def adjust(Qh, t, sig_sb, est, lim, noise_sb=None):
     boost = np.ones_like(gain)                   # Pseudocode 99 / 100
     for i in range(len(lim) - 1):
         lo = max(lim[i] - t["sbx"], 0)
-        hi = min(lim[i + 1] - 1 - t["sbx"], n_sb)
+        hi = min(lim[i + 1] - t["sbx"], n_sb)
         if hi <= lo:
             continue
         nom = EPSILON0 + sig_sb[lo:hi].sum(axis=0)
