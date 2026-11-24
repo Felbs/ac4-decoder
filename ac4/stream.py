@@ -656,7 +656,8 @@ class Ac4Stream:
                 psub, p.get("b_alternative", 0), p.get("b_pres_ndot", 0),
                 st.get("n_substreams", 0), self.drc_state,
                 sel.get("channel_mode", 1), self.frame_len or 1536)
-            return dict(dialnorm=md.get("dialnorm"), drc=md.get("drc"))
+            return dict(dialnorm=md.get("dialnorm"), drc=md.get("drc"),
+                        truepk=(md.get("loudness") or {}).get("truepk"))
         except Exception:                                      # noqa: BLE001
             return None
 

@@ -31,12 +31,13 @@ concealed by the stream (zeroed spectrum, A-SPX high band muted, state
 held); after synthesis an output guard mutes any frame far above a running
 reference. n_concealed / concealed.reasons / last_concealed report them.
 
-THE BURST GUARD is a heuristic carried over from the receiver, not part of
-the standard: on air, a few A-SPX frames have been seen to decode tens of
-times louder than any programme (a decode error in the envelope chain whose
-cause is not yet found). Its default limit is twice the receiver's fixed
-reference level for the element and is in decoder units; pass
-burst_limit=float("inf") to turn it off.
+THE BURST GUARD is a last-resort check, not part of the standard: an
+A-SPX frame whose output peaks above BURST_LIMIT (twice full scale, +6
+dBFS, in decoder units: no clean programme measured comes near it, the
+loudest public test stream peaks at 0.92 of full scale) plays its core
+band. (It used to be twice the receiver's fixed reference level for the
+element, REF_PEAK, which fired on clean frames of streams louder than
+that reference.) Pass burst_limit=float("inf") to turn it off.
 """
 from __future__ import annotations
 
@@ -62,6 +63,8 @@ HF_TAIL = 2                 # frames after a burst frame that also play core
 REF_PEAK = {"5_X": 9.0e5, "pair": 2.0e5, "mono": 2.0e5, "3_0": 9.0e5,
             "5_0": 9.0e5, "7_X": 9.0e5}
 ELEMENTS = tuple(REF_PEAK)
+# the burst guard's limit: twice full scale (loudness.FULL_SCALE)
+BURST_LIMIT = 2.0 * RB._FULL_SCALE
 
 
 def core_for_bursts(hf_a, hf_b, core_a, core_b, lead, limit, owed,
@@ -160,7 +163,7 @@ class Decoder:
                              + (" or 2" if "L" in full else ""))
         self.element = element
         self.chans = full if channels == len(full) else ("L", "R")
-        self.burst_limit = (2.0 * REF_PEAK[element] if burst_limit is None
+        self.burst_limit = (BURST_LIMIT if burst_limit is None
                             else float(burst_limit))
         self.fb_state = {k: None for k in self.chans}
         self.pairs = [(self.stream.PAIRS[g], gk) for g, gk in
@@ -321,16 +324,22 @@ class Decoder:
             status = (status + [None] * len(frames))[:len(frames)]
         bad = np.array([s is not None for s in status], dtype=bool)
         fired = np.zeros(len(frames), dtype=bool)
+        tpk = None
         if self.guard is not None:
-            fired = self.guard.process(y, force=bad)
+            meta = (list(self.stream.meta) + [None] * len(frames))[
+                :len(frames)]
+            tpk = [m.get("truepk") if m else None for m in meta]
+            fired = self.guard.process(y, force=bad, truepk=tpk)
         else:
             y[~np.isfinite(y)] = 0.0
         for s in status:
             if s is not None:
                 self.concealed.add(s)
         hf_flag = self._aspx_flag[:len(frames)] & ~bad & ~fired
+        tpf = (self.guard.last_truepk if self.guard is not None
+               else np.zeros(len(frames), dtype=bool))
         for f in np.flatnonzero(fired & ~bad):
-            self.concealed.add("guard.level")
+            self.concealed.add("guard.truepk" if tpf[f] else "guard.level")
         for f in np.flatnonzero(hf_flag):
             self.concealed.add("aspx.level")
         fired = fired | hf_flag

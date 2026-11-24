@@ -15,7 +15,7 @@ static const double MODE_RANGE[4][2] = {
     { -31, -27 }, { -26, -17 }, { -16, 0 }, { -16, 0 } };
 
 /* ------------------------------------------------------------ parse */
-static void further_loudness_info(ac4_bits *b)
+static void further_loudness_info(ac4_bits *b, ac4_meta *m)
 {
     /* b_presentation_ldn = 1, sus_ver = 1 */
     uint32_t v = ac4_u(b, 2), t, n;
@@ -34,9 +34,15 @@ static void further_loudness_info(ac4_bits *b)
         ac4_u(b, 11);
         ac4_u(b, 3);
     }
+    /* loudstrm3s, max_loudstrm3s, truepk, max_truepk */
     for (i = 0; i < 4; i++)
-        if (ac4_bit(b))
-            ac4_u(b, 11);
+        if (ac4_bit(b)) {
+            uint32_t x = ac4_u(b, 11);
+            if (i == 2) {
+                m->has_truepk = 1;
+                m->truepk = ((double)x - 1024.0) / 10.0;
+            }
+        }
     if (ac4_bit(b)) {                   /* b_prgmbndy */
         n = 0;
         while (ac4_bit(b) == 0)
@@ -303,8 +309,8 @@ int ac4_pres_metadata(const uint8_t *sub, size_t len, int b_alternative,
     m.dialnorm = -(double)ac4_u(&b, 7) / 4.0;
     m.valid = 1;
     if (ac4_bit(&b))
-        further_loudness_info(&b);
-    size = ac4_u(&b, 5);               /* drc_metadata_size, not needed */
+        further_loudness_info(&b, &m);
+    size = ac4_u(&b, 5);               /* drc_metadata_size */
     if (ac4_bit(&b))
         size += (size_t)ac4_vb(&b, 3) << 5;
     (void)size;

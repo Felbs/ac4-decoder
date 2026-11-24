@@ -48,6 +48,7 @@ enum {
     AC4E_TRANSF_LEN,       /* asf.transf_length (Table 103: not defined) */
     AC4E_CHEL_MATSEL,      /* asf.chel_matsel (reserved value) */
     AC4E_ADD_CH,           /* asf.add_ch (7_X: framings differ) */
+    AC4E_GUARD_TRUEPK,     /* guard.truepk (output guard, truepk rule) */
     AC4E_COUNT
 };
 const char *ac4_reason_name(int code);
@@ -819,6 +820,8 @@ typedef struct {
 typedef struct {
     int valid;                  /* dialnorm parsed */
     double dialnorm;            /* dBFS */
+    int has_truepk;             /* further_loudness_info sent truepk */
+    double truepk;              /* dBTP (TS 103 190-1 4.3.12.3.17) */
     int has_drc;
     ac4_drc_config cfg;         /* in force for this frame */
     int reset;                  /* drc_reset_flag, -1 when not sent */

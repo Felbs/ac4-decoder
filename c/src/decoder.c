@@ -66,6 +66,10 @@ void ac4_spectra_init(void);
 #define G_NEAR 3
 #define G_NEAR_RATIO 2.0
 #define G_RAMP 256
+#define G_TP_WIN 3            /* truepk window: f - 3 .. f + 3 */
+#define G_TP_MARGIN_DB 20.0
+#define G_TP_NEAR_DB 12.0
+#define G_TP_STEP 0.25
 
 enum { CH_L, CH_R, CH_C, CH_LFE, CH_LS, CH_RS, CH_X1, CH_X2 };
 #define NCH AC4_NCH
@@ -85,7 +89,7 @@ static const char *REASONS[AC4E_COUNT] = {
     "aspx.parse", "aspx.num_env", "aspx.borders", "acpl.parse",
     "audio_size.late", "guard.level", "aspx.level", "toc.presentation",
     "toc.unsupported_rate", "asf.transf_length", "asf.chel_matsel",
-    "asf.add_ch"
+    "asf.add_ch", "guard.truepk"
 };
 
 const char *ac4_reason_name(int code)
@@ -142,6 +146,7 @@ typedef struct {
     int code, unknown, seq, iframe, seq_jump;
     int forced;                 /* concealed upstream */
     int aspx_flag;              /* aspx.level */
+    int tp_fired;               /* guard.truepk */
     double pk;                  /* peak over all output channels */
     int ok;
     int n;                      /* samples (the frame length) */
@@ -155,8 +160,11 @@ typedef struct {
     double last[NCH];
     int has_last, muted;
     int forced_hist[G_NEAR];    /* forced flags of the last frames judged */
+    double tp_hist[G_TP_WIN];   /* truepk of the last frames judged */
+    int tp_has[G_TP_WIN], n_tp;
+    double tp_off;              /* decoded peak re truepk, dB (tracked) */
     int n_hist;
-    long n_fired, n_sustained;
+    long n_fired, n_sustained, n_truepk;
 } guard_t;
 
 struct ac4dec {
@@ -1490,7 +1498,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         r->af[2].kind = AC4_GRP_NONE;
     /* loudness / DRC metadata of the presentation substream (stream.py
        _pres_metadata) */
-    if (d->cfg.loudness) {
+    {
         int pi = choose_pres(&d->cfg, &t);
         const ac4_toc_sub *s = ac4_toc_audio_substream(&t, pi);
         const ac4_toc_pres *pp = pi >= 0 && pi < t.n_pres ? &t.pres[pi]
@@ -1635,7 +1643,7 @@ static void np_frame_stats(const double *x, int n, double *rms,
 static int bursts(ac4dec *d, int p, double *y[2], double *dc[2],
                   int *bad_out)
 {
-    double limit = 2.0 * ac4dec_ref_peak((ac4dec_element)d->element);
+    double limit = 2.0 * AC4_FULL_SCALE;   /* decoder.BURST_LIMIT */
     double floor_ = HF_MIN_FRAC * ac4dec_ref_peak((ac4dec_element)d->element);
     double pk = 0.0;
     int c, over = 0, hot, bad = 0;
@@ -1903,6 +1911,13 @@ static int sustained(const ac4dec *d, int f, double ref)
     return n >= G_S;
 }
 
+/* FULL_SCALE x 10^((T + min(offset, 0) + margin) / 20) */
+static double tp_limit(const guard_t *g, double t, double margin)
+{
+    double off = g->tp_off < 0.0 ? g->tp_off : 0.0;
+    return AC4_FULL_SCALE * pow(10.0, (t + off + margin) / 20.0);
+}
+
 static int cmp_desc(const void *a, const void *b)
 {
     double x = *(const double *)a, y = *(const double *)b;
@@ -1913,8 +1928,8 @@ static int cmp_desc(const void *a, const void *b)
 static int guard_one(ac4dec *d, outf_t *o)
 {
     guard_t *g = &d->guard;
-    double ref, lv, down;
-    int near = 0, loud, i, c;
+    double ref, lv, down, tmax = 0.0;
+    int near = 0, loud, i, c, have = 0;
     if (!g->seeded) {
         double w[G_WARM];
         int n = 0;
@@ -1945,9 +1960,25 @@ static int guard_one(ac4dec *d, outf_t *o)
         if (a->forced)
             near = 1;
     }
+    /* the true peak the stream sent for frames f - 3 .. f + 3
+       (robust.OutputGuard.truepk_limits) */
+    for (i = 0; i < g->n_tp; i++)
+        if (g->tp_has[i] && (!have || g->tp_hist[i] > tmax)) {
+            tmax = g->tp_hist[i];
+            have = 1;
+        }
+    for (i = 0; i <= G_TP_WIN && i < d->ring_n; i++) {
+        const outf_t *a = &d->ring[(int)((d->ring_first + i) % d->ring_cap)];
+        if (a->meta.valid && a->meta.has_truepk
+            && (!have || a->meta.truepk > tmax)) {
+            tmax = a->meta.truepk;
+            have = 1;
+        }
+    }
     if (near) {
         double m = g->ref > g->floor ? g->ref : g->floor;
-        loud = o->pk > G_NEAR_RATIO * m;
+        loud = o->pk > G_NEAR_RATIO * m
+               && (!have || o->pk > tp_limit(g, tmax, G_TP_NEAR_DB));
     } else {
         loud = o->pk > G_RATIO * ref;
     }
@@ -1955,6 +1986,20 @@ static int guard_one(ac4dec *d, outf_t *o)
         loud = 0;
         g->n_sustained++;
     }
+    o->tp_fired = 0;
+    if (!loud && have && o->pk > tp_limit(g, tmax, G_TP_MARGIN_DB)) {
+        loud = 1;
+        o->tp_fired = 1;
+        g->n_truepk++;
+    }
+    if (g->n_tp < G_TP_WIN) {
+        g->n_tp++;
+    } else {
+        memmove(g->tp_hist, g->tp_hist + 1, sizeof(double) * (G_TP_WIN - 1));
+        memmove(g->tp_has, g->tp_has + 1, sizeof(int) * (G_TP_WIN - 1));
+    }
+    g->tp_has[g->n_tp - 1] = o->meta.valid && o->meta.has_truepk;
+    g->tp_hist[g->n_tp - 1] = o->meta.truepk;
     if (loud) {
         g->n_fired++;
         for (c = 0; c < d->n_ch; c++)
@@ -1977,6 +2022,14 @@ static int guard_one(ac4dec *d, outf_t *o)
         }
         if (o->ok && !near)
             rise = o->pk < G_UP * g->ref ? o->pk : G_UP * g->ref;
+        if (o->ok && !near && have && o->pk > 0.0) {
+            /* the stream's level against its truepk: a median tracker */
+            double r = 20.0 * log10(o->pk / AC4_FULL_SCALE) - tmax;
+            if (r > g->tp_off)
+                g->tp_off += G_TP_STEP;
+            else if (r < g->tp_off)
+                g->tp_off -= G_TP_STEP;
+        }
         nr = g->ref * G_RELEASE;
         if (rise > nr)
             nr = rise;
@@ -2022,7 +2075,7 @@ static void emit(ac4dec *d, ac4dec_frame *out)
     o = &d->cur;
     code = o->code;
     if (code == AC4E_NONE && fired)
-        code = AC4E_GUARD_LEVEL;
+        code = o->tp_fired ? AC4E_GUARD_TRUEPK : AC4E_GUARD_LEVEL;
     else if (code == AC4E_NONE && o->aspx_flag)
         code = AC4E_ASPX_LEVEL;
     memset(out, 0, sizeof(*out));
@@ -2042,7 +2095,7 @@ static void emit(ac4dec *d, ac4dec_frame *out)
         out->reason = ac4_reason_name(code);
         d->n_concealed++;
         d->reasons[code > 0 && code < AC4E_COUNT ? code : AC4E_INTERNAL]++;
-        if (code == AC4E_GUARD_LEVEL)
+        if (code == AC4E_GUARD_LEVEL || code == AC4E_GUARD_TRUEPK)
             d->n_guard++;
         else if (code == AC4E_ASPX_LEVEL)
             d->n_aspx_level++;

@@ -86,12 +86,18 @@ both are tuned so that they do not fire on any clean material measured
                   core band; Decoder / core_for_bursts)
   guard.level     the frame's peak is far above a running reference of
                   accepted frames (muted with short ramps; OutputGuard)
+  guard.truepk    the frame's peak is far above the true peak the stream
+                  sends for it (TS 103 190-1 4.3.12.3.17; OutputGuard)
 """
 from __future__ import annotations
 
 import collections
+import math
 
 import numpy as np
+
+# loudness.FULL_SCALE (IMDCT_K * 2^14.5): 0 dBFS in decoder units
+_FULL_SCALE = math.sqrt(2.0 * 1536.0) * 2.0 ** 14.5
 
 # 5.1.3.1 NOTE 1: "The maximum allowed value of the elements of quant_spec
 # is 8 191."  ext_decode returns 2**(N+4) + val with val < 2**(N+4), so
@@ -364,6 +370,32 @@ class OutputGuard:
     no concealed frames, so this cannot touch it; on air it costs at most
     a frame or two next to frames that are lost anyway.
 
+    TRUE PEAK (TS 103 190-1 4.3.12.3.17). Most streams send, in the
+    presentation substream's further_loudness_info, `truepk`: the true
+    peak of the programme since the value before (dBTP; in 67 to 98 % of
+    the frames of the captures and the public test streams). That is the
+    stream's own statement of how loud its programme is, frame by frame,
+    and it does not travel in the audio substream that damage usually
+    hits. With T the largest truepk sent in frames f - TP_WIN .. f +
+    TP_WIN (the encoder's frame of a peak and the decoder's differ by a
+    frame or two) and the stream's offset O (below):
+      * a frame whose peak is above FULL_SCALE x 10^((T + O + TP_MARGIN_DB)
+        / 20) is muted (reason guard.truepk), sustained or not;
+      * a frame judged by the near-damage rule is muted only when it is
+        also above the same limit with TP_NEAR_DB: programme within what
+        the stream says it has is not taken for damage next to a
+        concealed frame.
+    O is min(0, the median of 20 log10(peak / FULL_SCALE) - T over the
+    accepted frames), tracked in TP_STEP dB steps: a stream that decodes
+    quieter than its metadata (broadcaster A's stereo, 17 dB) gets limits
+    that much tighter; one that decodes louder keeps O = 0. MEASURED
+    (2026-11-23, every capture and every public kit stream with truepk,
+    16,896 frames): the frame peak is at most 11.7 dB above T (per stream
+    median -5.8 to +0.6 dB, A's stereo -18.7; at most 11.2 dB above the
+    stream's median), so TP_MARGIN_DB 20 leaves 8.3 dB; no clean frame
+    fires. Frames without a truepk in their window are judged
+    by the rules above alone.
+
     A frame that fires is muted: a short linear ramp from the last output
     sample down to zero at its start, zeros, and the next frame that does
     not fire ramps back in over RAMP samples. Frames that fire, and frames
@@ -389,6 +421,7 @@ class OutputGuard:
     L, S, SPREAD = 6, 4, 4.0
     NEAR, NEAR_RATIO = 3, 2.0
     RAMP = 256
+    TP_WIN, TP_MARGIN_DB, TP_NEAR_DB, TP_STEP = 3, 20.0, 12.0, 0.25
 
     def __init__(self, start_level, frame=1536):
         self.frame = frame
@@ -399,6 +432,31 @@ class OutputGuard:
         self.muted = False        # was the previous frame muted?
         self.n_fired = 0
         self.n_sustained = 0
+        self.n_truepk = 0
+        self.tp_hist = []         # truepk of the last TP_WIN frames judged
+        self.tp_off = 0.0         # decoded peak re truepk, dB (tracked)
+        self.last_truepk = np.zeros(0, dtype=bool)
+
+    def truepk_window(self, truepk, n):
+        """Per frame T, the largest truepk (dBTP, TS 103 190-1 4.3.12.3.17)
+        sent in frames f - TP_WIN .. f + TP_WIN (None where none was); the
+        frames before this pass are carried."""
+        tp = [None] * n if truepk is None else \
+            (list(truepk) + [None] * n)[:n]
+        h = len(self.tp_hist)
+        allv = self.tp_hist + tp
+        out = []
+        for f in range(n):
+            w = [v for v in allv[max(0, h + f - self.TP_WIN):
+                                 h + f + self.TP_WIN + 1] if v is not None]
+            out.append(max(w) if w else None)
+        self.tp_hist = allv[-self.TP_WIN:]
+        return out
+
+    def tp_limit(self, t, margin):
+        """FULL_SCALE x 10^((T + min(offset, 0) + margin) / 20)."""
+        return _FULL_SCALE * 10.0 ** ((t + min(self.tp_off, 0.0) + margin)
+                                      / 20.0)
 
     def level(self):
         return max(self.ref or 0.0, self.init, self.floor)
@@ -413,16 +471,20 @@ class OutputGuard:
         thr = max(ref, pk[f] / self.SPREAD)
         return int(((pk[ahead] > thr) & ok[ahead]).sum()) >= self.S
 
-    def process(self, y, force=None):
+    def process(self, y, force=None, truepk=None):
         """y: (n_frames * frame, ch), modified in place where frames fire.
         force: optional bool per frame, frames concealed upstream (they do
-        not move the reference).
-        -> bool array, True where this guard muted a frame."""
+        not move the reference). truepk: optional per frame the truepk
+        (dBTP) of its presentation substream, None where not sent.
+        -> bool array, True where this guard muted a frame
+        (last_truepk: those the true-peak rule muted)."""
         F = self.frame
         n = len(y) // F
         fired = np.zeros(n, dtype=bool)
+        self.last_truepk = np.zeros(n, dtype=bool)
         if n == 0:
             return fired
+        tw = self.truepk_window(truepk, n)
         with np.errstate(invalid="ignore"):
             pk = np.abs(y[:n * F]).reshape(n, F, -1).max(axis=(1, 2))
         pk = np.where(np.isfinite(pk), pk, np.inf)
@@ -447,14 +509,25 @@ class OutputGuard:
             # into the second output frame after it)
             near = bool(forced[max(0, f - self.NEAR):f + self.NEAR + 1].any()
                         or spark[max(0, f - self.NEAR):f].any())
+            t = tw[f]
             if near:
                 loud = pk[f] > self.NEAR_RATIO * max(self.ref, self.floor)
+                if loud and t is not None:
+                    # programme within what the stream says it has is
+                    # not damage
+                    loud = pk[f] > self.tp_limit(t, self.TP_NEAR_DB)
             else:
                 loud = pk[f] > self.RATIO * ref
             if loud and ok[f] and not near and \
                     self._sustained(pk, ok, f, ref):
                 loud = False
                 self.n_sustained += 1
+            if not loud and t is not None and \
+                    pk[f] > self.tp_limit(t, self.TP_MARGIN_DB):
+                # far above the peak the stream says its programme has
+                loud = True
+                self.last_truepk[f] = True
+                self.n_truepk += 1
             if loud:
                 fired[f] = True
                 spark[f] = not near
@@ -472,6 +545,14 @@ class OutputGuard:
                     self.muted = False
                 rise = (float(min(pk[f], self.UP * self.ref))
                         if ok[f] and not near else 0.0)
+                if ok[f] and not near and t is not None and pk[f] > 0:
+                    # the stream's level against its truepk: a median
+                    # tracker in TP_STEP dB steps
+                    r = 20.0 * math.log10(float(pk[f]) / _FULL_SCALE) - t
+                    if r > self.tp_off:
+                        self.tp_off += self.TP_STEP
+                    elif r < self.tp_off:
+                        self.tp_off -= self.TP_STEP
                 self.ref = max(self.ref * self.RELEASE, rise, self.floor)
             self.last = np.array(seg[-1], dtype=float)
         return fired

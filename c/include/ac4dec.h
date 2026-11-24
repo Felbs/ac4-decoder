@@ -99,8 +99,9 @@ typedef enum {
     AC4DEC_CONCEALED = 1,  /* broke a bitstream rule (spectrum zeroed, the
                               previous frame's overlap fades out, A-SPX
                               high band muted), or a level check fired
-                              (reason "guard.level": muted with 256-sample
-                              ramps; "aspx.level": plays its core band) */
+                              (reason "guard.level" or "guard.truepk":
+                              muted with 256-sample ramps; "aspx.level":
+                              plays its core band) */
     AC4DEC_BAD = 2         /* could not be decoded and nothing to conceal
                               from (element not known yet): silence */
 } ac4dec_status;
@@ -251,7 +252,7 @@ typedef struct {
                               Python's Decoder.n_concealed) */
     long n_bad;            /* of those, by a bitstream rule or element
                               unknown (the Python's Decoder.n_bad) */
-    long n_guard;          /* of those, guard.level */
+    long n_guard;          /* of those, guard.level and guard.truepk */
     long n_aspx_level;     /* of those, aspx.level */
     long n_late;           /* of those, audio_size.late */
     long n_burst;          /* A-SPX frames that played their core band
