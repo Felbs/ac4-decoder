@@ -147,6 +147,8 @@ def compare(path, tag, presentation=None):
     t0 = time.time()
     lvl = [] if LOUDNESS else ["--legacy-level"]
     lvl += ["--de-level", str(DE_LEVEL)]
+    # both CLIs apply the legacy level rule pass by pass: the same passes
+    lvl += ["--max-pass", str(MAX_PASS)]
     if LAYOUT:
         lvl += ["--layout", LAYOUT, "--stereo-dmx", STEREO_DMX]
     if presentation is not None:
