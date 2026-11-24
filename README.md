@@ -40,15 +40,15 @@ this repository.
 | Mono, 3.0, 5.0, 7.x | single_channel_element (mono: C), 3_0_channel_element (L R C, both coding configs), 5_X without LFE (5.0: L R C Ls Rs), 7_X_channel_element in codec modes SIMPLE and ASPX for all six 7.0 / 7.1 channel modes of Table 88 (L R C [LFE] Ls Rs plus Lb Rb, Lw Rw or Tfl Tfr; Tables 182, 183 with b_use_sap_add_ch; A-SPX on the four blocks of Table 213): on synthetic streams only (unverified on real streams). 7_X ASPX_ACPL_1 / _2 are concealed (`element.parse`) |
 | 7.1.4 / 5.1.4 (`immersive_channel_element`, TS 103 190-2) | immersive_codec_mode ASPX_ACPL_2 (the public 5.1.4 test streams): the 7CH_STATIC core, A-SPX on its four blocks, the four one-channel A-CPL modules to Ls Lb Rs Rb Tfl Tbl Tfr Tbr, L R C at twice their A-SPX output; the channels the substream signals absent are left out (the kit's back pair: 5.1.4). Every core_5ch_grouping and b_use_sap_add_ch on synthetic streams only. SCPL, ASPX_SCPL, ASPX_ACPL_1, ASPX_AJCC (A-JCC) and 9.X.4 are concealed (`element.parse`). See [Phase C](#phase-c-immersive-and-objects) |
 | "IMS" (the kit's immersive-stereo streams) | presentation_version 2 with a 7.1 channel mode: the substream is a channel_pair_element (see Interpretations); its stereo core is decoded, both kit streams without a concealed frame, and rendered as any stereo programme (`--layout`). What makes it "immersive" (it carries EMDF payload 18, an ID registered outside ETSI) is not in the standard at hand (Phase C) |
-| Objects (A-JOC substreams) | a presentation with no channel-coded substream decodes its A-JOC substream in core decoding mode: the downmix (a var_channel_element of 1 - 7 signals, SIMPLE or ASPX, or a static 5.X element) with the downmix objects' OAMD, rendered by a plain panner that is not Dolby's (`ac4/objrender.py`). OAMD and the A-JOC side information are parsed in full; the A-JOC upmix (full decoding) is not built. On synthetic streams only (no object stream at hand) |
-| Output layouts | `--layout 2.0 / 5.1 / 5.1.2 / 5.1.4 / 7.1 / 7.1.2 / 7.1.4`: the channel renderer of TS 103 190-2 5.10.2 with the stream's custom downmix coefficients (custom_dmx_data, parsed) or their defaults; stereo as the LoRo downmix of TS 103 190-1 6.2.17.4 |
+| Objects (A-JOC substreams) | a presentation with no channel-coded substream decodes its A-JOC substream in full decoding mode (phase D): the downmix (a var_channel_element of 1 - 7 signals, SIMPLE or ASPX, or a static 5.X element) is upmixed by the A-JOC tool (TS 103 190-2 5.7) to up to 64 objects, which are rendered from their OAMD (with its block updates and ramps, 5.9) by a plain panner that is not Dolby's (`ac4/objrender.py`). `--core-decoding` (C `ajoc_core`) renders the downmix objects instead (phase C). On synthetic streams only (no object stream at hand). See [Phase D](#phase-d-objects-downmixes-dialogue-enhancement) |
+| Output layouts | `--layout 2.0 / 5.1 / 5.1.2 / 5.1.4 / 7.1 / 7.1.2 / 7.1.4`: the channel renderer of TS 103 190-2 5.10.2 with the stream's custom downmix coefficients (custom_dmx_data, parsed) or their defaults; stereo as the LoRo downmix of TS 103 190-1 6.2.17.4, or LtRt / its Pro Logic II form, or the stream's preferred one (`--stereo-dmx loro|ltrt|pl2|auto`, phase D); the stream's downmix loudness correction (loud_corr) applied to downmixes (phase D) |
 | Core (ASF/MDCT) | Huffman spectral data, scale factors, long and short frames with block switching, KBD windows, stereo processing (sap_mode 1 and 2: M/S; sap_mode 3: full SAP with prediction coefficients, see below), spectral noise fill (clause 5.1.4, the standard's own noise generator; no capture here signals it), LFE |
 | A-SPX | parsed and rendered on the L/R and Ls/Rs pairs and the centre: 64-band complex QMF, envelope decoding (1.5 and 3 dB steps), HF generation with TNA and pre-flattening, envelope adjustment with the limiter, noise, additional harmonics (sinusoids), FIC/TIC (interleaved waveform coding), joint-balance rendering; companding (5.7.5) of the core |
 | A-CPL | ASPX_ACPL_3 (clause 5.7.7.6.2): parameter decoding and dequantisation, interpolation, the three decorrelators with the transient ducker, the 5-channel upmix in the QMF domain. ASPX_ACPL_1/2 (5.7.7.6.1, one-channel A-CPL): in a channel pair, and ASPX_ACPL_2 in 5_X |
 | Output | 48 kHz (44,1 kHz) via the resampler of TS 103 190-1 Table 83 for the stream's frame rate (1001/960 at 29.97 fps; without it audio runs 4.27 % fast). Every channel is 577 samples (12 ms) after the MDCT core: the A-SPX channels through the QMF bank, the others (LFE, a pair without A-SPX) through a delay line of the same length, so all channels are time-aligned. Channel order checked on a public 2.0 channel-identification signal against its AAC version (envelope correlation L-L 0.947, R-R 0.949; crossed 0.90, 0.89) |
 | Loudness, DRC | applied (`ac4/loudness.py`, C `src/loudness.c`): dialnorm normalised to a target level (default -24 dB, `--target-level`), the stream's DRC decoder mode for that level (5.7.9.2): E-AC-3 profiles, transmitted curves, transmitted gains (`--drc auto|off|N`). The CLIs write this; `--legacy-level` / `--ref-peak` keep the old fixed-reference rule |
 | Metadata | parsed: further loudness information; dialogue enhancement config and parameters; EMDF payload ids (`tools/survey.py` reports them) |
-| Dialogue enhancement | de_method 0 (parametric, channel independent, with the M/S form; TS 103 190-1 5.7.8.7) applied in the QMF domain at a user gain (`--de-level dB`, `Decoder(de_level=)`, C `de_level`; default 0: off, output unchanged), capped by the stream's maximum. Both broadcasters and the kit send method 0 (centre, or L/R). Methods 1 - 3 (cross-channel, hybrid) are parsed, not applied |
+| Dialogue enhancement | de_method 0 (parametric, channel independent, with the M/S form; TS 103 190-1 5.7.8.7) applied in the QMF domain at a user gain (`--de-level dB`, `Decoder(de_level=)`, C `de_level`; default 0: off, output unchanged), capped by the stream's maximum. Both broadcasters and the kit send method 0 (centre, or L/R). Phase D: method 1 (cross-channel, 5.7.8.8) applied (synthetic streams only); methods 2 and 3 (waveform-parametric hybrid) on their parametric data alone, as 5.7.8.1 allows (synthetic streams only: the kit's immersive-stereo streams signal method 2, but their substream metadata does not parse to its size here, so no DE reaches them, as before) |
 | I-frames | decoding can start mid-stream; A-SPX starts at the first I-frame |
 | Damaged input | never raises, never changes the output length; damaged frames are concealed (see below) |
 
@@ -364,6 +364,154 @@ broadcaster B's upmixed 5.1 2.8x / 23.7x, its stereo 5.3x / 53.9x
 (phase B3's C: 18.5x, 50.0x, 24.1x, 56.1x: the same within the spread
 of a machine shared with other jobs); the 5.1.4 identification stream
 0.6x / 9.1x.
+
+### Phase D: objects, downmixes, dialogue enhancement
+
+Everything new in this phase is in both decoders (Python first, the C
+held to it). **No stream at hand uses A-JOC, cross-channel dialogue
+enhancement or a multi-substream presentation**: those parts are checked
+on synthetic streams written bit by bit from the syntax
+(`tests/test_phase_d.py`), against the standard's pseudocode written out
+in the tests, and C against Python; they are unverified on real streams.
+
+**A-JOC full decoding** (TS 103 190-2 5.7, `ac4/ajoc.py` Engine,
+`decoder.AjocFull`, C `src/ajoc.c`). The downmix signals' A-SPX output in
+the QMF domain, in the A-JOC input order of Pseudocode 14a (the last two
+or three signals of the var_channel_element first), is upmixed by
+Pseudocode 18: per QMF slot and subband the dry matrix on the downmix
+and the wet matrix on up to seven decorrelators (the A-CPL decorrelators
+of TS 103 190-1 5.7.7.4 with their ducker, cyclically 0, 2, 1, 0, 2, 1,
+0), whose input is the downmix through the decorrelation input matrix
+|Csub2^T| x Csub1 (5.7.3.6.2). The matrices are Huffman decoded,
+differentially decoded (Pseudocode 16, the last data point held per
+object), dequantised (Tables 29 - 32), mapped to QMF subbands (Table 28)
+and interpolated by linear ramps (Pseudocode 17). The upmix objects are
+rendered in the QMF domain with their own OAMD (the second OAMD portion,
+4.8.3.4.2), then the layout's channels are synthesised; the LFE object
+is the downmix LFE at the upmix LFE object's gain. Full decoding is the
+default for an A-JOC substream (`--core-decoding` / C `ajoc_core`: the
+phase C rendering of the downmix objects).
+
+Checks (synthetic): the engine equals Pseudocode 18 written out scalar
+by scalar (four configurations, two data points with ramps, 0 - 7
+decorrelators: within 1e-12); one downmix signal upmixed by dry gains to
+objects at L, R and C gives each loudspeaker exactly that gain times the
+downmix as core decoding renders it (1e-9); two objects with dry 0.5 and
+wet +-2 sum to the downmix and their difference is decorrelated from it
+(|corr| < 0.5); random A-JOC data (3 decorrelators, 15 bands, coarse and
+fine, 2 / 5 / 7 signals, SIMPLE and ASPX, static 5.1) closes on
+audio_size in every frame; C against Python within 1e-9 (in fact
+~1e-14) on six configurations with OAMD timing, gains and ramps.
+
+**OAMD timing** (5.9): each block update takes effect at its update PCM
+sample (sample_offset + 32 x block_offset_factor) and is reached by a
+linear crossfade of the rendering gains over its ramp_duration (Tables
+94, 95): per sample in core decoding (`objrender.SampleRamp`), per QMF
+slot (64 samples, the ramp rounded up) in full decoding.
+
+**Downmixes.** `--stereo-dmx` (C `stereo_dmx`) picks the row of TS
+103 190-1 Table 218: LoRo (the default, as before), LtRt
+(preferred_dmx_method 2), its Pro Logic II form (method 3: surrounds at
++1.8 / -3.2 dB), or `auto`, the stream's preferred_dmx_method (the kit's
+5.1 and 5.1.4 streams prefer 3; the broadcasters' say 0, not indicated).
+LtRt gains fall back to the LoRo ones without b_ltrt_mixinfo
+(4.3.12.2.12). The presentation's loud_corr (TS 103 190-2 6.2.9.1) is
+parsed after custom_dmx_data and applied to a downmix (4.8.5.3): the
+correction of the output configuration (loro / ltrt for 2.0), held from
+the last sent, 0 dB before; only when the layout drops a channel the
+decoder gives out. On every capture and kit stream checked (5.1 of
+both broadcasters, the kit's 2.0, 5.1 and 5.1.4) loud_corr parses to
+within 0 - 7 bits of the presentation substream's end in every frame
+(the byte alignment that follows it) and sends no correction, so their
+output is unchanged. This needed pres_ch_mode_core by Pseudocode 26
+(Table 71: 5 / 6 for the 5.X.2 cores of channel modes 11 - 14, -1
+otherwise; it was taken equal to pres_ch_mode, which reads one more bit
+on 5.1.4 streams).
+
+**Dialogue enhancement.** Cross-channel enhancement (de_method 1,
+5.7.8.8): Y = (I + g r p^T) m over the processed channels, p from Table
+210, the rendering vector r from the de_mix_coef indices (Table 172, the
+last coefficient energy preserving). The hybrid methods 2 and 3 run on
+their parametric data alone (5.7.8.1 allows it for low-complexity
+decoders): the standards at hand do not say where the waveform-coded
+dialogue d_c is carried. Checked against 5.7.8.8 written out, and C
+against Python on SIMPLE 5_X streams with methods 1 - 3 at 9 dB. The
+kit's immersive-stereo streams, the only real streams that signal method
+2, are unchanged with DE on (bit-identical to phase C at 9 dB): their
+substream metadata() does not close on its tools size in this decoder
+(the 7.1 channel mode they signal for a channel pair), so their DE data
+is dropped; open.
+
+**Mixing.** A substream's mixing matrix that changes between frames
+crossfades over the frame: (1 - w) old + w new, w = (n + 1/2) / N.
+
+**Damaged input.** `make test` and `make asan` now also damage two
+synthetic A-JOC streams (`c/tests/data/*.syn`, written by
+`tests/gen_fuzz_streams.py`; random spectra, no captured audio): full
+decoding over a 5-signal ASPX downmix and over a static 5.1 downmix,
+11 damage kinds each.
+
+Interpretations (phase D):
+
+* A-JOC ramp: a data point at slot s with ajoc_ramp_len L keeps the
+  slot-s value and reaches its own at slot s + L, linearly (Pseudocode
+  17 as printed increments while curr_ramp_len <= target_ramp_len,
+  L + 1 steps, overshooting); the first data point of a stream is taken
+  at once; a frame's data points count from the A-CPL frame start (QMF
+  slot nts f + ts_offset), as A-SPX and A-CPL do here.
+* The decorrelation input matrix is computed per QMF subband
+  (5.7.3.6.2's formula), not per parameter band as Pseudocode 18 sums it
+  (objects may have different ajoc_num_bands); it is interpolated like
+  the dry and wet matrices. A disabled decorrelator (ajoc_decorr_enable
+  0) contributes nothing.
+* A time-differential A-JOC value outside its table is clamped into it.
+* The downmix objects of core decoding, and the downmix inputs of the
+  A-JOC tool, follow Pseudocode 14a's order (phase C took the bitstream
+  order; for 4 - 7 downmix signals core decoding renders differently
+  now, on synthetic streams only).
+* A frame without oamd_timing_data keeps the last one sent for its OAMD
+  portion; b_derive_timing_from_dmx takes the downmix's.
+* A frame the A-SPX checks replace by its core plays silence in full
+  decoding (the upmix needs the QMF-domain downmix).
+* Cross-channel DE on channels that are not decoded in one place (L / R
+  and C in separate A-SPX pairs, e.g. a 5_X element in codec mode ASPX)
+  is not applied (identity); without a de_mix_coef ever sent, a two- or
+  three-channel cross-channel frame is the identity.
+
+Not done in this phase (see [What it does not do yet](#what-it-does-not-do-yet)):
+object substreams without A-JOC and ISF; immersive_codec_mode
+ASPX_ACPL_1, S-CPL / ASPX_SCPL, A-JCC (ASPX_AJCC), 9.X.4 and the
+22_2_channel_element; 7_X in ASPX_ACPL_1 / _2; the SSF speech frontend;
+the v0 associated substream's extended_metadata gains and
+dialog_max_gain; presentation_config 7 of bitstream_version 1; dialogue
+enhancement of objects; IMS beyond its stereo core (EMDF payload 18 is
+not defined in the standards at hand: TS 103 190-2 says only that a
+presentation of version 2 is decoded as versions 1 and 2 are, and the
+payload's ID is registered outside ETSI, so there is nothing specified
+to build).
+
+**Phase D figures** (2026-11-24): every capture and public kit stream
+(32 inputs) decodes bit-identically to phase C with the C CLI (decoder
+scale, statuses, loudness-normalised WAVs and `--layout 2.0` WAVs: 160
+of 160 files identical). Against the Python (`compare.py`, 26 capture
+and kit files, one pass): 1.31e-14 of full scale at decoder scale,
+8.99e-15 loudness-normalised, 2.49e-14 with dialogue enhancement at 9
+dB, 1.31e-14 at `--layout 2.0` (LoRo and `--stereo-dmx auto`, which
+picks the Pro Logic II row on the kit's 5.1 and 5.1.4) and at `--layout
+5.1`; 16-bit WAVs identical and the same per-frame statuses everywhere.
+Synthetic A-JOC, DE and mixing streams: C within 1e-9 of the Python (in
+fact ~1e-14). `check_inputs.py` (40 inputs, clean and with 30 byte
+changes each): the same frames. Damaged input (`robust_compare.py`,
+unchanged from phase C): worst peak 1.94x, 0 LOUD, 86 undamaged frames
+concealed, 0 gate failures (lookahead 8: 1.98x, 0, 102, 0). `make test`
+and `make asan` (now with the two synthetic A-JOC streams: worst frame
+1.08x / 1.12x their clean peak): clean. pytest: 449 passed. Speed
+(`speed.py`, best of 2, one thread, decode time; Python / C):
+broadcaster A's 5.1 2.0x / 18.2x, its stereo 5.0x / 47.7x, broadcaster
+B's upmixed 5.1 2.8x / 23.9x, its stereo 5.4x / 53.2x, the 5.1.4
+identification stream 0.6x / 9.1x (phase C: 18.2x, 47.7x, 23.7x, 53.9x,
+9.1x for the C); the synthetic A-JOC stream (5 ASPX downmix signals, 6
+objects, 3 decorrelators, rendered to 5.1) 1.1x / 10.7x.
 
 ## Changes against the standard
 
@@ -842,35 +990,33 @@ immersive-stereo streams the burst guard no longer replaces 19 / 27 and
 * **frame_rate_factor / frame_rate_fraction above 1** (high frame rates,
   efficient HFR) and 96/192 kHz substreams: concealed as
   `toc.unsupported_rate`.
-* **Dialogue enhancement** methods 1 - 3 (cross-channel, waveform hybrid)
-  are not applied; DRC gains act on the output samples per QMF slot, not
-  on QMF samples (see Interpretations).
-* **Immersive** (phase C): immersive_codec_mode SCPL, ASPX_SCPL (S-CPL),
+* **Dialogue enhancement**: the waveform-coded dialogue of methods 2 / 3
+  (their parametric part is applied); cross-channel DE across separately
+  decoded channels; DE of objects. DRC gains act on the output samples
+  per QMF slot, not on QMF samples (see Interpretations).
+* **Immersive**: immersive_codec_mode SCPL, ASPX_SCPL (S-CPL),
   ASPX_ACPL_1 (its residual tracks), ASPX_AJCC (A-JCC) and b_5fronts
   (9.X.4) are concealed; the 22_2_channel_element is not read. The
-  presentation-level loudness corrections (loud_corr) after
-  custom_dmx_data are not read.
-* **Objects** (phase C): the A-JOC upmix (full decoding, TS 103 190-2
-  5.7.3.4 - 5.7.3.6); object substreams without A-JOC (audio_data_objs
-  and the oamd_substream); ISF; alternative presentations' object
-  metadata (parsed, dropped); OAMD timing (parsed, not applied); A-JOC
-  substreams with more than seven downmix signals or 64 upmix objects;
-  dialogue enhancement of objects. Object rendering is a plain panner,
-  not Dolby's.
+  loud_corr "core" corrections (core decoding of 5.X.2 cores) are parsed,
+  not used.
+* **Objects**: object substreams without A-JOC (audio_data_objs and the
+  oamd_substream); ISF; alternative presentations' object metadata
+  (parsed, dropped); A-JOC substreams with more than seven downmix
+  signals or 64 upmix objects; dialogue enhancement of objects (ajoc_dmx
+  de_data parsed, not applied). Object rendering is a plain panner, not
+  Dolby's.
 * **IMS**: the rendering of an immersive-stereo presentation beyond its
-  stereo core (EMDF payload 18).
-* **Mixing** (phase B3): the associated audio's gains of a
-  presentation_version 0 presentation (in the associated substream's
-  extended_metadata) and pan_dialog / g_dialog limits (dialog_max_gain)
-  are not read; mixing gains change at frame boundaries, unsmoothed.
-  Object audio substreams are not mixed.
+  stereo core (EMDF payload 18; see Phase D).
+* **Mixing**: the associated audio's gains of a presentation_version 0
+  presentation (in the associated substream's extended_metadata) and
+  pan_dialog / g_dialog limits (dialog_max_gain) are not read. Object
+  audio substreams are not mixed.
 * **Bitstream versions 0 / 1** (phase B3): the sus_ver 0 DRC frame is not
   read (no DRC on such streams); presentation_config 7 of version 1 is
   skipped; the `dac4` box of version 0 is not parsed (`--list` reads the
   TOC).
 * The SSF speech frontend (TS 103 190-1 5.2): frames that use it are
-  concealed (`element.parse`); 7_X in ASPX_ACPL_1 / _2; LtRt (matrix
-  surround) stereo downmix (`--layout 2.0` is LoRo).
+  concealed (`element.parse`); 7_X in ASPX_ACPL_1 / _2.
 
 ## Survey
 
@@ -1219,6 +1365,19 @@ guard changes nothing, on the clean cuts. Its negative control turns the checks 
 (`robust.CHECKS = False`, `guard=False`) and requires the same gate to
 fail.
 
+Phase D added `tests/test_phase_d.py`: an A-JOC writer with data
+points, decorrelators, upmix OAMD with block updates, ramps and gains;
+Pseudocode 14a; the ramp; the engine against Pseudocode 18 written out;
+the band mapping and the decorrelation input matrix; full decoding
+(scaled downmix, decorrelated objects, random data on 2 - 7 signals and
+a static 5.1); OAMD block updates in core decoding; Table 218's LtRt and
+Pro Logic II rows; loud_corr bit by bit and applied; cross-channel DE
+against 5.7.8.8, its application, and DE methods 1 - 3 in a SIMPLE 5_X
+stream with its metadata written bit by bit; the mixing crossfade; and
+the C decoder against the Python on all of these.
+`tests/gen_fuzz_streams.py` writes the synthetic streams of
+`c/tests/data` for the C damaged-input gate.
+
 Phase C added `tests/test_phase_c.py`: the immersive element written bit
 by bit in every core grouping, with and without b_use_sap_add_ch,
 against Tables 19 / 20; two instances of one decorrelator; the immersive
@@ -1276,8 +1435,8 @@ their streams bit by bit.
 | `robust.py` | damaged-frame rules, sequence rules, output guard (with the true-peak rules) |
 | `mix.py` | mixing the substreams of a presentation (`MixDecoder`) |
 | `render.py` | output layouts: the channel renderer of TS 103 190-2 5.10.2 (phase C) |
-| `oamd.py`, `ajoc.py` | object audio metadata; A-JOC side information (phase C) |
-| `objrender.py` | the plain object panner (not Dolby's; phase C) |
+| `oamd.py`, `ajoc.py` | object audio metadata and its timing; A-JOC side information (phase C) and full decoding (phase D) |
+| `objrender.py` | the plain object panner (not Dolby's; phase C), its rendering matrix and per-sample ramps (phase D) |
 | `cli.py` | `ac4dec` |
 | `scalefac.py`, `pcm.py` | early LFE prototypes, kept for constants they define |
 | `tables/` | numeric tables (no standards text) |
