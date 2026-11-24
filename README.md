@@ -23,6 +23,58 @@ print(dec.chans, dec.n_ok, dec.n_bad)             # decoder scale, not +-1.0
 print(dec.n_concealed, dict(dec.concealed.reasons))   # damaged frames
 ```
 
+## How it works
+
+An AC-4 stream is a run of frames (2048 or 1536 samples, 25 to 60 per
+second at 48 kHz). Each frame starts with a table of contents (TOC). The TOC
+lists one or more **presentations**, which are complete mixes a listener can
+choose: English 5.1, French stereo, and so on. Each presentation points at
+**substreams**, which carry the coded audio itself: channels, objects, or
+dialogue, plus a metadata substream with loudness, DRC and dialogue
+enhancement data.
+
+```mermaid
+flowchart LR
+    F["AC-4 frame"] --> T["TOC<br/>(rate, presentations)"]
+    T --> P1["Presentation 0<br/>e.g. English 5.1"]
+    T --> P2["Presentation 1<br/>e.g. French stereo"]
+    P1 --> S1["Substream: channels<br/>(stereo / 5.1 / 7.1.4)"]
+    P1 --> S2["Substream: objects<br/>(A-JOC, OAMD)"]
+    P1 --> S3["Presentation substream<br/>(loudness, DRC, DE)"]
+    P2 --> S4["Substream: channels"]
+    P2 --> S3
+```
+
+The decoder picks one presentation (`--presentation`, `--language`, or the
+stream's default) and decodes only the substreams that presentation needs.
+Each frame then goes through these steps:
+
+```mermaid
+flowchart TD
+    IN["Input<br/>MP4 / fragmented MP4 / MPEG-TS / raw sync frames"] --> DMX["Find frames<br/>(container reader, CRC check)"]
+    DMX --> TOC["Read the TOC<br/>choose the presentation"]
+    TOC --> CORE["Core decoding (ASF)<br/>Huffman spectra, scale factors,<br/>stereo / SAP processing"]
+    CORE --> IMDCT["IMDCT + KBD window<br/>spectrum to time samples"]
+    IMDCT --> QA["QMF analysis<br/>64 bands"]
+    QA --> COMP["Companding<br/>undo the encoder's level shaping"]
+    COMP --> ASPX["A-SPX<br/>rebuild the high frequencies<br/>from the low ones + envelopes"]
+    ASPX --> UP["Parametric tools<br/>A-CPL: stereo to 5.1 / 7.1.4<br/>A-JOC: downmix to objects"]
+    UP --> QS["QMF synthesis<br/>back to time samples"]
+    QS --> MIX["Mix substreams<br/>(main, dialogue, associated audio)"]
+    MIX --> LOUD["Loudness and dynamics<br/>dialnorm, DRC, dialogue enhancement"]
+    LOUD --> REN["Render to the output layout<br/>objects panned, downmix LoRo / LtRt"]
+    REN --> GUARD["Damage guard<br/>conceal bad frames, true-peak check"]
+    GUARD --> RS["Resample if needed<br/>(1001/960 rates)"]
+    RS --> OUT["PCM out<br/>WAV / float / ac4dec_decode_frame()"]
+```
+
+The Python package (`ac4/`) is the reference: it follows the standard's
+pseudocode closely. The C library (`c/`) does the same steps and is checked
+against the Python on every test stream (largest difference about 1e-14 of
+full scale), at 9 to 55 times real time on one CPU thread. Every frame comes
+out with a status (ok, concealed, or bad), and the output length never changes,
+so a damaged frame never shifts the audio after it.
+
 ## What it decodes
 
 Everything below was measured on off-air captures from two ATSC 3.0
