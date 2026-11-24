@@ -43,6 +43,11 @@ def channels_of(element, ch_mode=None):
         return ("L", "R", "C", "Ls", "Rs")
     if element == "5_X":
         return ("L", "R", "C", "lfe", "Ls", "Rs")
+    if element == "ice":
+        # the coded tracks (A'' .. G'' as channels, and the LFE)
+        lfe = CH_MODE_ICE[ch_mode][0]
+        return (("L", "R", "C") + (("lfe",) if lfe else ())
+                + ("Ls", "Rs", "Tfl", "Tfr"))
     layout, lfe = CH_MODE_7X[ch_mode]
     extra = LAYOUT_7X[layout][0]
     return (("L", "R", "C") + (("lfe",) if lfe else ()) + ("Ls", "Rs")
@@ -51,6 +56,8 @@ def channels_of(element, ch_mode=None):
 
 def aspx_pairs(element, ch_mode=None):
     """The pair groups of the A-SPX blocks: {group: (ka, kb)}."""
+    if element == "ice":
+        return dict(ICE_PAIRS)
     if element == "7_X":
         p = LAYOUT_7X[CH_MODE_7X[ch_mode][0]][1]
         return {0: p[0], 1: p[1], 2: ("C", "C"), 3: p[2]}
@@ -207,3 +214,158 @@ def seven_x_channel_element(sub, T, ch_mode, b_iframe=False):
     out["aspx_pairs"] = {0: pairs[0], 1: pairs[1], 2: ("C", "C"),
                          3: pairs[2]}
     return _finish(out, b, sub, asz, a0, ("7_X", mode))
+
+
+# ---------------------------------------------------------------- immersive
+# TS 103 190-2 6.2.4.1 (immersive_channel_element), 6.3.5 (Tables 73, 74),
+# 5.2.3 (SMP, Tables 19, 20), 5.5.2 (A-CPL, Table 25, Pseudocode 2).
+ICE_MODES = {0: "SCPL", 1: "ASPX_SCPL", 2: "ASPX_ACPL_1", 3: "ASPX_ACPL_2",
+             4: "ASPX_AJCC"}
+# ch_mode (Table 56) -> (b_lfe, b_5fronts) of audio_data_chan (6.2.3.1)
+CH_MODE_ICE = {11: (False, False), 12: (True, False), 13: (False, True),
+               14: (True, True)}
+# The intermediate signals A'' .. G'' of a 7CH_STATIC core as the channels
+# they carry (Table 23 for S-CPL, Table 25 for A-CPL): A L, B R, C C, D Ls,
+# E Rs, F Tfl, G Tfr; the A-CPL modules of Pseudocode 2 (b_5fronts 0)
+# rebuild (Ls, Lb), (Rs, Rb) from D'', E'' (decorrelator D0) and (Tfl,
+# Tbl), (Tfr, Tbr) from F'', G'' (decorrelator D1).
+ICE_TRACK = {"A": "L", "B": "R", "C": "C", "D": "Ls", "E": "Rs",
+             "F": "Tfl", "G": "Tfr"}
+# the full channel set of 7.X.4 in output order (WAV order: L R C LFE,
+# the surrounds, the back pair, the four top channels)
+ICE_FULL = ("L", "R", "C", "lfe", "Ls", "Rs", "Lb", "Rb", "Tfl", "Tfr",
+            "Tbl", "Tbr")
+# the A-SPX block groups of Table 8 (ASPX_ACPL_1 / _2: (A'', B''),
+# (D'', E''), (F'', G''), C'')
+ICE_PAIRS = {0: ("L", "R"), 1: ("Ls", "Rs"), 2: ("C", "C"),
+             3: ("Tfl", "Tfr")}
+
+
+def ice_channels(ch_mode, present=None):
+    """The output channels of an immersive channel mode (ch_mode 11 / 12:
+    7.0.4 / 7.1.4) given ac4_substream_info_chan's (b_4_back_channels_
+    present, b_centre_present, top_channels_present) (6.3.2.7, Tables 57
+    - 59): the back pair only when present (else 5.X.4), the top channels
+    only when any are (top_channels_present 1: Tfl Tfr carry the original
+    Tsl Tsr; 2: Tbl Tbr do; 3: all four). The centre is kept even when
+    signalled silent (it is a channel of every layout of Table A.27)."""
+    lfe = CH_MODE_ICE[ch_mode][0]
+    back, _centre, top = present if present is not None else (1, 1, 3)
+    out = ["L", "R", "C"] + (["lfe"] if lfe else []) + ["Ls", "Rs"]
+    if back:
+        out += ["Lb", "Rb"]
+    if top in (1, 3):
+        out += ["Tfl", "Tfr"]
+    if top in (2, 3):
+        out += ["Tbl", "Tbr"]
+    return tuple(out)
+
+
+def immersive_channel_element(sub, T, ch_mode, b_iframe=False):
+    """6.2.4.1 for b_5fronts 0 (7.0.4 / 7.1.4), immersive_codec_mode
+    ASPX_ACPL_2: the 7CH_STATIC core (Table 74) as tracks A .. G (Table
+    19, 2ch_mode included), the b_use_sap_add_ch step on (D, F) and (E, G)
+    (5.2.3.2 step 4), A-SPX on (A'', B''), (D'', E''), (F'', G''), C''
+    (Table 8) and four acpl_data_1ch() (Pseudocode 2).
+
+    The other codec modes (SCPL, ASPX_SCPL: S-CPL; ASPX_ACPL_1: the
+    residual tracks after the A-SPX data; ASPX_AJCC: A-JCC) and b_5fronts
+    1 (9.X.4) are concealed (element.parse: not built).
+
+    Reading: 5.2.3.3 (ASPX_ACPL_2) assigns the tracks "as in step 2" of
+    5.2.3.2 and does not repeat steps 3 / 4, but the bitstream carries
+    b_use_sap_add_ch and its chparam_info for every 7CH_STATIC mode; they
+    are applied as in 5.2.3.2 (with b_use_sap_add_ch 0, as on the public
+    test stream, both readings agree)."""
+    from .acpl_parse import acpl_config_1ch, PARTIAL, FULL
+    b_lfe, b_5fronts = CH_MODE_ICE[ch_mode]
+    b, asz, a0 = _head(sub)
+    mode = 4 if b.u(1) else b.u(2)               # Table 73
+    if b_5fronts:
+        raise Damaged("element.parse", "9.X.4 (b_5fronts) not implemented")
+    if mode != 3:
+        raise Damaged("element.parse",
+                      f"immersive_codec_mode {ICE_MODES[mode]} "
+                      "not implemented")
+    aspx = acpl = None
+    if b_iframe:                                 # immers_cfg (6.2.4.2)
+        aspx = C.aspx_config(b)
+        acpl = acpl_config_1ch(b, PARTIAL if mode == 2 else FULL)
+    out = dict(aspx=aspx, acpl=acpl, compand=None, codec_mode=mode)
+    order = []
+    if b_lfe:
+        out["lfe"] = C.mono_data(b, T, b_lfe=True)
+        order.append("lfe")
+    grouping = b.u(2)                            # core_5ch_grouping
+    steps = []
+    mono_c = False
+    if grouping == 0:
+        mode2ch = b.u(1)
+        k1, k2 = (("A", "B"), ("D", "E")) if mode2ch == 0 else \
+            (("A", "D"), ("B", "E"))
+        for kk in (k1, k2):
+            x, y, st = C.two_channel_data(b, T)
+            out[kk[0]], out[kk[1]] = x, y
+            steps.append((kk, MC.two_channel_step(st)))
+            order += list(kk)
+        mono_c = True
+    elif grouping == 1:
+        tr, s3 = MC.three_channel_data(b, T)
+        out.update(A=tr[0], B=tr[1], C=tr[2])
+        steps.append((("A", "B", "C"), s3))
+        x, y, st = C.two_channel_data(b, T)
+        out.update(D=x, E=y)
+        steps.append((("D", "E"), MC.two_channel_step(st)))
+        order += ["A", "B", "C", "D", "E"]
+    elif grouping == 2:
+        tr, s4 = MC.four_channel_data(b, T)
+        out.update(A=tr[0], B=tr[1], D=tr[2], E=tr[3])
+        steps.append((("A", "B", "D", "E"), s4))
+        order += ["A", "B", "D", "E"]
+        mono_c = True
+    else:
+        tr, s5 = MC.five_channel_data(b, T)
+        out.update(A=tr[0], B=tr[1], C=tr[2], D=tr[3], E=tr[4])
+        steps.append((("A", "B", "C", "D", "E"), s5))
+        order += ["A", "B", "C", "D", "E"]
+    if mono_c:
+        out["C"] = C.mono_data(b, T, b_lfe=False)
+        order.append("C")
+    # 7CH_STATIC: the additional tracks F, G
+    fin = [(("D", "F"), ("Ls", "Tfl")), (("E", "G"), ("Rs", "Tfr"))]
+    sap = [None, None]
+    use_sap = b.u(1)                             # b_use_sap_add_ch
+    if use_sap:
+        sap = [MC.read_chparam(b, out[base]["framing"], T)
+               for (base, _a), _o in fin]
+    x, y, st = C.two_channel_data(b, T)
+    out.update(F=x, G=y)
+    steps.append((("F", "G"), MC.two_channel_step(st)))
+    order += ["F", "G"]
+    ren = dict(ICE_TRACK, lfe="lfe")
+    side = []
+    for i, ((base, add), (o0, o1)) in enumerate(fin):
+        if sap[i] is not None:
+            fb, fa = out[base]["framing"], out[add]["framing"]
+            if (fb.num_windows != fa.num_windows
+                    or [fb.length_g(fb.w2g[w]) for w in range(fb.num_windows)]
+                    != [fa.length_g(fa.w2g[w])
+                        for w in range(fa.num_windows)]):
+                raise Damaged("asf.add_ch", "framings differ")
+            side.append(((o0, o1), sap[i], fb))
+    res = {ren[k]: v for k, v in out.items() if k in ren and k != "lfe"}
+    out = {k: v for k, v in out.items()
+           if k not in ("A", "B", "C", "D", "E", "F", "G")}
+    out.update(res)
+    out["steps"] = [(tuple(ren[k] for k in kk), s) for kk, s in steps]
+    out["side_steps"] = side
+    out["order"] = tuple(ren[k] for k in order)
+    out["use_sap_add_ch"] = use_sap
+    out["core_5ch_grouping"] = grouping
+    out["aspx_blocks"] = ((0, True), (1, True), (3, True), (2, False))
+    out["aspx_pairs"] = dict(ICE_PAIRS)
+    out["acpl1"] = "ice"
+    out["acpl_blocks"] = 4
+    out.update(bits=b.p, nbits=len(sub) * 8, audio_size=asz,
+               audio_start=a0, mode=("ice", mode))
+    return out

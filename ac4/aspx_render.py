@@ -512,15 +512,27 @@ def _upmix(QL, QR, acpl_groups, state0, log, w, geo, acpl_1ch=None,
     from . import acpl as ACPL
     if acpl_1ch is not None:
         five = acpl_1ch["five"]
-        q0s = [QL, QR] if five else [QL]
+        names = acpl_1ch.get("names")
+        q0s = [QL, QR] if (five or names) else [QL]
         q1s = []
         for x in acpl_1ch["res"]:
+            if x is None:
+                q1s.append(None)
+                continue
             xx = x[:(len(x) // Q.NSB) * Q.NSB]
             q1s.append(Q.analyse(xx, w, Q.analysis_matrix()))
         zs = ACPL.render_1ch(q0s, q1s, acpl_groups, state0=state0,
                              state_log=log, ts_offset=geo["ts_offset"],
-                             nts=geo["nts"], split=acpl_1ch["split"])
-        if five:
+                             nts=geo["nts"], split=acpl_1ch["split"],
+                             dec=acpl_1ch.get("dec"))
+        if names:
+            # the immersive element (TS 103 190-2 Pseudocode 2): both
+            # outputs of each module times sqrt 2
+            up = {}
+            for m, (n0, n1) in enumerate(names):
+                up[n0] = zs[m][0] * ACPL.SQRT2
+                up[n1] = zs[m][1] * ACPL.SQRT2
+        elif five:
             up = {"L": zs[0][0], "Ls": zs[0][1] * ACPL.SQRT2,
                   "R": zs[1][0], "Rs": zs[1][1] * ACPL.SQRT2}
         else:

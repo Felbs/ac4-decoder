@@ -58,6 +58,8 @@ class Ac4Stream:
         self.element = element
         if element == "7_X" and ch_mode is None:
             ch_mode = 6
+        if element == "ice" and ch_mode is None:
+            ch_mode = 12
         self.ch_mode = ch_mode
         self.CHANS = EL.channels_of(element, ch_mode)
         self.PAIRS = EL.aspx_pairs(element, ch_mode)
@@ -89,7 +91,8 @@ class Ac4Stream:
         # with a concealed frame like the A-SPX framing state
         self.acpl_q = [None] * 11
         # the same for the modules of ASPX_ACPL_1 / _2 (alpha1, beta1 each)
-        self.acpl_q1 = [[None, None], [None, None]]
+        # (four modules in the immersive element)
+        self.acpl_q1 = [[None, None] for _ in range(4)]
         for nm in self.tabs:
             P.CENTRE[nm] = 0 if nm.endswith("_F0") else \
                 (len(arrays[nm + "_LEN"]) - 1) // 2
@@ -619,6 +622,9 @@ class Ac4Stream:
         if el == "7_X":
             return EL.seven_x_channel_element(sub, self.Tf, self.ch_mode,
                                               b_iframe=ifr)
+        if el == "ice":
+            return EL.immersive_channel_element(sub, self.Tf, self.ch_mode,
+                                                b_iframe=ifr)
         return C.decode_element(sub, self.Tf, b_iframe=ifr,
                                 has_lfe=el != "5_0")
 

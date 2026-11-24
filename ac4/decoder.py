@@ -60,7 +60,7 @@ HF_TAIL = 2                 # frames after a burst frame that also play core
 # level written at 0.9 of full scale. Hand-tuned; the decoder's true full
 # scale is NOT established. Used for the default burst limit and by the CLI.
 REF_PEAK = {"5_X": 9.0e5, "pair": 2.0e5, "mono": 2.0e5, "3_0": 9.0e5,
-            "5_0": 9.0e5, "7_X": 9.0e5}
+            "5_0": 9.0e5, "7_X": 9.0e5, "ice": 9.0e5}
 ELEMENTS = tuple(REF_PEAK)
 # the burst guard's limit: twice full scale (loudness.FULL_SCALE)
 BURST_LIMIT = 2.0 * RB._FULL_SCALE
@@ -140,7 +140,7 @@ class Decoder:
     def __init__(self, element="5_X", channels=None, burst_limit=None,
                  guard=True, presentation=None, language=None,
                  target_level=None, drc="auto", ch_mode=None, de_level=0.0,
-                 substream=0):
+                 substream=0, present=None):
         """The frame length follows the stream (TS 103 190-1 Table 83):
         `frame` is FRAME (1536) until the first frame whose rate the
         decoder takes (see Ac4Stream), then that frame_len_base; out_rate
@@ -156,6 +156,19 @@ class Decoder:
                                 language=language, ch_mode=ch_mode,
                                 substream=substream)
         full = self.stream.CHANS
+        # the channels decoded inside (ichans) and given out (chans): the
+        # same except for the immersive element, whose A-CPL makes the
+        # back and top-back channels from the coded tracks and whose
+        # output drops the channels its substream signals absent
+        # (`present`: ac4_substream_info_chan's b_4_back_channels_present,
+        # b_centre_present, top_channels_present; elements.ice_channels)
+        self.ichans = None
+        if element == "ice":
+            from . import elements as EL
+            cm = self.stream.ch_mode
+            self.ichans = tuple(k for k in EL.ICE_FULL
+                                if k != "lfe" or EL.CH_MODE_ICE[cm][0])
+            full = EL.ice_channels(cm, present)
         if channels is None:
             channels = len(full)
         if channels not in (2, len(full)) or (channels == 2
@@ -164,9 +177,13 @@ class Decoder:
                              + (" or 2" if "L" in full else ""))
         self.element = element
         self.chans = full if channels == len(full) else ("L", "R")
+        if self.ichans is None or self.chans == ("L", "R"):
+            self.ichans = self.chans
+        self._out_idx = (None if self.ichans == self.chans else
+                         [self.ichans.index(k) for k in self.chans])
         self.burst_limit = (BURST_LIMIT if burst_limit is None
                             else float(burst_limit))
-        self.fb_state = {k: None for k in self.chans}
+        self.fb_state = {k: None for k in self.ichans}
         self.pairs = [(self.stream.PAIRS[g], gk) for g, gk in
                       ((0, "lr"), (1, "sr"), (2, "c"), (3, "xr"))
                       if g in self.stream.PAIRS]
@@ -176,7 +193,7 @@ class Decoder:
         self.lead_groups = {"lr": [], "sr": [], "c": [], "xr": []}
         # the last HF_DELAY core samples of every channel: the delay line
         # of the channels that do not go through the QMF bank
-        self.core_tail = {k: np.zeros(HF_DELAY) for k in self.chans}
+        self.core_tail = {k: np.zeros(HF_DELAY) for k in self.ichans}
         self.hf_state = {"lr": [None], "sr": [None], "c": [None],
                          "xr": [None]}
         # the A-SPX tables in force before the lead-in of the next pass
@@ -190,6 +207,8 @@ class Decoder:
         # for the A-SPX pairs
         self.lead_acpl = []
         self.acpl_state = [None]
+        # the immersive element's A-CPL: per pair (Ls / Rs, Tfl / Tfr)
+        self.ice_acpl_state = {"sr": [None], "xr": [None]}
         # dialogue enhancement (de.py): the user gain in dB (0 = off) and
         # the lead-in frames' DE entries
         self.de_level = float(de_level)
@@ -236,7 +255,7 @@ class Decoder:
         if fl is None or fl == self.frame:
             return
         self.frame = fl
-        self.fb_state = {k: None for k in self.chans}
+        self.fb_state = {k: None for k in self.ichans}
         self.lead_pcm = {k: np.zeros(0) for k in self.lead_pcm}
         self.lead_core = {}
         self.lead_groups = {k: [] for k in self.lead_groups}
@@ -245,6 +264,7 @@ class Decoder:
         self.hf_state = {k: [None] for k in self.hf_state}
         self.t_hold = {k: None for k in self.t_hold}
         self.acpl_state = [None]
+        self.ice_acpl_state = {"sr": [None], "xr": [None]}
         if self.guard is not None:
             self.guard.frame = fl
 
@@ -271,15 +291,17 @@ class Decoder:
         if self.element == "pair":
             return gkey == "lr" and mode[1] >= 1
         if gkey == "lr":
-            return "L" in self.chans
+            return "L" in self.ichans
         if gkey == "c" and not SC.CENTRE_ASPX:
             return False
-        if gkey == "sr" and self.stream.acpl1:
+        if gkey == "sr" and self.stream.acpl1 in ("5_X", "pair"):
             return False                # ASPX_ACPL_1 / _2: no Ls/Rs A-SPX
         if self.acpl3 or self.stream.acpl3:
             return False
         ka = dict((g, p) for p, g in self.pairs)[gkey][0]
-        return ka in self.chans and len(self.chans) > 2
+        if self.element == "ice":
+            return len(self.chans) > 2
+        return ka in self.ichans and len(self.ichans) > 2
 
     def decode_pass(self, frames):
         """-> float64 array (len(frames) * 1536, n_channels) at the internal
@@ -298,6 +320,9 @@ class Decoder:
         self._aspx_flag = np.zeros(len(frames), dtype=bool)
         try:
             y = self._decode_pass(frames)
+            if self._out_idx is not None and y.ndim == 2 \
+                    and y.shape[1] == len(self.ichans):
+                y = y[:, self._out_idx]
             n_out = len(frames) * self.frame
             status = list(self.stream.status)
             self.log.extend(self.stream.log)
@@ -361,13 +386,21 @@ class Decoder:
         return y
 
     def _decode_pass(self, frames):
-        chans = self.chans
+        chans = self.ichans
         dec = self.stream
         wins, lens, grp, cnts = dec.decode_frames(frames, chans)
         self._adopt_frame()
         FRAME = self.frame
         pcm, self.fb_state = FB.synthesise_frames(
             wins, lens, cnts, FRAME, states=self.fb_state, return_state=True)
+        ice = self.element == "ice"
+        if ice:
+            # the immersive element: Lb Rb Tbl Tbr come from the A-CPL
+            # upmix below (silent until it runs)
+            n_ref = len(next(iter(pcm.values())))
+            for k in chans:
+                if k not in pcm:
+                    pcm[k] = np.zeros(n_ref)
         if len(pcm) < len(chans):
             # ASPX_ACPL_3: a two-channel core (and the LFE) plus A-CPL;
             # C / Ls / Rs come from the upmix below
@@ -404,6 +437,14 @@ class Decoder:
         a1 = dec.acpl1
         up1 = bool(a1 == "pair" or (a1 == "5_X" and "C" in chans
                                     and self.element == "5_X"))
+        # the immersive element's A-CPL (TS 103 190-2 5.5.2, Pseudocode 2,
+        # b_5fronts 0): modules 1, 2 on the Ls / Rs pair's A-SPX output
+        # (decorrelator D0) give Ls, Lb, Rs, Rb; modules 3, 4 on the Tfl /
+        # Tfr pair's (D1) give Tfl, Tbl, Tfr, Tbr
+        ice_up = {}
+        if ice and a1 == "ice" and len(chans) > 2:
+            ice_up = {"sr": (0, (("Ls", "Lb"), ("Rs", "Rb"))),
+                      "xr": (2, (("Tfl", "Tbl"), ("Tfr", "Tbr")))}
         if up1:
             upmix = True
         ga = grp.get("acpl") or [None] * len(grp["lr"])
@@ -426,6 +467,7 @@ class Decoder:
             if gkey == "lr" and up1:
                 return None
             return dict(frames=de_frames, level=self.de_level, pair=pair)
+        lead_acpl0 = list(self.lead_acpl)
         for (ka, kb), gkey in self.pairs:
             # the centre (aspx_data_1ch) goes through the pair renderer as
             # the same channel twice: with balance 0 each half is decoded
@@ -452,6 +494,14 @@ class Decoder:
                 if up:
                     gacpl = self.lead_acpl[-LEAD:] + ga
                     acs, alog = self.acpl_state, []
+                if gkey in ice_up:
+                    up = True
+                    m0, names = ice_up[gkey]
+                    gacpl = [g_[m0:m0 + 2] if isinstance(g_, list) else g_
+                             for g_ in lead_acpl0[-LEAD:] + ga]
+                    acs, alog = self.ice_acpl_state[gkey], []
+                    a1ch = dict(res=[None, None], split=False, five=False,
+                                names=names, dec=(m0 // 2, m0 // 2))
                 try:
                     hf, _n = R37.apply_hf_pair(
                         pa, pb, gg, dec.cfg,
@@ -491,17 +541,23 @@ class Decoder:
                         n = len(pcm[ka])
                         if a1 == "pair":
                             pcm[kb] = pcm[ka]
+                        # (the immersive element: a replaced frame plays
+                        # its core as core decoding mode does, gain 2)
+                        cg = 2.0 if gkey in ice_up else 1.0
                         for k in hf["up"]:
                             v = hf["up"][k][lead:lead + n]
                             if k in (ka, kb):
                                 v = np.where(np.repeat(bad, FRAME)[:n],
-                                             pcm[k], v)
+                                             cg * pcm[k], v)
                             else:
                                 v = np.where(np.repeat(bad, FRAME)[:n],
                                              0.0, v)
                             pcm[k] = v
                         via_qmf |= set(hf["up"])
-                        self.acpl_state = alog[-(LEAD + 1):]
+                        if gkey in ice_up:
+                            self.ice_acpl_state[gkey] = alog[-(LEAD + 1):]
+                        else:
+                            self.acpl_state = alog[-(LEAD + 1):]
                     if nb_:
                         self.n_burst += nb_
                         self.log.append(
@@ -515,7 +571,9 @@ class Decoder:
                 except Exception as e:                         # noqa: BLE001
                     self.hf_state[gkey] = (
                         hs + [hs[-1]] * len(gl))[-(LEAD + 1):]
-                    if up:
+                    if gkey in ice_up:
+                        self.ice_acpl_state[gkey] = [None]
+                    elif up:
                         self.acpl_state = [None]
                     self.n_hf_fail += 1
                     self.log.append(
@@ -540,6 +598,12 @@ class Decoder:
             # the core of the last LEAD frames (ASPX_ACPL_1 residuals)
             self.lead_core[k] = np.concatenate(
                 [self.lead_core.get(k, np.zeros(0)), core[k]])[-LEAD * FRAME:]
+        if ice:
+            # Pseudocode 2: z0, z2, z4 = 2 x (L, R, C); the core decoding
+            # mode's gain 2 (4.8.3.14) where there is no upmix
+            for k in chans:
+                if k in ("L", "R", "C") or (k != "lfe" and not ice_up):
+                    pcm[k] = 2.0 * pcm[k]
         return np.column_stack([pcm[k] for k in chans])
 
 
@@ -557,7 +621,7 @@ def probe_rate(frames, limit=64):
 
 ELEMENT_OF_CH_MODE = {0: "mono", 1: "pair", 2: "3_0", 3: "5_0", 4: "5_X",
                       5: "7_X", 6: "7_X", 7: "7_X", 8: "7_X", 9: "7_X",
-                      10: "7_X"}
+                      10: "7_X", 11: "ice", 12: "ice", 13: "ice", 14: "ice"}
 
 
 # A presentation_version 2 presentation whose channel-coded substream
@@ -593,6 +657,28 @@ def probe_ch_mode(frames, limit=64, presentation=None, language=None,
     return None
 
 
+def probe_present(frames, limit=64, presentation=None, language=None,
+                  substream=0):
+    """(b_4_back_channels_present, b_centre_present, top_channels_present)
+    of the audio substream that would be decoded (an immersive channel
+    mode, TS 103 190-2 6.3.2.7), or None."""
+    from . import toc as M
+    for f in frames[:limit]:
+        try:
+            st = M.parse(f)
+        except Exception:                                      # noqa: BLE001
+            continue
+        pi = M.choose(st, presentation, language)
+        sel = M.audio_substream(st, pi, substream)
+        if sel is None:
+            continue
+        if "top_channels_present" not in sel:
+            return None
+        return (sel["b_4_back_channels_present"], sel["b_centre_present"],
+                sel["top_channels_present"])
+    return None
+
+
 def probe_element(frames, limit=64, presentation=None, language=None,
                   substream=0):
     """Guess the element from the channel_mode of the audio substream of
@@ -624,7 +710,11 @@ def decode(frames, element=None, channels=None, max_pass=1800,
         raise ValueError("cannot tell the element from the stream; pass "
                          "element='5_X' or 'pair'")
     ch_mode = (probe_ch_mode(frames, presentation=presentation,
-                             language=language) if element == "7_X" else None)
+                             language=language)
+               if element in ("7_X", "ice") else None)
+    present = (probe_present(frames, presentation=presentation,
+                             language=language)
+               if element == "ice" else None)
     dec = None
     if mix:
         from . import mix as MX
@@ -636,7 +726,7 @@ def decode(frames, element=None, channels=None, max_pass=1800,
     if dec is None:
         dec = Decoder(element, channels, presentation=presentation,
                       language=language, target_level=target_level, drc=drc,
-                      ch_mode=ch_mode, de_level=de_level)
+                      ch_mode=ch_mode, de_level=de_level, present=present)
     rs = StreamResampler(up, down)
     out = []
     for i in range(0, len(frames), max(1, max_pass)):

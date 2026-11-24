@@ -157,11 +157,15 @@ def presentation(w, groups, pres_sub, md_compat=0, pres_id=None,
 
 
 def group(w, ch_mode_code, index, ndot=1, cc=None, lang=None, fs=1, frf=1,
-          sf_mult=None, add_ch_base=None):
-    """ac4_substream_group_info with one channel-coded substream."""
+          sf_mult=None, add_ch_base=None, top=None):
+    """ac4_substream_group_info with one channel-coded substream. top:
+    (b_4_back_channels_present, b_centre_present, top_channels_present)
+    for the immersive channel modes (TS 103 190-2 6.2.1.8)."""
     w.u(1, 1).u(1, 0).u(1, 1)                # present, no hsf, single
     w.u(1, 1)                                # b_channel_coded
     w.u(len(ch_mode_code), int(ch_mode_code, 2))
+    if top is not None:
+        w.u(1, top[0]).u(1, top[1]).u(2, top[2])
     if fs == 1:
         if sf_mult is None:
             w.u(1, 0)                        # b_sf_multiplier

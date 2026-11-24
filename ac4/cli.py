@@ -27,7 +27,9 @@ DAMAGED INPUT. Frames that break a rule of the bitstream are concealed
 OUT is 16-bit PCM at 48 kHz (44,1 kHz for a 44,1 kHz stream), every
 frame rate of TS 103 190-1 Table 83 resampled as the table says: 6 channels in WAV 5.1 order (L R C LFE Ls Rs)
 for a 5.1 element, 2 for stereo, 1 for mono, L R C for 3.0, L R C Ls Rs for 5.0,
-and L R C LFE Ls Rs plus the layout's pair (Lb Rb, Lw Rw or Tfl Tfr) for 7.x.
+and L R C LFE Ls Rs plus the layout's pair (Lb Rb, Lw Rw or Tfl Tfr) for 7.x;
+for 7.1.4 (the immersive_channel_element, TS 103 190-2) L R C LFE Ls Rs Lb Rb
+Tfl Tfr Tbl Tbr, without Lb Rb when the stream signals them absent (5.1.4).
 
 OUTPUT LEVEL. Loudness normalisation (TS 103 190-1 5.7.9): the stream's
 reference level (dialnorm) is brought to --target-level (default -24 dB,
@@ -168,9 +170,13 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
             return 1
     t0 = time.time()
     legacy = bool(ref_peak)
-    from .decoder import probe_ch_mode
+    from .decoder import probe_ch_mode, probe_present
     ch_mode = (probe_ch_mode(frames, presentation=presentation,
-                             language=language) if element == "7_X" else None)
+                             language=language)
+               if element in ("7_X", "ice") else None)
+    present = (probe_present(frames, presentation=presentation,
+                             language=language)
+               if element == "ice" else None)
     try:
         dec = None
         if mix:
@@ -189,7 +195,8 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
             dec = Decoder(element, channels, guard=guard,
                           presentation=presentation, language=language,
                           target_level=None if legacy else target_level,
-                          drc=drc, ch_mode=ch_mode, de_level=de_level)
+                          drc=drc, ch_mode=ch_mode, de_level=de_level,
+                          present=present)
     except ValueError as e:
         say(str(e))
         return 1
@@ -257,7 +264,7 @@ def main(argv=None):
                          "automatic choice")
     ap.add_argument("--element", default="auto",
                     choices=("auto", "5_X", "pair", "mono", "3_0", "5_0",
-                             "7_X"))
+                             "7_X", "ice"))
     ap.add_argument("--channels", type=int, default=None,
                     help="default: all of the element's channels (6 for "
                     "5.1, 8 for 7.1, ...); 2: L, R only")

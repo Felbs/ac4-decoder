@@ -251,21 +251,30 @@ def copy_state(s):
                 smooth=s["smooth"].copy(), spd=s["spd"].copy())
 
 
-def decorrelate(v, s):
+def decorrelate(v, s, rows=None):
     """Pseudocode 111, the three decorrelators at once. v (3, n, 64)
-    complex -> u (3, n, 64); s["xh"], s["yh"] carried on."""
+    complex -> u (3, n, 64); s["xh"], s["yh"] carried on.
+
+    rows: per instance the decorrelator whose coefficients it uses
+    (default instance d uses D_d); the immersive A-CPL (TS 103 190-2
+    Pseudocode 2) runs two instances of D0 (Ls, Rs) and two of D1 (Tfl,
+    Tfr), each with its own history."""
     n = v.shape[1]
+    if rows is None:
+        BC, AC = B_COEF, A_COEF
+    else:
+        BC, AC = B_COEF[list(rows)], A_COEF[list(rows)]
     X = np.concatenate([s["xh"], v], axis=1)            # (3, HIST + n, 64)
     Y = np.concatenate([s["yh"], np.zeros((3, n, NSB), complex)], axis=1)
     for ts in range(n):
         p = HIST + ts                                   # ts in X
         q = MAXL + ts                                   # ts in Y
-        y = B_COEF[:, 0, :] * X[:, p - DELAY, _SB]
+        y = BC[:, 0, :] * X[:, p - DELAY, _SB]
         for i in range(1, MAXL + 1):
             # past a region's L the coefficients are 0 (and the index is
             # held inside the history): y + 0 leaves y exactly as it is
-            y = y + (B_COEF[:, i, :] * X[:, np.maximum(p - i - DELAY, 0), _SB]
-                     - A_COEF[:, i, :] * Y[:, q - i, :])
+            y = y + (BC[:, i, :] * X[:, np.maximum(p - i - DELAY, 0), _SB]
+                     - AC[:, i, :] * Y[:, q - i, :])
         Y[:, q, :] = y
     s["xh"] = X[:, -HIST:, :].copy()
     s["yh"] = Y[:, -MAXL:, :].copy()
@@ -430,7 +439,7 @@ def copy_state_1ch(s):
     return c
 
 
-def upmix_frame_1ch(x0s, x1s, frames, s, nts=NTS):
+def upmix_frame_1ch(x0s, x1s, frames, s, nts=NTS, dec=None):
     """One frame of Pseudocodes 115 / 117 / 120 before the output scaling.
     x0s: per module (n, 64) complex, the A-SPX output of its core channel;
     x1s: per module the residual (n, 64) or None (ASPX_ACPL_2); frames: per
@@ -464,7 +473,9 @@ def upmix_frame_1ch(x0s, x1s, frames, s, nts=NTS):
     v = np.zeros((3, n, NSB), complex)
     for m in range(nm):
         v[m] = 2.0 * x0s[m]
-    y = duck(decorrelate(v, s), s)
+    # dec: the decorrelator of each module (default module m uses D_m)
+    rows = None if dec is None else tuple(dec) + (2,) * (3 - len(dec))
+    y = duck(decorrelate(v, s, rows), s)
     out = []
     for m in range(nm):
         x0in = 2.0 * x0s[m]
@@ -482,7 +493,7 @@ def upmix_frame_1ch(x0s, x1s, frames, s, nts=NTS):
 
 
 def render_1ch(Q0s, Q1s, groups, state0=None, state_log=None, ts_offset=4,
-               nts=NTS, split=False):
+               nts=NTS, split=False, dec=None):
     """The 1ch upmix of a decode pass. Q0s: per module (64, n_slots)
     complex, the A-SPX output of its core channel; Q1s: per module the
     residual's analysis or None; groups: per frame None, CONCEALED (hold),
@@ -517,7 +528,7 @@ def render_1ch(Q0s, Q1s, groups, state0=None, state_log=None, ts_offset=4,
             [Q0s[m][:, a:z].T for m in range(nm)],
             [None if Q1s[m] is None else Q1s[m][:, a:z].T
              for m in range(nm)],
-            None if g is CONCEALED else g, s, nts)
+            None if g is CONCEALED else g, s, nts, dec)
         for m in range(nm):
             out[m][0][:, a:z] = res[m][0].T
             out[m][1][:, a:z] = res[m][1].T
