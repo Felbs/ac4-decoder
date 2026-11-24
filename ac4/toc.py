@@ -156,7 +156,14 @@ def frame_rate_fractions_info(b, fri, frf):
     return 1
 
 
-def sgi_specifier(b):
+def sgi_specifier(b, st=None):
+    """6.2.1.7 -> the group index. bitstream_version 1 (a presentation of
+    presentation_config 7, phase E): the ac4_substream_group_info itself,
+    appended to st["_v1_groups"], whose index it returns."""
+    if st is not None and st.get("bitstream_version") == 1 and \
+            "_v1_groups" in st:
+        st["_v1_groups"].append(substream_group_info(b, st))
+        return len(st["_v1_groups"]) - 1
     g = b.u(3)
     if g == 7:
         g += b.vb(2)
@@ -217,20 +224,21 @@ def presentation_v1_info(b, fri, st):
         if b.u(1):                        # b_presentation_filter
             p["enabled"] = bool(b.u(1))   # b_enable_presentation
         if single:
-            p["groups"] = [sgi_specifier(b)]
+            p["groups"] = [sgi_specifier(b, st)]
             p["n_substream_groups"] = 1
         else:
             p["multi_pid"] = b.u(1)
             table = {0: (2, 2), 1: (2, 1), 2: (2, 2), 3: (3, 3), 4: (3, 2)}
             if cfg in table:
                 n_spec, p["n_substream_groups"] = table[cfg]
-                p["groups"] = [sgi_specifier(b) for _ in range(n_spec)]
+                p["groups"] = [sgi_specifier(b, st)
+                               for _ in range(n_spec)]
             elif cfg == 5:
                 n_sg = b.u(2) + 2
                 if n_sg == 5:
                     n_sg += b.vb(2)
                 p["n_substream_groups"] = n_sg
-                p["groups"] = [sgi_specifier(b) for _ in range(n_sg)]
+                p["groups"] = [sgi_specifier(b, st) for _ in range(n_sg)]
             else:
                 presentation_config_ext_info(b, st)
         p["pre_virtualized"] = b.u(1)
@@ -544,8 +552,9 @@ def presentation_info_v0(b, fri, st, groups):
     ac4_substream_info becomes a substream group of its own (appended to
     `groups`), with that substream's content type; there is no
     presentation substream (the metadata is in the audio substreams).
-    presentation_config 7 (bitstream_version 1: an ac4_presentation_v1_info
-    inside presentation_config_ext_info) is skipped: no substreams."""
+    presentation_config 7 of bitstream_version 1: the ac4_presentation_v1_
+    info inside presentation_config_ext_info (with its substream groups)
+    is the presentation (phase E)."""
     single = b.u(1)                       # b_single_substream
     cfg = 0
     if not single:
@@ -572,6 +581,42 @@ def presentation_info_v0(b, fri, st, groups):
         p["emdf"].append(emdf_info(b, st))
         n = 1 if single else V0_N_SUBSTREAMS.get(cfg, 0)
         hsf = 0 if single else b.u(1)    # b_hsf_ext
+        if not single and cfg == 7 and st.get("bitstream_version") == 1:
+            # presentation_config_ext_info (TS 103 190-2 6.2.1.5): an
+            # ac4_presentation_v1_info, its substream groups inline
+            # (ac4_sgi_specifier, 6.2.1.7), padded to a byte, inside
+            # n_skip_bytes; it is the presentation decoded (phase E)
+            nskip = b.u(5)
+            if b.u(1):
+                nskip += b.vb(2) << 5
+            p0 = b.p
+            st["_v1_groups"] = []
+            pv1 = presentation_v1_info(b, fri, st)
+            got = st.pop("_v1_groups")
+            nread = b.p - p0
+            if nread % 8:
+                b.u(8 - nread % 8)
+                nread += 8 - nread % 8
+            nskip -= nread // 8
+            if nskip < 0:
+                raise ValueError("presentation_config_ext_info overrun")
+            b.p += 8 * nskip
+            if b.p > len(b.d) * 8:
+                raise EOFError("presentation_config_ext_info")
+            base = len(groups)
+            groups.extend(got)
+            pv1["groups"] = [base + g for g in pv1["groups"]]
+            pv1["config_ext"] = cfg
+            pv1["pre_virtualized"] = b.u(1)
+            if b.u(1):                    # b_add_emdf_substreams
+                k = b.u(2)
+                if k == 0:
+                    k = b.vb(2) + 4
+                for _ in range(k):
+                    pv1["emdf"].append(emdf_info(b, st))
+            st["presentation_config"] = cfg
+            st["single_group"] = single
+            return pv1
         if not single and cfg not in V0_N_SUBSTREAMS:
             presentation_config_ext_info(b, st)
         for i in range(n):
@@ -619,7 +664,10 @@ def substream_group_info(b, st):
     if g["channel_coded"]:
         st["channel_coded"] += 1
         for _ in range(n_lf):
+            sus_ver = (b.u(1) if st.get("bitstream_version") == 1
+                       else 1)
             s = substream_info_chan(b, present, frf, st)
+            s["sus_ver"] = sus_ver
             if hsf:
                 s["hsf_index"] = hsf_ext_substream_info(b, present)
             g["substreams"].append(s)

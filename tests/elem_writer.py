@@ -10,6 +10,9 @@ from ac4 import channels as CH
 from test_phase_a import BW, build_toc
 
 SFB = CH.SFB_TABLE[1536]
+# the reference scale factor every Track writes (100: lines dequantise to
+# sign(q) |q|^(4/3)); the fuzz streams raise it to a realistic level
+SF_REF = 100
 
 
 def huff_put(w, book, sym):
@@ -42,7 +45,7 @@ class Track:
                 for v in (a, b):
                     if v:
                         w.u(1, 1 if v < 0 else 0)  # sign
-        w.u(8, 100)                                 # reference sf
+        w.u(8, SF_REF)                              # reference sf
         for _ in range(max(self.nbands - 1, 0)):
             huff_put(w, T["sf"], 60)                # unchanged
         w.u(1, 0)                                   # no noise fill

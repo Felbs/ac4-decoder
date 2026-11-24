@@ -180,6 +180,8 @@ typedef struct {
     int n_types, oamd_offset;
     signed char types[8];
     unsigned obj_bed;      /* the group's bed_mask */
+    int sus_ver;           /* channel-coded: 0 or 1 (bitstream_version 1
+                              presentations of presentation_config 7) */
 } ac4_toc_sub;
 #define AC4_OBJ_ISF_I(i) (-10 - (i))
 #define AC4_OBJ_DYN (-1)
@@ -1100,6 +1102,17 @@ int ac4_pres_metadata(const uint8_t *sub, size_t len, int b_alternative,
    -1 when it does not parse */
 int ac4_v0_metadata(const uint8_t *sub, size_t len, size_t bit,
                     ac4_meta *out);
+/* bitstream_version 0 / 1, phase E (metadata.v0_substream_metadata):
+   the metadata() of an audio substream sub, read with channel mode cm:
+   dialnorm / truepk, the associated audio gains of extended_metadata
+   (assoc: b_associated) in out->has_assoc / sc, dialog_max_gain's code
+   in *dmax (-1: not sent; dialog: b_dialog), and with drc the drc_frame
+   (state: the DRC configuration, updated on an I-frame). What parses
+   is kept. -> 0, or -1 when not even dialnorm parses */
+int ac4_v0_sub_metadata(const uint8_t *sub, size_t len, int cm, int iframe,
+                        int assoc, int dialog, int drc,
+                        ac4_drc_config *state, const ac4_huff *hcb, int fl,
+                        ac4_meta *out, int *dmax);
 double ac4_curve_gain(double x, const double *pv);
 
 typedef struct {

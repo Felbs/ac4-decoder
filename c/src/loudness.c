@@ -15,9 +15,17 @@ static const double MODE_RANGE[4][2] = {
     { -31, -27 }, { -26, -17 }, { -16, 0 }, { -16, 0 } };
 
 /* ------------------------------------------------------------ parse */
+static void further_loudness_info_v(ac4_bits *b, ac4_meta *m, int v0);
+
 static void further_loudness_info(ac4_bits *b, ac4_meta *m)
 {
-    /* b_presentation_ldn = 1, sus_ver = 1 */
+    further_loudness_info_v(b, m, 0);
+}
+
+/* metadata.further_loudness_info with b_presentation_ldn = 1 (v0 0:
+   sus_ver 1) or sus_ver 0 of an audio substream (v0 1) */
+static void further_loudness_info_v(ac4_bits *b, ac4_meta *m, int v0)
+{
     uint32_t v = ac4_u(b, 2), t, n;
     int i;
     if (v == 3)
@@ -59,6 +67,26 @@ static void further_loudness_info(ac4_bits *b, ac4_meta *m)
     for (i = 0; i < 2; i++)
         if (ac4_bit(b))
             ac4_u(b, 11);
+    if (v0) {
+        if (ac4_bit(b)) {               /* b_extension */
+            uint64_t e = ac4_u(b, 5);
+            long long rest;
+            if (e == 31)
+                e += ac4_vb(b, 4);
+            if (ac4_bit(b)) {           /* b_rtll_comp */
+                ac4_u(b, 8);
+                rest = (long long)e - 9;
+            } else {
+                rest = (long long)e - 1;
+            }
+            if (rest > 0) {
+                if (b->p + (size_t)rest > b->nbits)
+                    ac4_fail(b, b->eof_code);
+                b->p += (size_t)rest;
+            }
+        }
+        return;
+    }
     if (ac4_bit(b))
         ac4_u(b, 8);
     if (ac4_bit(b)) {
@@ -925,4 +953,183 @@ void ac4_leveler_frame(ac4_leveler *lv, const ac4_meta *md, double **pcm,
             for (i = s * SLOT; i < (s + 1) * SLOT && i < n; i++)
                 pcm[k][i] *= g;
         }
+}
+
+/* ---- bitstream_version 0 / 1: metadata.v0_substream_metadata */
+static int scale_db_set(ac4_bits *b, double *v)
+{
+    if (!ac4_bit(b))
+        return 0;
+    {
+        uint32_t x = ac4_u(b, 8);
+        *v = x == 0xff ? -INFINITY : -0.3 * (double)x;
+    }
+    return 1;
+}
+
+static void v0_basic(ac4_bits *b, int cm, ac4_meta *m)
+{
+    ac4_u(b, 7);                        /* dialnorm_bits */
+    if (!ac4_bit(b))                    /* b_more_basic_metadata */
+        return;
+    if (ac4_bit(b))                     /* b_further_loudness_info */
+        further_loudness_info_v(b, m, 1);
+    if (cm == 1 && ac4_bit(b)) {        /* b_prev_dmx_info */
+        ac4_u(b, 3);
+        ac4_u(b, 2);
+    }
+    if (cm > 1) {
+        if (ac4_bit(b)) {               /* b_stereo_dmx_coeff */
+            ac4_u(b, 6);
+            if (ac4_bit(b))
+                ac4_u(b, 5);
+            if (ac4_bit(b))
+                ac4_u(b, 6);
+            if (ac4_bit(b))
+                ac4_u(b, 5);
+            if ((cm == 4 || cm == 6 || cm == 8 || cm == 10 || cm == 12
+                 || cm == 14 || cm == 15) && ac4_bit(b))
+                ac4_u(b, 5);
+            ac4_u(b, 2);
+        }
+        if (cm == 3 || cm == 4) {
+            if (ac4_bit(b))
+                ac4_u(b, 3);
+            if (ac4_bit(b))
+                ac4_u(b, 4);
+        }
+        if (cm >= 5 && ac4_bit(b)) {
+            if (cm == 5 || cm == 6 || cm >= 11)
+                ac4_u(b, 2);
+            else if (cm == 9 || cm == 10)
+                ac4_bit(b);
+        }
+        ac4_u(b, 2);
+        ac4_bit(b);
+        ac4_bit(b);
+    }
+    if (ac4_bit(b))                     /* b_dc_blocking */
+        ac4_bit(b);
+}
+
+static void two_lev(ac4_bits *b)
+{
+    if (ac4_bit(b))
+        ac4_bit(b);
+}
+
+/* TS 103 190-1 Table 69 (b_associated, b_dialog parameters) */
+static void v0_extended(ac4_bits *b, int cm, int assoc, int dialog,
+                        ac4_meta *m, int *dmax)
+{
+    if (assoc) {
+        int i;
+        m->has_assoc = 1;
+        for (i = 0; i < 3; i++)
+            m->has_sc[i] = scale_db_set(b, &m->sc[i]);
+        m->has_sc[3] = 0;
+        if (cm == 0) {
+            uint32_t x = ac4_u(b, 8);
+            m->has_sc[3] = 1;
+            m->sc[3] = x < 0xf0 ? 1.5 * (double)x : 0.0;
+        }
+    }
+    if (dialog) {
+        if (ac4_bit(b))                 /* b_dialog_max_gain */
+            *dmax = (int)ac4_u(b, 2);
+        if (ac4_bit(b)) {               /* b_pan_dialog_present */
+            ac4_u(b, 8);
+            if (cm != 0) {
+                ac4_u(b, 8);
+                ac4_u(b, 2);
+            }
+        }
+    }
+    if (ac4_bit(b)) {                   /* b_channels_classifier */
+        if (cm == 0 || (cm >= 2 && cm <= 15))
+            two_lev(b);
+        if (cm >= 1 && cm <= 15) {
+            two_lev(b);
+            two_lev(b);
+        }
+        if (cm >= 3 && cm <= 15)
+            ac4_u(b, 2);
+        if (cm == 5 || cm == 6 || (cm >= 11 && cm <= 15))
+            ac4_u(b, 2);
+        if (cm == 7 || cm == 8 || cm == 15)
+            ac4_u(b, 2);
+        if (cm == 9 || cm == 10)
+            ac4_u(b, 2);
+        if (cm == 4 || cm == 6 || cm == 8 || cm == 10 || cm == 12
+            || cm == 14 || cm == 15)
+            ac4_bit(b);
+    }
+    if (ac4_bit(b))                     /* b_event_probability */
+        ac4_u(b, 4);
+}
+
+int ac4_v0_sub_metadata(const uint8_t *sub, size_t len, int cm, int iframe,
+                        int assoc, int dialog, int drc,
+                        ac4_drc_config *state, const ac4_huff *hcb, int fl,
+                        ac4_meta *out, int *dmax)
+{
+    jmp_buf jb;
+    ac4_bits b;
+    size_t p0;
+    uint64_t asz;
+    ac4_meta m;
+    *dmax = -1;
+    b.d = sub;
+    b.nbits = len * 8;
+    b.p = 0;
+    b.jb = &jb;
+    b.eof_code = AC4E_ELEMENT_PARSE;
+    if (setjmp(jb) != 0)
+        return -1;
+    asz = ac4_u(&b, 15);                /* audio_size (Table 16) */
+    if (ac4_bit(&b)) {
+        asz += ac4_vb(&b, 7) << 15;
+        ac4_align(&b);
+    }
+    if (asz > len)
+        return -1;
+    p0 = b.p + 8 * (size_t)asz;
+    if (ac4_v0_metadata(sub, len, p0, out) != 0)
+        return -1;
+    m = *out;
+    {
+        jmp_buf jb2;
+        b.jb = &jb2;
+        if (setjmp(jb2) != 0)
+            return 0;   /* what parsed is kept (v0_substream_metadata) */
+        b.p = p0;
+        v0_basic(&b, cm, &m);
+        {
+            int dm = -1;
+            ac4_meta e = m;
+            e.has_assoc = 0;
+            v0_extended(&b, cm, assoc, dialog, &e, &dm);
+            out->has_assoc = e.has_assoc;
+            memcpy(out->has_sc, e.has_sc, sizeof(e.has_sc));
+            memcpy(out->sc, e.sc, sizeof(e.sc));
+            *dmax = dm;
+        }
+        {
+            uint32_t sz = ac4_u(&b, 7);
+            (void)sz;
+            if (ac4_bit(&b))
+                ac4_vb(&b, 3);
+        }
+        if (drc) {
+            ac4_meta dm_;
+            memset(&dm_, 0, sizeof(dm_));
+            if (drc_frame(&b, hcb, iframe, state, cm, fl, &dm_)) {
+                out->has_drc = 1;
+                out->cfg = dm_.cfg;
+                out->reset = dm_.reset;
+                memcpy(out->gains, dm_.gains, sizeof(dm_.gains));
+            }
+        }
+    }
+    return 0;
 }

@@ -20,8 +20,8 @@ sees every frame, and the outputs are mixed frame by frame:
     for an associated substream g_assoc (the user's, default 0 dB) and
     scale_main_centre, scale_main_front and scale_main on the main and
     dialogue substreams, in that order (4.8.3.17); the user's dialogue
-    gain g_dialog (default 0 dB, at most dialog_max_gain: not read here,
-    so only gains <= 0 dB are taken);
+    gain g_dialog (default 0 dB, at most g_dialog_max: bitstream_version
+    0's dialog_max_gain, phase E; 0 dB otherwise);
   * the sum is divided by the number of substreams mixed (4.8.4, as
     printed: Y = sum(X_s) / n_sub; MIX_NORMALISE = False drops it, TS 103
     190-1 6.2.16's sum).
@@ -145,6 +145,7 @@ class MixState:
     def __init__(self, n_groups):
         self.sg = [0.0] * n_groups          # dB
         self.assoc = None
+        self.dmax = 0.0                     # g_dialog_max (v0), dB
 
     def update(self, meta):
         if not meta:
@@ -154,6 +155,8 @@ class MixState:
             self.sg = (list(g) + [0.0] * len(self.sg))[:len(self.sg)]
         if meta.get("assoc") is not None:
             self.assoc = dict(meta["assoc"])
+        if meta.get("dmax") is not None:
+            self.dmax = float(meta["dmax"])
 
 
 class MixDecoder:
@@ -212,7 +215,7 @@ class MixDecoder:
         self.drc_mode = drc
         self.leveler = None
         self.assoc_gain = min(0.0, float(assoc_gain))
-        self.dialog_gain = min(0.0, float(dialog_gain))
+        self.dialog_gain = float(dialog_gain)
         self.state = MixState(1 + max(d["sg"] for d in self.subs))
         self.version = self.subs[0].get("version")
         self.concealed = RB.DamageLog()
@@ -260,7 +263,9 @@ class MixDecoder:
             if d["type"] == "associated":
                 m = m * db(self.assoc_gain)
             if d["type"] == "dialogue":
-                m = m * db(self.dialog_gain)
+                # g_dialog, at most g_dialog_max (bitstream_version 0's
+                # dialog_max_gain, phase E; 0 dB otherwise)
+                m = m * db(min(self.dialog_gain, self.state.dmax))
             if a and has_assoc and d["type"] in ("main", "dialogue"):
                 # 4.8.3.17: centre, then L / R, then every channel
                 for key, which in (("scale_main_centre", ("C",)),

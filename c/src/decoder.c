@@ -310,6 +310,7 @@ struct ac4dec {
     /* ---- stats */
     long n_frames, n_out, n_ok, n_concealed, n_bad, n_seq_jumps;
     long n_guard, n_aspx_level, n_burst, n_late;
+    int sus0;                   /* the audio substream is sus_ver 0 */
     int v0;                     /* the frame's presentation is
                                    bitstream_version 0 / 1 */
     /* ---- mixing (mix.py): the other substreams' decoders */
@@ -1616,6 +1617,9 @@ static void late_closure(ac4dec *d)
 /* ------------------------------------------------------------ parse */
 /* Parse and check frame `index` (Ac4Stream.decode_frames, one frame);
    nx = the next frame (has_next 0 at the end of the stream). */
+static const uint8_t *sub_bytes(const ac4_toc *t, const uint8_t *data,
+                                size_t len, long idx, size_t *sl);
+
 static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
                         const uint8_t *nx, size_t nx_len, int has_next,
                         rec_t *r)
@@ -2077,12 +2081,48 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
                                                           : NULL;
         r->meta.valid = 0;
         d->v0 = pp && pp->v0;
+        /* a sus_ver 0 substream outside bitstream_version 0 / 1
+           presentations: its tools metadata is not read (stream.py) */
+        d->sus0 = s && s->kind == 0 && s->sus_ver == 0;
         if (pp && s && pp->v0) {
-            /* bitstream_version 0 / 1 (stream._v0_metadata) */
-            if (ac4_v0_metadata(sub, sub_len,
-                                e->audio_start + 8 * e->audio_size,
-                                &r->meta) != 0)
-                r->meta.valid = 0;
+            /* bitstream_version 0 / 1 (stream._v0_metadata, phase E):
+               dialnorm, truepk and DRC from the associated substream, or
+               Table 16's, the associated audio gains from the
+               associated substream's extended_metadata */
+            static const int CM[8] = { 4, 4, 1, 0, 2, 3, 6, 12 };
+            const ac4_toc_sub *ss[8], *as_ = NULL, *ds_ = NULL, *dn;
+            long gg[8];
+            int ns = ac4_toc_audio_substreams(&t, pi, ss, gg, 8), j, dmx;
+            for (j = 0; j < ns; j++) {
+                int ty = ac4_toc_substream_type(&t, pi, gg[j]);
+                if (ty == 2 && !as_)
+                    as_ = ss[j];
+                if (ty == 1 && !ds_)
+                    ds_ = ss[j];
+            }
+            dn = as_ ? as_ : ((pp->config == 0 || pp->config == 3) && ds_
+                              ? ds_ : NULL);
+            if (!dn) {
+                int cm = d->element == AC4DEC_ELEMENT_7X
+                         || d->element == AC4DEC_ELEMENT_ICE
+                         ? d->ch_mode
+                         : d->element < 8 ? CM[d->element]
+                                          : (int)s->channel_mode;
+                if (ac4_v0_sub_metadata(sub, sub_len, cm, ifr, s == as_,
+                                        s == ds_, 1, &d->drc_state,
+                                        &d->drc_hcb, d->fl, &r->meta,
+                                        &dmx) != 0)
+                    r->meta.valid = 0;
+            } else {
+                size_t dl;
+                const uint8_t *dp = sub_bytes(&t, data, len, dn->index, &dl);
+                if (!dp || ac4_v0_sub_metadata(dp, dl, (int)dn->channel_mode,
+                                               dn->ndot, dn == as_,
+                                               dn == ds_, 1, &d->drc_state,
+                                               &d->drc_hcb, d->fl, &r->meta,
+                                               &dmx) != 0)
+                    r->meta.valid = 0;
+            }
         } else if (pp && s && pp->pres_substream >= 0
             && pp->pres_substream < t.n_substreams
             && pp->pres_substream < t.n_sizes) {
@@ -2144,7 +2184,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
        (stream.py _sub_metadata), read with the coded element's channel
        mode */
     r->de.kind = AC4_DE_NONE;
-    if (d->cfg.de_level != 0.0 && !d->v0
+    if (d->cfg.de_level != 0.0 && !d->v0 && !d->sus0
         && d->element != AC4DEC_ELEMENT_AJOC) {
         static const int CM[8] = { 4, 4, 1, 0, 2, 3, 6, 12 };
         int cm = d->element == AC4DEC_ELEMENT_7X
@@ -2194,6 +2234,22 @@ fail:
         else if (d->seq_prev >= 0)
             d->seq_prev = seq_next(d->seq_prev);
     }
+}
+
+/* substream idx of a frame (its bytes; NULL when outside the table) */
+static const uint8_t *sub_bytes(const ac4_toc *t, const uint8_t *data,
+                                size_t len, long idx, size_t *sl)
+{
+    size_t o = t->toc_bytes + (size_t)t->payload_base;
+    long i;
+    if (idx < 0 || idx >= t->n_sizes || idx >= AC4_MAX_SIZES)
+        return NULL;
+    for (i = 0; i < idx; i++)
+        o += (size_t)t->sizes[i];
+    if (o > len)
+        o = len;
+    *sl = (size_t)t->sizes[idx] > len - o ? len - o : (size_t)t->sizes[idx];
+    return data + o;
 }
 
 /* parse the held raw frame (its successor nx, or none) into a record */

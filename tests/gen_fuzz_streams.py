@@ -38,7 +38,9 @@ def main(out):
     # phase E: direct-coded objects (a bed over two substreams and two
     # dynamic objects; ISF over two substreams)
     import test_phase_e as E
+    import elem_writer as EW
     rng = np.random.default_rng(2027)
+    EW.SF_REF = 160                      # tracks at a realistic level
     for name, subs, objs in (
             ("objs_bed_dyn",
              [dict(kind="bed", n=3, blfe=1, start=("code", 2)),
@@ -53,6 +55,30 @@ def main(out):
         frames, _ = E.objs_frames(rng, subs, objs, n=48, iframe_every=8)
         with open(os.path.join(out, name + ".syn"), "wb") as fh:
             fh.write(b"".join(syncframe(f) for f in frames))
+    # phase E: bitstream_version 0 main + associated audio with their
+    # metadata (associated gains, DRC); bitstream_version 1 with a
+    # presentation of presentation_config 7
+    from test_bitstream_v0 import toc_v0
+    from test_mix import pair_sub
+    rng = np.random.default_rng(2028)
+    frames = []
+    for i in range(48):
+        ifr = int(i % 8 == 0)
+        a = E.v0_sub(rng, "pair", dialnorm=92,
+                     drc="config" if ifr else "data")
+        d = E.v0_sub(rng, "mono", dialnorm=80, assoc=(10, 3, 20, 200))
+        frames.append(toc_v0([("10", None), ("0", None)], [len(a), len(d)],
+                             config=2, seq=5 + i, iframe=ifr) + a + d)
+    with open(os.path.join(out, "v0_assoc.syn"), "wb") as fh:
+        fh.write(b"".join(syncframe(f) for f in frames))
+    frames = []
+    for i in range(48):
+        a = pair_sub(rng)
+        frames.append(E.toc_v1_cfg7(len(a), 5 + i, int(i % 8 == 0),
+                                    skip_extra=1) + bytes(2) + a)
+    with open(os.path.join(out, "v1_cfg7.syn"), "wb") as fh:
+        fh.write(b"".join(syncframe(f) for f in frames))
+    EW.SF_REF = 100
 
 
 if __name__ == "__main__":

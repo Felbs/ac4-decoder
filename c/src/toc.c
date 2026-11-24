@@ -116,12 +116,28 @@ static int frame_rate_fractions_info(ac4_bits *b, int fri, int frf)
     return 1;
 }
 
-static long sgi_specifier(ac4_bits *b)
+static void substream_group_info(ac4_bits *b, int frf, ac4_toc *t,
+                                 ac4_toc_group *g);
+
+/* 6.2.1.7; bitstream_version 1 (presentation_config 7, phase E): the
+   ac4_substream_group_info itself, appended to t's groups */
+static long sgi_specifier_t(ac4_bits *b, ac4_toc *t, int frf)
 {
-    uint64_t g = ac4_u(b, 3);
-    if (g == 7)
-        g += ac4_vb(b, 2);
-    return (long)g;
+    if (t && t->bitstream_version == 1) {
+        ac4_toc_group g;
+        long gi = t->n_groups_all;
+        substream_group_info(b, frf, t, &g);
+        if (t->n_groups < AC4_MAX_GROUPS)
+            t->groups[t->n_groups++] = g;
+        t->n_groups_all++;
+        return gi;
+    }
+    {
+        uint64_t g = ac4_u(b, 3);
+        if (g == 7)
+            g += ac4_vb(b, 2);
+        return (long)g;
+    }
 }
 
 static long substream_index(ac4_bits *b)
@@ -144,9 +160,20 @@ static void presentation_config_ext_info(ac4_bits *b)
 
 /* 6.2.1.3; *frf_out receives frame_rate_factor, *multi is set when
    frame_rate_factor or frame_rate_fraction is not 1 */
+static void presentation_v1_info_t(ac4_bits *b, int fri, int *frf_out,
+                                   int *multi, ac4_toc_pres *p,
+                                   long *max_group, ac4_toc *t);
+
 static void presentation_v1_info(ac4_bits *b, int fri, int *frf_out,
                                  int *multi, ac4_toc_pres *p,
                                  long *max_group)
+{
+    presentation_v1_info_t(b, fri, frf_out, multi, p, max_group, NULL);
+}
+
+static void presentation_v1_info_t(ac4_bits *b, int fri, int *frf_out,
+                                   int *multi, ac4_toc_pres *p,
+                                   long *max_group, ac4_toc *t)
 {
     int single = (int)ac4_bit(b);
     uint64_t cfg = 0;
@@ -204,7 +231,7 @@ static void presentation_v1_info(ac4_bits *b, int fri, int *frf_out,
                       : cfg == 5 ? (long)n_spec : 0;
         }
         for (i = 0; i < n_spec; i++) {
-            long g = sgi_specifier(b);
+            long g = sgi_specifier_t(b, t, frf);
             if (p->n_groups < AC4_MAX_PGROUPS)
                 p->groups[p->n_groups++] = g;
             if (g > *max_group)
@@ -578,8 +605,11 @@ static void substream_group_info(ac4_bits *b, int frf, ac4_toc *t,
     }
     for (i = 0; i < n_lf; i++) {
         ac4_toc_sub s;
-        if (g->channel_coded)
+        if (g->channel_coded) {
+            int sv = t->bitstream_version == 1 ? (int)ac4_bit(b) : 1;
             info_chan(b, present, frf, t, &s);
+            s.sus_ver = sv;
+        }
         else if (ac4_bit(b))            /* b_ajoc */
             info_ajoc(b, present, frf, t, &s);
         else
@@ -672,6 +702,40 @@ static void presentation_info_v0(ac4_bits *b, int fri, int *frf_out,
         n = single ? 1 : cfg <= 5 ? NSUB[cfg] : 0;
         if (!single)
             hsf = (int)ac4_bit(b);      /* b_hsf_ext */
+        if (!single && cfg == 7 && t->bitstream_version == 1) {
+            /* presentation_config_ext_info (6.2.1.5): the
+               ac4_presentation_v1_info it holds is the presentation
+               (toc.presentation_info_v0, phase E) */
+            uint64_t nskip = ac4_u(b, 5);
+            size_t p0, nread;
+            long mg = -1;
+            int frf1 = 1;
+            if (ac4_bit(b))
+                nskip += ac4_vb(b, 2) << 5;
+            p0 = b->p;
+            presentation_v1_info_t(b, fri, &frf1, multi, p, &mg, t);
+            *frf_out = frf1;
+            nread = b->p - p0;
+            if (nread % 8) {
+                ac4_skip(b, (int)(8 - nread % 8));
+                nread += 8 - nread % 8;
+            }
+            if ((uint64_t)(nread / 8) > nskip)
+                ac4_fail(b, b->eof_code);
+            nskip -= nread / 8;
+            if (nskip > b->nbits)
+                ac4_fail(b, b->eof_code);
+            ac4_skip(b, (int)(8 * nskip));
+            ac4_bit(b);                 /* b_pre_virtualized */
+            if (ac4_bit(b)) {           /* b_add_emdf_substreams */
+                uint64_t k = ac4_u(b, 2), j;
+                if (k == 0)
+                    k = ac4_vb(b, 2) + 4;
+                for (j = 0; j < k; j++)
+                    emdf_info(b);
+            }
+            return;
+        }
         if (!single && cfg > 5)
             presentation_config_ext_info(b);
         for (i = 0; i < n; i++) {

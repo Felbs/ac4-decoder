@@ -588,10 +588,12 @@ class Ac4Stream:
                 if acpl1:
                     self.acpl1 = acpl1
                 v0 = bool(st["presentations"][pi].get("v0"))
-                self.meta.append(self._v0_metadata(sub, r, sel) if v0
-                                 else self._pres_metadata(f, st, pi, sel))
+                self.meta.append(self._v0_metadata(sub, r, sel, f, st, pi)
+                                 if v0 else
+                                 self._pres_metadata(f, st, pi, sel))
                 got_de = self._sub_metadata(sub, r, ifr, sel,
-                                            sus_ver=0 if v0 else 1)
+                                            sus_ver=0 if v0 else
+                                            sel.get("sus_ver", 1))
                 self.n_ok += 1
                 self.status.append(None)
                 self.seq_break.append(brk)
@@ -688,21 +690,74 @@ class Ac4Stream:
     # its metadata closes only when read as stereo)
     META_CH_MODE = {"mono": 0, "pair": 1, "3_0": 2, "5_0": 3, "5_X": 4}
 
-    def _v0_metadata(self, sub, r, sel):
-        """bitstream_version 0 / 1 (TS 103 190-2 4.8.5.2, Table 16):
-        dialnorm and truepk from the audio substream's basic_metadata
-        (sus_ver 0) -> dict like _pres_metadata's (no DRC: the sus_ver 0
-        drc_frame is not read), or None."""
+    def _v0_metadata(self, sub, r, sel, f=None, st=None, pi=None):
+        """bitstream_version 0 / 1 (TS 103 190-2 4.8.5.2, Table 16; TS
+        103 190-1 Table 66, phase E): the metadata() of the presentation's
+        substreams -> dict like _pres_metadata's, or None.
+
+        dialnorm, truepk and the DRC frame (4.8.6: the substream that
+        gives dialnorm) come from the associated substream when the
+        presentation has one, else from the substream of Table 16
+        (presentation_config 0 and 3: the dialogue substream; the others:
+        main); assoc (scale_main, _centre, _front, pan_associated) from
+        the associated substream's extended_metadata (b_associated);
+        dmax, g_dialog_max in dB ((1 + dialog_max_gain) x 3, 4.3.12.4.11;
+        0 dB from an I-frame of the dialogue substream that does not send
+        it, else held), from the dialogue substream's (b_dialog)."""
         from . import metadata as MDm
-        from .toc import Bits
+        subs = {}
+        if st is not None and pi is not None:
+            for gi, g, s_ in M.audio_substreams(st, pi):
+                t = M.substream_type(st, pi, gi)
+                if t not in subs:
+                    subs[t] = s_
+        cfg = st["presentations"][pi].get("config") if subs else None
+        dn = ("associated" if "associated" in subs else
+              "dialogue" if cfg in (0, 3) and "dialogue" in subs else None)
+        fl = self.frame_len or RT.DEFAULT_FRAME
+
+        def meta_of(s_, assoc, dialog, drc):
+            b_ = M.substream_bytes(f, st, s_["index"])
+            return MDm.v0_substream_metadata(
+                b_, s_.get("channel_mode", 1), bool(s_["ndot"][0]),
+                self.drc_state, fl, int(assoc), int(dialog), drc)
+
         try:
-            b = Bits(sub)
-            b.p = r["audio_start"] + 8 * r["audio_size"]
-            md = MDm.v0_loudness(b)
+            if dn is None:
+                cm = self.META_CH_MODE.get(self.element,
+                                           sel.get("channel_mode"))
+                md = MDm.v0_substream_metadata(
+                    sub, cm, bool(sel["ndot"][0]), self.drc_state, fl,
+                    int(sel is subs.get("associated")),
+                    int(sel is subs.get("dialogue")))
+            else:
+                md = meta_of(subs[dn], dn == "associated",
+                             dn == "dialogue", True)
         except Exception:                                      # noqa: BLE001
             return None
-        return dict(dialnorm=md["dialnorm"], drc=None, truepk=md["truepk"],
-                    sg_gain=None, assoc=None)
+        assoc = md.get("assoc") if dn == "associated" else None
+        if "associated" in subs and dn != "associated":
+            try:
+                assoc = meta_of(subs["associated"], True, False,
+                                False).get("assoc")
+            except Exception:                                  # noqa: BLE001
+                assoc = None
+        dm = None
+        if "dialogue" in subs:
+            if dn == "dialogue":
+                dm = md
+            else:
+                try:
+                    dm = meta_of(subs["dialogue"], False, True, False)
+                except Exception:                              # noqa: BLE001
+                    dm = None
+            if dm is not None and dm.get("dialog_max_gain") is not None:
+                self.v0_dmax = 3.0 * (1 + dm["dialog_max_gain"])
+            elif subs["dialogue"]["ndot"][0]:
+                self.v0_dmax = 0.0
+        return dict(dialnorm=md["dialnorm"], drc=md.get("drc"),
+                    truepk=md["truepk"], sg_gain=None, assoc=assoc,
+                    dmax=getattr(self, "v0_dmax", 0.0))
 
     def _sub_metadata(self, sub, r, ifr, sel, sus_ver=1):
         """The dialogue enhancement data of the audio substream's

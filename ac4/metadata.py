@@ -700,17 +700,22 @@ def v0_loudness(b):
     return out
 
 
-def extended_metadata(b, ch_mode, sus_ver, b_associated=0):
+def extended_metadata(b, ch_mode, sus_ver, b_associated=0, b_dialog=0):
+    """6.2.7.3 (sus_ver 1: b_dialog read) / TS 103 190-1 Table 69 (sus_ver
+    0: b_associated and b_dialog are parameters, 4.3.12.4.1 / .2) -> dict:
+    dialog, dialog_max_gain (the 2-bit code), assoc (sus_ver 0 with
+    b_associated: scale_main / _centre / _front in dB, pan_associated in
+    degrees for a mono substream, None when not sent), the channels
+    classifier, event_probability."""
     out = {}
-    b_dialog = 0
     if sus_ver >= 1:
         b_dialog = b.u(1)
     elif b_associated:
-        for _ in range(3):
-            if b.u(1):
-                b.u(8)
-        if ch_mode == 0:
-            b.u(8)
+        a = {}
+        for k in ("scale_main", "scale_main_centre", "scale_main_front"):
+            a[k] = scale_db(b.u(8)) if b.u(1) else None
+        a["pan_associated"] = pan_deg(b.u(8)) if ch_mode == 0 else None
+        out["assoc"] = a
     out["dialog"] = b_dialog
     if b_dialog:
         if b.u(1):
@@ -807,4 +812,34 @@ def substream_metadata(sub, audio_start, audio_size, ch_mode, iframe, st,
             n = b.vb(8)
             b.p += 8 * n
             out["emdf"].append(pid)
+    return out
+
+
+def v0_substream_metadata(sub, ch_mode, iframe, drc_state, frame_len,
+                          b_associated=0, b_dialog=0, drc=True):
+    """metadata() of a bitstream_version 0 / 1 audio substream (sus_ver 0,
+    TS 103 190-1 Table 66), located by the substream's audio_size ->
+    dict: dialnorm, truepk (or None), assoc, dialog_max_gain (the code, or
+    None), drc (drc_frame, or None; only with drc). What parses is kept:
+    a substream whose metadata stops parsing gives what came before it
+    (dialnorm and truepk from its first bits, as v0_loudness)."""
+    from .channels import audio_size
+    b = Bits(sub)
+    asz, a0 = audio_size(b)
+    p0 = a0 + 8 * asz
+    b.p = p0
+    out = dict(v0_loudness(b), assoc=None, dialog_max_gain=None, drc=None)
+    try:
+        b.p = p0
+        basic_metadata(b, ch_mode, 0)
+        ext = extended_metadata(b, ch_mode, 0, b_associated, b_dialog)
+        out["assoc"] = ext.get("assoc")
+        out["dialog_max_gain"] = ext.get("dialog_max_gain")
+        size = b.u(7)
+        if b.u(1):
+            size += b.vb(3) << 7
+        if drc:
+            out["drc"] = drc_frame(b, iframe, drc_state, ch_mode, frame_len)
+    except (ValueError, EOFError, KeyError):
+        pass
     return out

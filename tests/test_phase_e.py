@@ -375,3 +375,277 @@ def test_c_objs(tmp_path, case, layout):
         objs = [(False, None, None)] * 8
     frames, _ = objs_frames(rng, subs, objs, n=5)
     _c_vs_python(tmp_path, frames, layout)
+
+
+# ---- bitstream_version 0: extended_metadata, DRC (item 4) ------------------
+
+def v0_meta(cm=1, dialnorm=92, assoc=None, dmax=None, drc=None):
+    """metadata() of a sus_ver 0 substream (TS 103 190-1 Table 66) as
+    bytes: basic_metadata (dialnorm, nothing more), extended_metadata
+    with b_associated (assoc = (scale_main, _centre, _front raw codes or
+    None, pan code for a mono substream)) or b_dialog (dmax:
+    dialog_max_gain code), tools_metadata_size, drc_frame (drc: None,
+    "config": one mode, default profile, eac3_profile 1 (I-frame), or
+    "data": a later frame), no DE, no EMDF."""
+    w = BW().u(7, dialnorm).u(1, 0)
+    if assoc is not None:
+        for v in assoc[:3]:
+            if v is None:
+                w.u(1, 0)
+            else:
+                w.u(1, 1).u(8, v)
+        if cm == 0:
+            w.u(8, assoc[3])
+    if dmax is not None:
+        w.u(1, 1).u(2, dmax).u(1, 0)     # dialog_max_gain, no pan_dialog
+    w.u(1, 0).u(1, 0)                    # channels classifier, event prob.
+    tools = BW()
+    if drc is None:
+        tools.u(1, 0)
+    else:
+        tools.u(1, 1)
+        if drc == "config":
+            tools.u(3, 0).u(3, 0).u(1, 0).u(1, 1).u(3, 1)
+        tools.u(1, 0).u(2, 0)            # drc_reset_flag, reserved
+    tools.u(1, 0).u(1, 0)                # no DE data, no EMDF
+    w.u(7, len(tools.bits)).u(1, 0)
+    w.bits += tools.bits
+    return w.bytes()
+
+
+def v0_sub(rng, kind, **kw):
+    """An audio substream (SIMPLE pair or mono) with its sus_ver 0
+    metadata."""
+    from test_mix import mono_sub, pair_sub
+    body = pair_sub(rng) if kind == "pair" else mono_sub(rng)
+    return body + v0_meta(cm=1 if kind == "pair" else 0, **kw)
+
+
+def test_v0_associated_gains_and_dialnorm():
+    """presentation_config 2 (main + associated): the associated mono
+    substream's extended_metadata (scale_main -3 dB, scale_main_centre
+    absent, scale_main_front -6 dB, pan_associated 30 degrees) reaches
+    the mixer; dialnorm comes from the associated substream (4.8.5.2)."""
+    from test_bitstream_v0 import toc_v0
+    from ac4 import mix as MX
+    from ac4.decoder import Decoder
+    rng = np.random.default_rng(21)
+    frames = []
+    for i in range(5):
+        a = v0_sub(rng, "pair", dialnorm=92)
+        d = v0_sub(rng, "mono", dialnorm=80, assoc=(10, None, 20, 20))
+        frames.append(toc_v0([("10", None), ("0", None)], [len(a), len(d)],
+                             config=2, seq=5 + i, iframe=int(i == 0))
+                      + a + d)
+    subs = MX.probe(frames)
+    assert [x["type"] for x in subs] == ["main", "associated"]
+    mx = MX.MixDecoder(subs, guard=False)
+    y = mx.decode_pass(frames)
+    meta = mx.decs[0].stream.meta
+    assert [m["dialnorm"] for m in meta] == [-20.0] * 5
+    a = meta[0]["assoc"]
+    assert a["scale_main"] == pytest.approx(-3.0)
+    assert a["scale_main_centre"] is None
+    assert a["scale_main_front"] == pytest.approx(-6.0)
+    assert a["pan_associated"] == pytest.approx(30.0)
+    ya = Decoder("pair", guard=False).decode_pass(frames)
+    yb = Decoder("mono", guard=False, substream=1).decode_pass(frames)
+    g = 10 ** (-3 / 20) * 10 ** (-6 / 20)
+    exp = ya * g + np.column_stack([0 * yb[:, 0], yb[:, 0]])
+    assert np.abs(y - exp).max() <= 1e-12 * np.abs(exp).max()
+
+
+def test_v0_dialog_max_gain():
+    """presentation_config 0 (M&E + dialogue): dialog_max_gain 1 (6 dB)
+    caps the user's dialogue gain; an I-frame without it resets it to 0
+    dB (4.3.12.4.11)."""
+    from test_bitstream_v0 import toc_v0
+    from ac4 import mix as MX
+    from ac4.decoder import Decoder
+    rng = np.random.default_rng(22)
+    frames = []
+    for i in range(6):
+        a = v0_sub(rng, "pair")
+        d = v0_sub(rng, "mono", dmax=None if i >= 4 else 1)
+        frames.append(toc_v0([("10", None), ("0", None)], [len(a), len(d)],
+                             config=0, seq=5 + i, iframe=int(i in (0, 4)))
+                      + a + d)
+    mx = MX.MixDecoder(MX.probe(frames), guard=False, dialog_gain=9.0)
+    y = mx.decode_pass(frames)
+    assert [m["dmax"] for m in mx.decs[0].stream.meta] == [6.0] * 4 + [
+        0.0, 0.0]
+    ya = Decoder("pair", guard=False).decode_pass(frames)
+    yb = Decoder("mono", guard=False, substream=1).decode_pass(frames)
+    F = 1536
+    for f, gd in ((1, 6.0), (5, 0.0)):
+        seg = slice(f * F + F // 2, f * F + F // 2 + 1)
+        exp = ya[seg] + yb[seg][:, [0, 0]] * 0.5 * 10 ** (gd / 20)
+        # (frames 1 and 5 hold their matrix from the frame before)
+        assert np.allclose(y[seg], exp, rtol=1e-9, atol=1e-9)
+
+
+def test_v0_drc_frame():
+    """The sus_ver 0 drc_frame (TS 103 190-1 Table 66) is read: its
+    configuration from the I-frame, held after it."""
+    from test_bitstream_v0 import toc_v0
+    from ac4.stream import Ac4Stream
+    rng = np.random.default_rng(23)
+    frames = []
+    for i in range(4):
+        a = v0_sub(rng, "pair", drc="config" if i == 0 else "data")
+        frames.append(toc_v0([("10", 0)], [len(a)], seq=5 + i,
+                             iframe=int(i == 0)) + a)
+    s = Ac4Stream("pair")
+    s.decode_frames(frames)
+    assert s.n_bad == 0
+    d = [m["drc"] for m in s.meta]
+    assert all(x is not None for x in d)
+    assert d[0]["config"]["eac3_profile"] == 1
+    assert [m["id"] for m in d[3]["config"]["modes"]] == [0]
+
+
+@pytest.mark.parametrize("case", ["assoc", "drc"])
+def test_c_v0_metadata(tmp_path, case):
+    """The C decoder against the Python on the v0 metadata streams,
+    loudness-normalised (dialnorm and DRC from the right substream)."""
+    import os
+    import subprocess
+    from test_bitstream_v0 import toc_v0
+    from test_inputs import syncframe
+    from ac4 import mix as MX
+    from ac4.decoder import Decoder
+    cli = os.environ.get("AC4_C_CLI", C_CLI)
+    if not os.path.exists(cli):
+        pytest.skip("c/ac4dec-c not built")
+    rng = np.random.default_rng(24)
+    frames = []
+    for i in range(6):
+        if case == "assoc":
+            a = v0_sub(rng, "pair", dialnorm=92)
+            d = v0_sub(rng, "mono", dialnorm=80, assoc=(10, 3, 20, 200),
+                       drc="config" if i == 0 else "data")
+            frames.append(toc_v0([("10", None), ("0", None)],
+                                 [len(a), len(d)], config=2, seq=5 + i,
+                                 iframe=int(i == 0)) + a + d)
+        else:
+            a = v0_sub(rng, "pair", dialnorm=70,
+                       drc="config" if i == 0 else "data")
+            frames.append(toc_v0([("10", 0)], [len(a)], seq=5 + i,
+                                 iframe=int(i == 0)) + a)
+    src = tmp_path / "e.ac4"
+    src.write_bytes(b"".join(syncframe(f) for f in frames))
+    raw = tmp_path / "e.f64"
+    subprocess.run([cli, str(src), str(tmp_path / "e.wav"), "--f64",
+                    str(raw), "--internal", "--no-guard", "-q"], check=True)
+    subs = MX.probe(frames)
+    if len(subs) > 1:
+        dec = MX.MixDecoder(subs, guard=False, target_level=-24.0)
+        for d_ in dec.decs:
+            d_.hf_ratio = None
+    else:
+        dec = Decoder("pair", guard=False, target_level=-24.0)
+        dec.hf_ratio = None
+    ref = dec.decode_pass(frames)
+    got = np.fromfile(raw, "<f8").reshape(-1, len(dec.chans))
+    assert got.shape == ref.shape
+    assert np.abs(got - ref).max() <= 1e-9 * np.abs(ref).max()
+
+
+def toc_v1_cfg7(sub_len, seq=5, iframe=1, sus_ver=1, skip_extra=0):
+    """bitstream_version 1, one ac4_presentation_info of
+    presentation_config 7 whose presentation_config_ext_info holds an
+    ac4_presentation_v1_info (single group, inline: one stereo
+    substream, index 1; presentation substream index 0)."""
+    from test_phase_a import emdf_info, rate_info
+    v = BW().u(1, 1)                     # b_single_substream_group
+    v.u(1, 1).u(1, 0)                    # presentation_version 1
+    v.u(3, 0).u(1, 0)                    # md_compat, b_presentation_id
+    rate_info(v, 3)
+    emdf_info(v)
+    v.u(1, 0)                            # b_presentation_filter
+    # ac4_sgi_specifier (bitstream_version 1): ac4_substream_group_info
+    v.u(1, 1).u(1, 0).u(1, 1).u(1, 1)    # present, no hsf, single, chan
+    v.u(1, sus_ver).u(2, 0b10)           # sus_ver, channel_mode stereo
+    v.u(1, 0).u(1, 0).u(1, iframe).u(2, 1)   # sf_mult, bitrate, ndot, idx
+    v.u(1, 0)                            # b_content_type
+    v.u(1, 0).u(1, 0)                    # b_pre_virtualized, b_add_emdf
+    v.u(1, 0).u(1, 1).u(2, 0)            # presentation_substream_info
+    vb = v.bytes()
+    w = BW().u(2, 1).u(10, seq).u(1, 0).u(1, 1).u(4, 3).u(1, iframe)
+    w.u(1, 1).u(1, 0)                    # single presentation, no base
+    w.u(1, 0).u(3, 7).vb(2, 0)           # presentation_config 7
+    w.u(1, 0)                            # presentation_version 0
+    w.u(3, 0).u(1, 0)                    # md_compat, b_presentation_id
+    rate_info(w, 3)
+    emdf_info(w)
+    w.u(1, 0)                            # b_hsf_ext
+    n = len(vb) + skip_extra
+    w.u(5, n & 31).u(1, int(n > 31))
+    if n > 31:
+        w.vb(2, n >> 5)
+    for byte in vb + bytes(skip_extra):
+        w.u(8, byte)
+    w.u(1, 0).u(1, 0)                    # b_pre_virtualized, b_add_emdf
+    w.u(2, 2).u(1, 0).u(10, 2).u(1, 0).u(10, sub_len)
+    return w.bytes()
+
+
+@pytest.mark.parametrize("skip_extra", [0, 3])
+def test_v1_presentation_config_7(skip_extra):
+    """bitstream_version 1, presentation_config 7: the
+    ac4_presentation_v1_info in presentation_config_ext_info (TS 103
+    190-2 6.2.1.5) is the presentation decoded; it decodes as the same
+    audio under a bitstream_version 2 TOC."""
+    from test_mix import pair_sub, pres_sub
+    from ac4.decoder import Decoder
+    import elem_writer as EW_
+    rng = np.random.default_rng(31)
+    f1, f2 = [], []
+    for i in range(5):
+        a = pair_sub(rng)
+        ps = bytes(2)
+        f1.append(toc_v1_cfg7(len(a), 5 + i, int(i == 0),
+                              skip_extra=skip_extra) + ps + a)
+        t = dict(pres=[dict(groups=[0], pres_sub=0)],
+                 groups=[dict(ch_mode_code="10", index=1,
+                              ndot=int(i == 0))], sizes=[2, len(a)])
+        from test_phase_a import build_toc
+        f2.append(build_toc(**t, seq=5 + i, iframe=int(i == 0)) + ps + a)
+    st = M.parse(f1[0])
+    p = st["presentations"][0]
+    assert p.get("config_ext") == 7 and not p.get("v0")
+    assert M.audio_substream(st, 0)["channel_mode"] == 1
+    a = Decoder("pair", guard=False)
+    b = Decoder("pair", guard=False)
+    ya, yb = a.decode_pass(f1), b.decode_pass(f2)
+    assert a.n_concealed == 0 and b.n_concealed == 0
+    assert np.abs(ya).max() > 0 and np.array_equal(ya, yb)
+
+
+def test_c_v1_presentation_config_7(tmp_path):
+    import os
+    import subprocess
+    from test_mix import pair_sub
+    from test_inputs import syncframe
+    from ac4.decoder import Decoder
+    cli = os.environ.get("AC4_C_CLI", C_CLI)
+    if not os.path.exists(cli):
+        pytest.skip("c/ac4dec-c not built")
+    rng = np.random.default_rng(32)
+    frames = []
+    for i in range(5):
+        a = pair_sub(rng)
+        frames.append(toc_v1_cfg7(len(a), 5 + i, int(i == 0),
+                                  skip_extra=2) + bytes(2) + a)
+    src = tmp_path / "e.ac4"
+    src.write_bytes(b"".join(syncframe(f) for f in frames))
+    raw = tmp_path / "e.f64"
+    subprocess.run([cli, str(src), str(tmp_path / "e.wav"), "--f64",
+                    str(raw), "--internal", "--no-guard", "--legacy-level",
+                    "-q"], check=True)
+    dec = Decoder("pair", guard=False)
+    dec.hf_ratio = None
+    ref = dec.decode_pass(frames)
+    got = np.fromfile(raw, "<f8").reshape(-1, 2)
+    assert dec.n_concealed == 0 and got.shape == ref.shape
+    assert np.abs(got - ref).max() <= 1e-9 * np.abs(ref).max()
