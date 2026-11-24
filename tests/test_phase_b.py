@@ -928,3 +928,18 @@ def test_companding_frame_is_5_7_5_2(sync, on, avg):
         want = orig[c].copy()
         want[:sbx, ta:tz] *= g * G
         assert np.allclose(Qs[c], want, rtol=1e-12)
+
+
+@pytest.mark.parametrize("fl", [2048, 1920, 1536, 1024, 768, 512, 384])
+def test_frame_walker_uses_the_stream_frame_length(fl):
+    """The survey's frame walk (frameinfo.FrameWalker) parses with the
+    decoder's frame length: the element tables' fl and num_aspx_timeslots
+    (the A-SPX time grid) as Ac4Stream._set_rate sets them. Walking a
+    25 fps stream (2048) as 1536 misread its aspx_framing."""
+    from ac4 import aspx_bands as A
+    from ac4.frameinfo import FrameWalker
+    w = FrameWalker("pair", fl)
+    assert w.nats == A.num_aspx_timeslots(fl)
+    assert w.T.get("fl", 1536) == fl
+    if fl == 2048:
+        assert w.nats != A.num_aspx_timeslots(1536)

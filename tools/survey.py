@@ -40,6 +40,7 @@ from ac4 import channels as C                              # noqa: E402
 from ac4 import container                                  # noqa: E402
 from ac4 import decoder as DEC                            # noqa: E402
 from ac4 import metadata as MD                             # noqa: E402
+from ac4 import rates as RT                                # noqa: E402
 from ac4 import toc as M                                   # noqa: E402
 from ac4.frameinfo import FrameWalker                      # noqa: E402
 from ac4.toc_v1 import Bits, CH_MODE_NAME                  # noqa: E402
@@ -156,7 +157,11 @@ def survey_file(path, max_frames=None):
                st["n_substreams"], st.get("payload_base", 0) > 0)] += 1
         if st["b_iframe_global"]:
             S.iframes.append(fi)
-        flen = FRAME_LEN.get(fri, 1536)
+        # the frame length the decoder uses (Ac4Stream._set_rate): the
+        # element parse and the A-SPX time grid both depend on it
+        flen = (RT.frame_len_base(st["fs_index"], fri)
+                or FRAME_LEN.get(fri, 1536))
+        Tf = T if flen == 1536 else dict(T, fl=flen)
         done = set()
         for pi, p in enumerate(st["presentations"]):
             subs = M.presentation_substreams(st, pi)
@@ -247,7 +252,7 @@ def survey_file(path, max_frames=None):
                     S.errors["substream index outside the table"] += 1
                     continue
                 try:
-                    h = element_header(sub, cm, ifr, T)
+                    h = element_header(sub, cm, ifr, Tf)
                     c[f"{h['element']} {h.get('codec_mode', '')}".strip()] += 1
                     if "coding_config" in h:
                         c[f"coding_config {h['coding_config']}"] += 1
@@ -256,10 +261,11 @@ def survey_file(path, max_frames=None):
                     continue
                 # a full walk where this decoder has the element
                 el = ("pair" if cm == 1 else "5_X" if cm == 4 else None)
-                if el and h.get("codec_mode") in (("SIMPLE", "ASPX")
-                                                  if el == "pair" else
-                                                  ("ASPX", "ASPX_ACPL_3")):
-                    w = walkers.setdefault(k, FrameWalker(el))
+                if el and h.get("codec_mode") in (PAIR_MODE if el == "pair"
+                                                  else X5_MODE):
+                    w = walkers.get((k, flen))
+                    if w is None:
+                        w = walkers[(k, flen)] = FrameWalker(el, flen)
                     P.STATS = {}
                     r = w.walk_sub(sub, ifr)
                     for kk, v in P.STATS.items():
@@ -268,6 +274,9 @@ def survey_file(path, max_frames=None):
                     c[f"walk {r['status']}"] += 1
                     if r.get("error"):
                         S.errors[f"walk: {r['error'][:50]}"] += 1
+                    elif r["status"] == "closed" and r["slack"] < 0:
+                        # read past audio_size: the walk is wrong somewhere
+                        S.errors["walk: read past audio_size"] += 1
                     for sm in r.get("sap") or []:
                         c[f"sap_mode {sm}"] += 1
                     for kk in r.get("flags", ()):

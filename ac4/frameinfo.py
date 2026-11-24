@@ -37,11 +37,18 @@ from .toc import Bits
 
 
 class FrameWalker:
-    def __init__(self, element):
+    def __init__(self, element, frame_len=None):
+        """frame_len: the stream's frame_len_base (TS 103 190-1 Table 83);
+        None = 1536. The element parse (transform lengths) and A-SPX
+        (num_aspx_timeslots, hence the time grid of aspx_framing) both
+        depend on it, as in the decoder (Ac4Stream._set_rate)."""
         if element not in ("5_X", "pair"):
             raise ValueError(element)
         self.element = element
+        self.frame_len = frame_len or 1536
         self.T = C.load_tables()
+        if frame_len:
+            self.T = dict(self.T, fl=frame_len)
         arrays = H.parse_c(H.DEFAULT_C)
         self.tabs = {n[:-4]: S.Huff(arrays[n], arrays[n[:-4] + "_CW"])
                      for n in arrays
@@ -50,7 +57,7 @@ class FrameWalker:
             P.CENTRE[nm] = 0 if nm.endswith("_F0") else \
                 (len(arrays[nm + "_LEN"]) - 1) // 2
         self.acpl_books = AP.load_books(arrays)
-        self.nats = A.num_aspx_timeslots()
+        self.nats = A.num_aspx_timeslots(self.frame_len)
         self.cfg = None              # A-SPX config (i-frames only)
         self.acpl_cfg = None         # A-CPL config (i-frames only)
         self.fstate = {}
@@ -115,10 +122,9 @@ class FrameWalker:
             out["codec_mode"] = r.get("codec_mode")
             if r.get("aspx"):
                 self.cfg = r["aspx"]
-            if r.get("acpl_cfg"):
-                self.acpl_cfg = r["acpl_cfg"]
+            if r.get("acpl") or r.get("acpl_cfg"):
+                self.acpl_cfg = r.get("acpl") or r["acpl_cfg"]
             b.p = r["bits"]
-            mode = r.get("codec_mode")
             blocks = list(r.get("aspx_blocks", ()))
             if blocks and self.cfg is None:
                 out["status"] = "no_config"
@@ -127,11 +133,20 @@ class FrameWalker:
             for grp, two in blocks:
                 P.aspx_data(b, self.tabs, t, self.cfg, self.nats, ifr, two,
                             self.fstate, grp)
-            if mode == 4 and self.element != "pair":
+            # A-CPL side data after the A-SPX blocks, as the decoder reads
+            # it (Ac4Stream.decode_frames): ASPX_ACPL_3 one
+            # acpl_data_2ch(), ASPX_ACPL_1 / _2 one acpl_data_1ch() per
+            # module
+            acpl3 = r.get("acpl3")
+            n1 = r.get("acpl_blocks", 0) if r.get("acpl1") else 0
+            if acpl3 or n1:
                 if self.acpl_cfg is None:
                     out["status"] = "no_config"
                     return out
-                AP.acpl_data_2ch(b, self.acpl_books, self.acpl_cfg)
+                if acpl3:
+                    AP.acpl_data_2ch(b, self.acpl_books, self.acpl_cfg)
+                for _ in range(n1):
+                    AP.acpl_data_1ch(b, self.acpl_books, self.acpl_cfg)
             out["end"] = b.p - start
             out["slack"] = size * 8 - (b.p - start)
             out["status"] = "closed"
@@ -140,6 +155,6 @@ class FrameWalker:
         return out
 
 
-def walk(frames, element):
-    w = FrameWalker(element)
+def walk(frames, element, frame_len=None):
+    w = FrameWalker(element, frame_len)
     return [w.walk(f) for f in frames]
