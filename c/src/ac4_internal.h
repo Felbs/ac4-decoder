@@ -160,7 +160,16 @@ typedef struct {
     /* ch_mode 11 - 14 (TS 103 190-2 6.3.2.7): b_4_back_channels_present,
        b_centre_present, top_channels_present (1, 1, 3 otherwise) */
     int back4, centre, top;
+    /* A-JOC (kind 1; ac4_substream_info_ajoc, 6.2.1.9): b_lfe,
+       b_static_dmx, the full-band downmix and upmix signal counts and
+       their types (bed_dyn_obj_assignment: a render id RN_* for a bed
+       channel, AC4_OBJ_DYN, AC4_OBJ_ISF; the first AC4_MAX_DMX / _UMX) */
+    int lfe, static_dmx, n_dmx;
+    long n_umx;
+    signed char dmx_type[16], umx_type[64];
 } ac4_toc_sub;
+#define AC4_OBJ_DYN (-1)
+#define AC4_OBJ_ISF (-2)
 
 typedef struct {
     int substreams_present, hsf_ext, channel_coded;
@@ -352,6 +361,12 @@ typedef struct {
     int r_silent;               /* the pair's R not coded (ASPX_ACPL_2) */
     int comp_c;                 /* companding_control index of the centre
                                    block (2; 0 for mono) */
+    int comp_var;               /* A-JOC var_channel_element: the
+                                   companding index of a pair block p is
+                                   2 p, 2 p + 1 (groups 0, 1, 3), of the
+                                   odd signal n - 1 */
+    int tail;                   /* audio_data_ajoc: OAMD and A-JOC data
+                                   follow the A-SPX blocks */
     size_t audio_size, audio_start;
     size_t bits_end;            /* where the core parse ended */
     /* the tracks, by output channel (decoder.c CH_*: L R C LFE Ls Rs;
@@ -399,6 +414,9 @@ void ac4_parse_7x(ac4_bits *b, const ac4_books *bk, int b_iframe,
    X1 (Tfl) X2 (Tfr); the other modes and 9.X.4 raise element.parse */
 void ac4_parse_ice(ac4_bits *b, const ac4_books *bk, int b_iframe,
                    int ch_mode, ac4_element *e);
+void ac4_parse_ajoc(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                    int lfe, int static_dmx, int n, long n_umx,
+                    ac4_element *e);
 
 /* ------------------------------------------------------------ A-SPX
  * Port of ac4/aspx_bands.py, aspx_parse.py, aspx_env.py, aspx_envadj.py,
@@ -883,6 +901,30 @@ typedef struct {
     ac4_drc_gains gains[8];     /* by mode id */
 } ac4_meta;
 
+/* ------------------------------------------------------------ oamd.c
+ * Object audio metadata and A-JOC side information (ac4/oamd.py,
+ * ac4/ajoc.py): one object's state (oamd.ObjState) */
+typedef struct {
+    double gain, priority;      /* dB; -inf for an inactive object */
+    int active;
+    int px, py, pz;             /* standard precision codes */
+    double x, y, z;             /* room position (6.3.9.8.4) */
+    int zone_mask;
+} ac4_obj;
+/* the A-JOC substream's objects between frames (elements.ajoc_tail):
+   downmix (LFE first) and upmix objects, num_obj_info_blocks, the
+   dialogue objects of ajoc_dmx_de_data */
+typedef struct {
+    int init, blocks, n_dlg;
+    ac4_obj dmx[17], umx[65];
+} ac4_obj_state;
+void ac4_obj_init(ac4_obj *o);
+void ac4_oamd_common_data(ac4_bits *b);
+/* the rest of audio_data_ajoc after the downmix's A-SPX blocks; bk: the
+   twelve AC4T_AJOC_BOOKS. Raises through b->jb. */
+void ac4_ajoc_tail(ac4_bits *b, const ac4_huff *bk, const ac4_toc_sub *info,
+                   int ifr, ac4_obj_state *st);
+
 /* ------------------------------------------------------------ render.c
  * Rendering to an output layout (ac4/render.py). Channel ids: */
 enum { RN_L, RN_R, RN_C, RN_LFE, RN_LS, RN_RS, RN_LB, RN_RB, RN_TFL,
@@ -897,6 +939,12 @@ const int *ac4_layout_ids(int layout);
 void ac4_render_matrix(const int *ids, int n_in, int layout,
                        const ac4_cdmx *c, double *R);
 void ac4_cdmx_hold(ac4_cdmx *held, const ac4_cdmx *c);
+/* objrender.gains: one object at room position (x, y, z) on the layout
+   channels ids[0 .. n) (RN_*; LFE and negative ids get 0) -> g[0 .. n) */
+void ac4_obj_gains(double x, double y, double z, const int *ids, int n,
+                   double *g);
+/* objrender.bed_position */
+void ac4_bed_position(int id, double *x, double *y, double *z);
 
 /* -> 0 (out->valid tells whether dialnorm parsed), -1 when nothing did.
    state: the DRC configuration, updated on an I-frame. hcb: DRC_HCB. */

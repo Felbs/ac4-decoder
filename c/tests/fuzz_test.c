@@ -178,11 +178,12 @@ static void synthetic(void)
     /* garbage of any bitstream_version can set any rate: the per-frame
        sample count is checked against the rate the decoder took */
     g_any_rate = 1;
-    /* auto, 5_X, pair, and the immersive element on garbage */
-    for (el = 0; el <= 3; el++)
+    /* auto, 5_X, pair, the immersive and A-JOC elements on garbage */
+    for (el = 0; el <= 4; el++)
         for (internal = 0; internal <= 1; internal++) {
             ac4dec_element e = el == 3 ? AC4DEC_ELEMENT_ICE
-                                       : (ac4dec_element)el;
+                               : el == 4 ? AC4DEC_ELEMENT_AJOC
+                                         : (ac4dec_element)el;
             run(fr, 300, e, internal, &n_conc, NULL, NULL);
             run_la(fr, 300, e, internal, AC4DEC_MIN_LOOKAHEAD, &n_conc, NULL,
                    NULL);

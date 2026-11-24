@@ -37,6 +37,12 @@ extern const ac4t_book AC4T_ACPL_BOOKS[AC4T_N_ACPL_BOOKS];
 #define AC4T_N_MISC_BOOKS 5
 extern const ac4t_book AC4T_MISC_BOOKS[AC4T_N_MISC_BOOKS];
 
+/* A-JOC books (TS 103 190-2 Annex A.1.1; ac4_tables_p2.c, from
+   c/tools/gen_tables_p2.py): 6 * w + 3 * q + h, w 0..1 = DRY, WET; q
+   0..1 = COARSE, FINE; h 0..2 = F0, DF, DT (cb_off 0, 0, (n - 1) / 2) */
+#define AC4T_N_AJOC_BOOKS 12
+extern const ac4t_book AC4T_AJOC_BOOKS[AC4T_N_AJOC_BOOKS];
+
 /* Table D.3 QMF prototype (640 taps) and Table D.2 ASPX_NOISE (re, im). */
 extern const double AC4T_QWIN[640];
 extern const double AC4T_ASPX_NOISE[512][2];

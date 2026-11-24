@@ -65,8 +65,9 @@ static void usage(void)
 }
 
 static const char *const KIND[4] = { "unknown", "mp4", "sync", "ts" };
-static const char *const EL_NAME[8] = { "auto", "5_X", "pair", "mono",
-                                        "3_0", "5_0", "7_X", "ice" };
+static const char *const EL_NAME[9] = { "auto", "5_X", "pair", "mono",
+                                        "3_0", "5_0", "7_X", "ice",
+                                        "ajoc" };
 static const char *const CMODE[11] = {
     "Mono", "Stereo", "3.0", "5.0", "5.1", "7.0 (3/4/0)", "7.1 (3/4/0.1)",
     "7.0 (5/2/0)", "7.1 (5/2/0.1)", "7.0 (3/2/2)", "7.1 (3/2/2.1)"

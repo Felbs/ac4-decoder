@@ -463,6 +463,9 @@ def ajoc_element(sub, T, info, b_iframe=False):
     b_static_dmx: the downmix is a 5.0 / 5.1 audio_data_chan (5_X
     element); otherwise a var_channel_element of n_dmx signals (at most
     seven here; more are concealed, element.parse)."""
+    if info["n_upmix"] > 64:
+        raise Damaged("element.parse", "A-JOC with more than 64 upmix "
+                      "objects not built")
     if info["static"]:
         out = C.decode_element(sub, T, b_iframe=b_iframe,
                                has_lfe=bool(info["b_lfe"]))

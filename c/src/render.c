@@ -7,6 +7,10 @@
 
 #include "ac4_internal.h"
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 static const int LAY_N[8] = { 0, 2, 6, 8, 10, 8, 10, 12 };
 static const int LAY[8][12] = {
     { 0 },
@@ -239,4 +243,109 @@ void ac4_cdmx_hold(ac4_cdmx *held, const ac4_cdmx *c)
         held->loro_s = c->loro_s;
         held->lfe_mixgain = c->lfe_mixgain;
     }
+}
+
+/* ------------------------------------------------------------ objects */
+/* objrender.py: Table A.30 azimuths (the surrounds by the layout) */
+static double az_of(int id, int seven)
+{
+    switch (id) {
+    case RN_L: case RN_TFL: return 45.0;
+    case RN_R: case RN_TFR: return -45.0;
+    case RN_C: return 0.0;
+    case RN_LB: case RN_TBL: return 135.0;
+    case RN_RB: case RN_TBR: return -135.0;
+    case RN_TSL: return 90.0;
+    case RN_TSR: return -90.0;
+    case RN_LW: return 60.0;
+    case RN_RW: return -60.0;
+    case RN_LS: return seven ? 90.0 : 110.0;
+    case RN_RS: return seven ? -90.0 : -110.0;
+    default: return 0.0;
+    }
+}
+
+static int is_top(int id)
+{
+    return id == RN_TFL || id == RN_TFR || id == RN_TBL || id == RN_TBR
+           || id == RN_TSL || id == RN_TSR;
+}
+
+/* objrender._ring_gains: ring[k] output index, az[k] azimuth; centre:
+   the room's centre */
+static void ring_gains(double a_in, int centre, const int *ring,
+                       const double *az, int n, double w, double *g)
+{
+    int ord[16], i, j;
+    double a;
+    if (n == 0)
+        return;
+    if (centre || n == 1) {
+        double v = 1.0 / sqrt((double)n);
+        for (i = 0; i < n; i++)
+            g[ring[i]] = g[ring[i]] + w * v;
+        return;
+    }
+    for (i = 0; i < n; i++)
+        ord[i] = i;
+    for (i = 1; i < n; i++)              /* stable insertion sort */
+        for (j = i; j > 0 && az[ord[j - 1]] > az[ord[j]]; j--) {
+            int t = ord[j];
+            ord[j] = ord[j - 1];
+            ord[j - 1] = t;
+        }
+    a = fmod(a_in + 180.0, 360.0) - 180.0;
+    for (i = 0; i < n; i++) {
+        double a0 = az[ord[i]], a1 = az[ord[(i + 1) % n]];
+        double hi = i + 1 < n ? a1 : a1 + 360.0;
+        double x = a >= a0 ? a : a + 360.0;
+        if (a0 <= x && x <= hi) {
+            double t = hi > a0 ? (x - a0) / (hi - a0) : 0.0;
+            g[ring[ord[i]]] = g[ring[ord[i]]] + w * cos(t * M_PI / 2);
+            g[ring[ord[(i + 1) % n]]] = g[ring[ord[(i + 1) % n]]]
+                                        + w * sin(t * M_PI / 2);
+            return;
+        }
+    }
+    g[ring[ord[0]]] = g[ring[ord[0]]] + w * 1.0;
+}
+
+void ac4_obj_gains(double x, double y, double z, const int *ids, int n,
+                   double *g)
+{
+    int ear[16], top[16], ne = 0, nt = 0, i, seven = 0, centre;
+    double aze[16], azt[16], X = 2.0 * x - 1.0, Y = 1.0 - 2.0 * y;
+    double Z = z < -1.0 ? -1.0 : z > 1.0 ? 1.0 : z, az = 0.0, we, wt;
+    for (i = 0; i < n; i++) {
+        g[i] = 0.0;
+        if (ids[i] == RN_LB)
+            seven = 1;
+    }
+    for (i = 0; i < n; i++) {
+        if (ids[i] == RN_LFE || ids[i] < 0)
+            continue;
+        if (is_top(ids[i])) {
+            top[nt] = i;
+            azt[nt++] = az_of(ids[i], seven);
+        } else {
+            ear[ne] = i;
+            aze[ne++] = az_of(ids[i], seven);
+        }
+    }
+    centre = fabs(X) < 1e-9 && fabs(Y) < 1e-9;
+    if (!centre)
+        az = atan2(-X, Y) * (180.0 / M_PI);
+    wt = Z > 0 && nt ? sin(Z * M_PI / 2) : 0.0;
+    we = Z > 0 && nt ? cos(Z * M_PI / 2) : 1.0;
+    ring_gains(az, centre, ear, aze, ne, we, g);
+    if (wt != 0.0)
+        ring_gains(az, centre, top, azt, nt, wt, g);
+}
+
+void ac4_bed_position(int id, double *x, double *y, double *z)
+{
+    double a = az_of(id, 0) * (M_PI / 180.0);
+    *x = (1.0 - sin(a)) / 2.0;
+    *y = (1.0 - cos(a)) / 2.0;
+    *z = is_top(id) ? 1.0 : 0.0;
 }

@@ -831,6 +831,7 @@ static void element_reset(ac4_element *e)
     e->n_acpl1 = 0;
     e->r_silent = 0;
     e->comp_present = 0;
+    e->comp_var = e->tail = 0;
     e->has_aspx_cfg = e->has_acpl_cfg = 0;
     e->n_st = e->n_steps = e->n_side = e->n_order = 0;
     e->comp_c = 2;
@@ -1211,5 +1212,87 @@ void ac4_parse_ice(ac4_bits *b, const ac4_books *bk, int b_iframe,
     e->blk_two[3] = 0;
     e->acpl1 = AC4_ACPL1_ICE;
     e->n_acpl1 = 4;
+    e->bits_end = b->p;
+}
+
+/* elements.ajoc_element: an A-JOC substream's downmix (core decoding):
+   b_static_dmx a 5_X element (5.0 / 5.1), else b_some_signals_inactive and
+   a var_channel_element (6.2.4.4) of n_dmx signals (1 .. 7) on the slots
+   of elements.VAR_SLOTS (pairs on L/R, Ls/Rs, X1/X2 = Tfl/Tfr, an odd last
+   signal on C). e->tail is set: the rest (OAMD, A-JOC side information)
+   follows the A-SPX blocks (oamd.c). */
+void ac4_parse_ajoc(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                    int lfe, int static_dmx, int n, long n_umx,
+                    ac4_element *e)
+{
+    static const int SL[8][7] = {
+        { 0 }, { K_C }, { K_L, K_R }, { K_L, K_R, K_C },
+        { K_L, K_R, K_LS, K_RS }, { K_L, K_R, K_LS, K_RS, K_C },
+        { K_L, K_R, K_LS, K_RS, K_X1, K_X2 },
+        { K_L, K_R, K_LS, K_RS, K_X1, K_X2, K_C } };
+    static const int PG[3] = { 0, 1, 3 };
+    int n_pairs, p, nb = 0;
+    if (n_umx > 64)
+        ac4_fail(b, AC4E_ELEMENT_PARSE);
+    if (static_dmx) {
+        ac4_parse_5x_lfe(b, bk, b_iframe, lfe, e);
+        e->tail = 1;
+        return;
+    }
+    if (n < 1 || n > 7)
+        ac4_fail(b, AC4E_ELEMENT_PARSE);
+    element_reset(e);
+    audio_size(b, e);
+    if (ac4_bit(b))                       /* b_some_signals_inactive */
+        ac4_u(b, n);                      /* dmx_active_signals_mask */
+    e->mode = (int)ac4_bit(b);            /* var_codec_mode */
+    if (e->mode == 1) {
+        if (b_iframe) {
+            aspx_config(b, &e->aspx_cfg);
+            e->has_aspx_cfg = 1;
+        }
+        if (n <= 5)
+            companding_control(b, n, e);
+    }
+    if (lfe)
+        mono_data(b, bk, 1, e, K_LFE);
+    n_pairs = n / 2;
+    if (n % 2) {
+        if (n == 1) {
+            mono_data(b, bk, 0, e, K_C);
+        } else {
+            for (p = 0; p < n_pairs - 1; p++)
+                two_ch(b, bk, e, SL[n][2 * p], SL[n][2 * p + 1], 0);
+            if (ac4_bit(b) == 0) {        /* var_coding_config */
+                two_ch(b, bk, e, SL[n][2 * n_pairs - 2],
+                       SL[n][2 * n_pairs - 1], 0);
+                mono_data(b, bk, 0, e, SL[n][n - 1]);
+            } else {
+                int k3[3];
+                k3[0] = SL[n][2 * n_pairs - 2];
+                k3[1] = SL[n][2 * n_pairs - 1];
+                k3[2] = SL[n][n - 1];
+                n_ch(b, bk, e, 3, k3);
+            }
+        }
+    } else {
+        for (p = 0; p < n_pairs; p++)
+            two_ch(b, bk, e, SL[n][2 * p], SL[n][2 * p + 1], 0);
+    }
+    if (e->mode == 1) {
+        for (p = 0; p < n_pairs; p++) {
+            e->blk_grp[nb] = PG[p];
+            e->blk_two[nb++] = 1;
+        }
+        if (n % 2) {
+            e->blk_grp[nb] = 2;
+            e->blk_two[nb++] = 0;
+        }
+    }
+    e->n_blocks = nb;
+    /* companding_control's channel of each block (stream.py cidx) */
+    e->comp_var = 1;
+    e->comp_c = n - 1;
+    e->tail = 1;
     e->bits_end = b->p;
 }

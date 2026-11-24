@@ -131,6 +131,8 @@ typedef struct {
     ac4_aspx_frame af[NPAIR];   /* L/R, Ls/Rs, C (as C/C) */
     ac4_meta meta;              /* presentation substream (valid 0: none) */
     ac4_de_entry de;            /* dialogue enhancement data */
+    int has_obj;                /* AJOC: the downmix objects parsed */
+    ac4_obj obj[17];
 } rec_t;
 
 /* a frame from before the first aspx_config (audio_size.late) */
@@ -154,6 +156,8 @@ typedef struct {
     int ok;
     int n;                      /* samples (the frame length) */
     ac4_meta meta;
+    int has_obj;                /* AJOC: the frame's downmix objects */
+    ac4_obj obj[17];
     double pcm[NOUT][FRAME];
 } outf_t;
 
@@ -179,6 +183,15 @@ struct ac4dec {
     int ice_back4, ice_top;     /* ICE: b_4_back_channels_present,
                                    top_channels_present */
     int ice_known;              /* ... read from the stream's TOC */
+    /* AJOC: the substream's info (ac4_toc_sub, from the TOC), the
+       objects' state (oamd.c), the A-JOC codebooks, the downmix objects
+       held for rendering */
+    ac4_toc_sub ajoc_info;
+    int ajoc_known;
+    ac4_obj_state obj;
+    ac4_huff ajoc_huff[AC4T_N_AJOC_BOOKS];
+    ac4_obj obj_held[17];
+    int obj_have;
     int out_ch[NOUT];           /* output channel c is slot out_ch[c] */
     /* an output layout (cfg.layout, render.c): n_lay channels from the
        n_ch decoded ones through rmat (n_lay x n_ch), with the custom
@@ -415,6 +428,8 @@ static ac4dec_element element_of_toc(const ac4dec_config *c, const ac4_toc *t)
     long cm;
     if (!s)
         return AC4DEC_ELEMENT_AUTO;
+    if (s->kind == 1)
+        return AC4DEC_ELEMENT_AJOC;
     cm = s->channel_mode;
     switch (cm) {
     case 0: return AC4DEC_ELEMENT_MONO;
@@ -557,9 +572,70 @@ static void render_ids(const ac4dec *d, int *ids)
     }
 }
 
+static int ajoc_layout(const ac4dec *d);
+
+/* decoder.ObjectRenderer._matrix: the downmix objects of an AJOC
+   substream (held) to its layout */
+static void obj_render_update(ac4dec *d)
+{
+    const ac4_toc_sub *ai = &d->ajoc_info;
+    int lay = ajoc_layout(d), no = ac4_layout_channels(lay), j, c;
+    const int *out = ac4_layout_ids(lay);
+    int ids[NOUT];
+    render_ids(d, ids);
+    if (!d->ajoc_known || ai->static_dmx) {
+        ac4_render_matrix(ids, d->n_ch, lay, NULL, d->rmat);
+        return;
+    }
+    for (c = 0; c < no * d->n_ch; c++)
+        d->rmat[c] = 0.0;
+    for (j = 0; j < d->n_ch; j++) {
+        int t = ai->lfe ? (j == 0 ? RN_LFE : ai->dmx_type[j - 1])
+                        : ai->dmx_type[j];
+        const ac4_obj *st = d->obj_have ? &d->obj_held[j] : NULL;
+        double gdb = st ? st->gain : 0.0, g, gg[NOUT];
+        if (st && !st->active)
+            gdb = -INFINITY;
+        g = gdb == -INFINITY ? 0.0 : pow(10.0, gdb / 20.0);
+        if (t == RN_LFE) {
+            for (c = 0; c < no; c++)
+                if (out[c] == RN_LFE)
+                    d->rmat[c * d->n_ch + j] = g;
+        } else if (t == AC4_OBJ_DYN || t == AC4_OBJ_ISF) {
+            double x = 0.5, y = 0.0, z = 0.0;
+            if (st) {
+                x = st->x;
+                y = st->y;
+                z = st->z;
+            }
+            ac4_obj_gains(x, y, z, out, no, gg);
+            for (c = 0; c < no; c++)
+                d->rmat[c * d->n_ch + j] = g * gg[c];
+        } else {
+            int hit = -1;
+            for (c = 0; c < no; c++)
+                if (out[c] == t)
+                    hit = c;
+            if (hit >= 0) {
+                d->rmat[hit * d->n_ch + j] = g;
+            } else {
+                double x, y, z;
+                ac4_bed_position(t, &x, &y, &z);
+                ac4_obj_gains(x, y, z, out, no, gg);
+                for (c = 0; c < no; c++)
+                    d->rmat[c * d->n_ch + j] = g * gg[c];
+            }
+        }
+    }
+}
+
 static void render_update(ac4dec *d)
 {
     int ids[NOUT];
+    if (d->element == AC4DEC_ELEMENT_AJOC) {
+        obj_render_update(d);
+        return;
+    }
     if (!d->cfg.layout)
         return;
     render_ids(d, ids);
@@ -726,6 +802,15 @@ static int element_slots(int element, int ch_mode, int *slot)
     return n;
 }
 
+/* the layout an AJOC decoder renders to (decoder.py: 5.1 unless one is
+   asked for; channels 2: 2.0) */
+static int ajoc_layout(const ac4dec *d)
+{
+    if (d->cfg.layout)
+        return d->cfg.layout;
+    return d->cfg.channels == 2 ? AC4DEC_LAYOUT_2_0 : AC4DEC_LAYOUT_5_1;
+}
+
 static void set_element(ac4dec *d, int element)
 {
     double ref;
@@ -735,7 +820,35 @@ static void set_element(ac4dec *d, int element)
         d->ch_mode = d->cfg.ch_mode ? d->cfg.ch_mode : 6;
     if (element == AC4DEC_ELEMENT_ICE && !d->ch_mode)
         d->ch_mode = d->cfg.ch_mode ? d->cfg.ch_mode : 12;
-    if (element == AC4DEC_ELEMENT_ICE) {
+    if (element == AC4DEC_ELEMENT_AJOC) {
+        /* elements.ajoc_slots: the downmix tracks ([LFE] then the
+           var_channel_element's slots, or the 5_X element's) */
+        static const int SL[8][7] = {
+            { 0 }, { CH_C }, { CH_L, CH_R }, { CH_L, CH_R, CH_C },
+            { CH_L, CH_R, CH_LS, CH_RS }, { CH_L, CH_R, CH_LS, CH_RS, CH_C },
+            { CH_L, CH_R, CH_LS, CH_RS, CH_X1, CH_X2 },
+            { CH_L, CH_R, CH_LS, CH_RS, CH_X1, CH_X2, CH_C } };
+        const ac4_toc_sub *ai = &d->ajoc_info;
+        int nd = d->ajoc_known ? ai->n_dmx : 5;
+        n = 0;
+        if (!d->ajoc_known || ai->static_dmx) {
+            slot[n++] = CH_L;
+            slot[n++] = CH_R;
+            slot[n++] = CH_C;
+            if (!d->ajoc_known || ai->lfe)
+                slot[n++] = CH_LFE;
+            slot[n++] = CH_LS;
+            slot[n++] = CH_RS;
+        } else {
+            if (ai->lfe)
+                slot[n++] = CH_LFE;
+            for (i = 0; i < nd && i < 7; i++)
+                slot[n++] = SL[nd < 8 ? nd : 7][i];
+        }
+        d->el_mask = 0;
+        for (i = 0; i < n; i++)
+            d->el_mask |= 1 << slot[i];
+    } else if (element == AC4DEC_ELEMENT_ICE) {
         /* the coded tracks (L R C [LFE] Ls Rs Tfl Tfr); the outputs by
            what the substream signals present */
         int pr = d->cfg.present;
@@ -757,7 +870,8 @@ static void set_element(ac4dec *d, int element)
         for (i = 0; i < n; i++)
             d->el_mask |= 1 << slot[i];
     }
-    if (d->cfg.channels == 2 && n > 2 && (d->el_mask & 3) == 3) {
+    if (d->cfg.channels == 2 && n > 2 && (d->el_mask & 3) == 3
+        && element != AC4DEC_ELEMENT_AJOC) {
         n = 2;
         slot[0] = CH_L;
         slot[1] = CH_R;
@@ -766,6 +880,8 @@ static void set_element(ac4dec *d, int element)
     for (i = 0; i < NOUT; i++)
         d->out_ch[i] = i < n ? slot[i] : i;
     d->n_lay = d->cfg.layout ? ac4_layout_channels(d->cfg.layout) : n;
+    if (element == AC4DEC_ELEMENT_AJOC)
+        d->n_lay = ac4_layout_channels(ajoc_layout(d));
     render_update(d);
     /* A-SPX block groups -> channel pairs (Table 213) */
     d->pair_ch[0][0] = CH_L;
@@ -825,6 +941,8 @@ static void set_rate(ac4dec *d, int fs, int fri)
    the core pair and the LFE; C, Ls, Rs come from the A-CPL upmix) */
 static int chan_mask(const ac4dec *d, int acpl3)
 {
+    if (d->element == AC4DEC_ELEMENT_AJOC)
+        return d->el_mask;
     if (d->element == AC4DEC_ELEMENT_PAIR || d->n_ch == 2)
         return (1 << CH_L) | (1 << CH_R);
     if (acpl3)
@@ -886,6 +1004,8 @@ static void stream_reset(ac4dec *d)
     d->rate_known = 0;
     d->rs_fixed = 0;
     memset(&d->cdmx_held, 0, sizeof(d->cdmx_held));
+    memset(&d->obj, 0, sizeof(d->obj));
+    d->obj_have = 0;
     d->fs = d->fri = -1;
     d->fl = AC4_DEFAULT_FRAME;
     d->books.fl = AC4_DEFAULT_FRAME;
@@ -948,13 +1068,14 @@ ac4dec *ac4dec_open(const ac4dec_config *cfg)
     if (c.channels < 0 || c.channels > NOUT)
         return NULL;
     if ((int)c.element < AC4DEC_ELEMENT_AUTO
-        || (int)c.element > AC4DEC_ELEMENT_ICE)
+        || (int)c.element > AC4DEC_ELEMENT_AJOC)
         return NULL;
     if (c.ch_mode != 0 && (c.ch_mode < 5 || c.ch_mode > 14))
         return NULL;
     if (c.layout < 0 || c.layout > AC4DEC_LAYOUT_7_1_4)
         return NULL;
-    if (c.element != AC4DEC_ELEMENT_AUTO && c.channels) {
+    if (c.element != AC4DEC_ELEMENT_AUTO && c.element != AC4DEC_ELEMENT_AJOC
+        && c.channels) {
         int slot[NOUT], n;
         if (c.element == AC4DEC_ELEMENT_ICE)
             n = (c.present & 16)
@@ -991,6 +1112,11 @@ ac4dec *ac4dec_open(const ac4dec_config *cfg)
     }
     for (i = 0; i < 4; i++)
         if (ac4_huff_build(&d->de_hcb[i], &AC4T_MISC_BOOKS[1 + i]) != 0) {
+            ac4dec_close(d);
+            return NULL;
+        }
+    for (i = 0; i < AC4T_N_AJOC_BOOKS; i++)
+        if (ac4_huff_build(&d->ajoc_huff[i], &AC4T_AJOC_BOOKS[i]) != 0) {
             ac4dec_close(d);
             return NULL;
         }
@@ -1043,6 +1169,8 @@ void ac4dec_close(ac4dec *d)
     ac4_huff_free(&d->drc_hcb);
     for (i = 0; i < 4; i++)
         ac4_huff_free(&d->de_hcb[i]);
+    for (i = 0; i < AC4T_N_AJOC_BOOKS; i++)
+        ac4_huff_free(&d->ajoc_huff[i]);
     free(d->lev);
     ac4_aspx_books_free(&d->abk);
     ac4_fb_tables_free(d->fbt);
@@ -1139,6 +1267,8 @@ static void set_comp(ac4_aspx_frame *f, int g, const ac4_element *e,
         ac4_aspx_chd *cd = &f->g.c[ch];
         int i = g == 0 ? (ch == 0 || acpl1 == AC4_ACPL1_PAIR ? 0 : 1)
                 : g == 1 ? 3 + ch : e->comp_c;
+        if (e->comp_var)                /* A-JOC var_channel_element */
+            i = g == 0 ? ch : g == 1 ? 2 + ch : e->comp_c;
         cd->comp_set = 1;
         cd->comp_sync = e->comp_sync;
         cd->comp_avg = e->comp_avg;
@@ -1167,6 +1297,7 @@ static void rec_conceal(ac4dec *d, rec_t *r, int code)
         memset(r->win + k * FRAME, 0, sizeof(double) * (size_t)d->fl);
     }
     af_kinds(r, AC4_GRP_CONCEALED);
+    r->has_obj = 0;
     for (k = 0; k < NPAIR; k++)
         r->af[k].has_tab = 0;
     r->de.kind = AC4_DE_HOLD;
@@ -1299,6 +1430,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     volatile int changed = AC4E_NONE, resume = -1, seq = -1, brk = 0;
     volatile int first_cfg = 0;
     ac4_aspx_state fstate0 = d->fstate;
+    ac4_obj_state obj0 = d->obj;
     ac4_acpl_qstate aq0 = d->aq;
     int aq10[4][2][AC4_ACPL_NB], aq1n0[4][2];
     int code = AC4E_NONE, k, ifr = 0, has_aspx, acpl3, acpl1, complete;
@@ -1403,6 +1535,17 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
             sub_len = len - o;
         sub = data + o;
         ifr = s->ndot;
+        if (d->element == AC4DEC_ELEMENT_AJOC && !d->ajoc_known) {
+            /* the substream's info, from the first frame that has it
+               (decoder.probe_ajoc_info); the decoded slots follow it */
+            if (s->kind != 1) {
+                code = AC4E_ELEMENT_PARSE;
+                goto fail;
+            }
+            d->ajoc_info = *s;
+            d->ajoc_known = 1;
+            set_element(d, d->element);
+        }
         if (s->sf_multiplier >= 0) {     /* 96 / 192 kHz substream */
             code = AC4E_TOC_UNSUPPORTED;
             goto fail;
@@ -1428,6 +1571,13 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         break;
     case AC4DEC_ELEMENT_ICE:
         ac4_parse_ice(&b, &d->books, ifr, d->ch_mode, e);
+        break;
+    case AC4DEC_ELEMENT_AJOC:
+        if (!d->ajoc_known)
+            ac4_fail(&b, AC4E_ELEMENT_PARSE);
+        ac4_parse_ajoc(&b, &d->books, ifr, d->ajoc_info.lfe,
+                       d->ajoc_info.static_dmx, d->ajoc_info.n_dmx,
+                       d->ajoc_info.n_umx, e);
         break;
     default: ac4_parse_5x(&b, &d->books, ifr, e); break;
     }
@@ -1493,6 +1643,18 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     complete = (cfg || !has_aspx)
                && (!(acpl3 || acpl1) || e->has_acpl_cfg
                    || (acpl3 ? d->has_pcfg : d->has_pcfg1));
+    r->has_obj = 0;
+    if (e->tail && (cfg || !has_aspx)) {
+        /* the rest of audio_data_ajoc (elements.ajoc_tail) */
+        b.p = end;
+        b.eof_code = AC4E_ELEMENT_PARSE;
+        ac4_ajoc_tail(&b, d->ajoc_huff, &d->ajoc_info, ifr, &d->obj);
+        end = b.p;
+        r->has_obj = 1;
+        memcpy(r->obj, d->obj.dmx, sizeof(r->obj));
+    } else if (e->tail) {
+        complete = 0;
+    }
     /* audio_size closure */
     {
         size_t stop = e->audio_start + 8 * e->audio_size;
@@ -1503,7 +1665,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         if (complete && stop - end > 7)
             ac4_fail(&b, AC4E_AUDIO_CLOSURE);
     }
-    if (!cfg && has_aspx)
+    if (!cfg && has_aspx && !e->tail)
         add_pending(d, r->index, sub, sub_len, e, ifr);
     /* dequantise (with the level check) */
     r->mask = chan_mask(d, acpl3);
@@ -1742,7 +1904,8 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
        (stream.py _sub_metadata), read with the coded element's channel
        mode */
     r->de.kind = AC4_DE_NONE;
-    if (d->cfg.de_level != 0.0 && !d->v0) {
+    if (d->cfg.de_level != 0.0 && !d->v0
+        && d->element != AC4DEC_ELEMENT_AJOC) {
         static const int CM[8] = { 4, 4, 1, 0, 2, 3, 6, 12 };
         int cm = d->element == AC4DEC_ELEMENT_7X
                  || d->element == AC4DEC_ELEMENT_ICE ? d->ch_mode
@@ -1768,6 +1931,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
 
 fail:
     d->fstate = fstate0;
+    d->obj = obj0;
     d->aq = aq0;
     memcpy(d->aq1, aq10, sizeof(aq10));
     memcpy(d->aq1n, aq1n0, sizeof(aq1n0));
@@ -1815,6 +1979,13 @@ static void parse_held(ac4dec *d, const uint8_t *nx, size_t nx_len,
                 d->ice_known = 1;
             }
         }
+        if (el == AC4DEC_ELEMENT_AJOC) {
+            const ac4_toc_sub *s = chosen_sub(&d->cfg, &tt);
+            if (s) {
+                d->ajoc_info = *s;
+                d->ajoc_known = 1;
+            }
+        }
         if (el != AC4DEC_ELEMENT_AUTO)
             set_element(d, el);
     }
@@ -1840,6 +2011,8 @@ static int pair_capable(const ac4dec *d, int p)
         return (d->el_mask & 1) != 0;   /* L/R: every element but mono */
     if (p == 1 && d->acpl1 && d->acpl1 != AC4_ACPL1_ICE)
         return 0;                   /* ASPX_ACPL_1 / _2: no Ls/Rs A-SPX */
+    if (d->element == AC4DEC_ELEMENT_AJOC)
+        return (d->el_mask >> d->pair_ch[p][0]) & 1;
     if (d->acpl3 || d->n_ch <= 2)
         return 0;
     return (d->el_mask >> d->pair_ch[p][0]) & 1;  /* the element has it */
@@ -1936,6 +2109,9 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
     o->iframe = ri->iframe;
     o->seq_jump = ri->seq_jump;
     o->meta = ri->meta;
+    o->has_obj = ri->has_obj;
+    if (ri->has_obj)
+        memcpy(o->obj, ri->obj, sizeof(o->obj));
     o->forced = ri->code != AC4E_NONE;
     o->aspx_flag = 0;
     /* every channel 577 samples late: the delay line, unless its pair
@@ -2430,12 +2606,18 @@ static void emit(ac4dec *d, ac4dec_frame *out)
             ac4_leveler_frame(d->lev, o->meta.valid ? &o->meta : NULL, pp,
                               o->n);
     }
-    if (d->cfg.layout) {
+    if (d->cfg.layout || d->element == AC4DEC_ELEMENT_AJOC) {
         /* render.Renderer: the frame's custom downmix data held, then
-           the matrix */
+           the matrix; ObjectRenderer (AJOC): the frame's downmix objects */
         double (*tmp)[FRAME] = d->reorder;
         int c, j, i;
-        if (o->meta.cdmx.present) {
+        if (d->element == AC4DEC_ELEMENT_AJOC) {
+            if (o->has_obj) {
+                memcpy(d->obj_held, o->obj, sizeof(d->obj_held));
+                d->obj_have = 1;
+                render_update(d);
+            }
+        } else if (o->meta.cdmx.present) {
             ac4_cdmx_hold(&d->cdmx_held, &o->meta.cdmx);
             render_update(d);
         }

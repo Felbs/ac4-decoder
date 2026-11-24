@@ -103,7 +103,10 @@ def element_header(sub, cm, ifr, T):
                                                 "ASPX_ACPL_1",
                                                 "ASPX_ACPL_2")[m])
     if 11 <= cm <= 14:
-        return dict(element="immersive_channel")
+        from ac4 import elements as EL
+        m = 4 if b.u(1) else b.u(2)
+        return dict(element="immersive_channel",
+                    codec_mode=EL.ICE_MODES[m])
     if cm == 15:
         return dict(element="22_2")
     return dict(element=f"ch_mode {cm}")

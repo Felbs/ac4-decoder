@@ -181,8 +181,7 @@ class Decoder:
             layout = layout or "5.1"
         if channels is None:
             channels = len(full)
-        if channels not in (2, len(full)) or (channels == 2
-                                               and "L" not in full):
+        if channels != len(full) and (channels != 2 or "L" not in full):
             raise ValueError(f"channels must be {len(full)}"
                              + (" or 2" if "L" in full else ""))
         self.element = element
@@ -323,6 +322,8 @@ class Decoder:
         ka = dict((g, p) for p, g in self.pairs)[gkey][0]
         if self.element == "ice":
             return len(self.dchans) > 2
+        if self.element == "ajoc":
+            return ka in self.ichans
         return ka in self.ichans and len(self.ichans) > 2
 
     def decode_pass(self, frames):

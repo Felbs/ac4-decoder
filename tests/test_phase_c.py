@@ -616,7 +616,7 @@ def test_ajoc_dmx_de_data():
 
 
 # ------------------------------------------------ A-JOC core decoding
-def _ajoc_toc(sub_len, seq, iframe, n_dmx, n_umx, lfe):
+def _ajoc_toc(sub_len, seq, iframe, n_dmx, n_umx, lfe, static=False):
     """A TOC with one presentation whose only audio substream is A-JOC
     coded (ac4_substream_info_ajoc, 6.2.1.9): dynamic objects only."""
     from test_phase_a import presentation
@@ -627,8 +627,11 @@ def _ajoc_toc(sub_len, seq, iframe, n_dmx, n_umx, lfe):
     w.u(1, 1).u(1, 0).u(1, 1).u(1, 0)
     w.u(1, 0)                            # b_oamd_substream
     w.u(1, 1)                            # b_ajoc
-    w.u(1, lfe).u(1, 0).u(4, n_dmx - 1)  # b_lfe, not static, n_dmx
-    w.u(1, 1)                            # dmx: b_dyn_objects_only
+    if static:
+        w.u(1, lfe).u(1, 1)              # b_lfe, b_static_dmx
+    else:
+        w.u(1, lfe).u(1, 0).u(4, n_dmx - 1)  # b_lfe, not static, n_dmx
+        w.u(1, 1)                        # dmx: b_dyn_objects_only
     w.u(1, 0)                            # b_oamd_common_data_present
     w.u(4, n_umx - 1).u(1, 1)            # n_umx, dynamic only
     w.u(1, 0).u(1, 0)                    # b_sf_multiplier, b_bitrate_info
@@ -639,14 +642,29 @@ def _ajoc_toc(sub_len, seq, iframe, n_dmx, n_umx, lfe):
     return w.bytes()
 
 
-def _ajoc_sub(rng, n_dmx, n_umx, lfe, pos, iframe=True):
+def _ajoc_sub(rng, n_dmx, n_umx, lfe, pos, iframe=True, aspx=False,
+              static=False):
     """audio_data_ajoc (6.2.3.4) with a SIMPLE var_channel_element of
     n_dmx signals (+ LFE), downmix OAMD with the positions pos, an A-JOC
     side info with no data points, no DE data, the upmix OAMD inactive.
     -> (bytes, the dequantised tracks in bitstream order)."""
+    from ac4 import aspx_bands as A
     T = CH.load_tables()
+    books, abooks = _books()
+    t_ = A.tables_for(ASPX_CFG, 0)
+    if static:
+        sub5, exp = _static_5x(rng, lfe)
+        w = BW()
+        tracks = []
+        return _ajoc_rest(w, sub5, n_dmx, n_umx, lfe, pos, iframe, True), \
+            exp
     w = BW().u(1, 0)                     # b_some_signals_inactive
-    w.u(1, 0)                            # var_codec_mode SIMPLE
+    w.u(1, int(aspx))                    # var_codec_mode
+    if aspx:
+        if iframe:
+            _aspx_cfg_bits(w, ASPX_CFG)
+        if n_dmx <= 5:
+            w.u(1, 1).u(1, 1) if n_dmx > 1 else w.u(1, 1)   # companding
     tracks = []
     if lfe:
         t = EW.Track(rng, 2)
@@ -666,6 +684,44 @@ def _ajoc_sub(rng, n_dmx, n_umx, lfe, pos, iframe=True):
         t = EW.Track(rng, n)
         EW.mono(w, T, t)
         tracks.append(t.deq())
+    if aspx:
+        for _ in range(n_dmx // 2):
+            _aspx_2ch(w, abooks, t_, iframe)
+        if n_dmx % 2:
+            _aspx_1ch(w, abooks, t_, iframe)
+    return _ajoc_rest(w, None, n_dmx, n_umx, lfe, pos, iframe, False), \
+        tracks
+
+
+def _static_5x(rng, lfe):
+    """A SIMPLE 5_X element body (5.1 or 5.0) for b_static_dmx."""
+    T = CH.load_tables()
+    w = BW().u(3, 0)                     # 5_X_codec_mode SIMPLE
+    exp = {}
+    if lfe:
+        t = EW.Track(rng, 2)
+        EW.lfe(w, T, t)
+        exp["lfe"] = t.deq()
+    w.u(2, 0).u(1, 0)                    # coding_config 0, 2ch_mode 0
+    for keys in (("L", "R"), ("Ls", "Rs")):
+        tr = [EW.Track(rng, 8), EW.Track(rng, 8)]
+        EW.two_channel(w, T, tr, EW.St(rng, 0, 8))
+        exp.update(zip(keys, (x.deq() for x in tr)))
+    c = EW.Track(rng, 8)
+    EW.mono(w, T, c)
+    exp["C"] = c.deq()
+    return w, exp
+
+
+def _ajoc_rest(w, w5, n_dmx, n_umx, lfe, pos, iframe, static):
+    if static:
+        w = w5
+    else:
+        _dmx_oamd(w, n_dmx, lfe, pos, iframe)
+    return _ajoc_side_bits(w, n_umx, lfe)
+
+
+def _dmx_oamd(w, n_dmx, lfe, pos, iframe):
     w.u(1, 1)                            # b_dmx_timing
     w.u(1, 0).u(3, 1).u(6, 0).u(2, 0)    # offset 0, one block, ramp 0
     for k in range(n_dmx + (1 if lfe else 0)):
@@ -683,6 +739,9 @@ def _ajoc_sub(rng, n_dmx, n_umx, lfe, pos, iframe=True):
             w.u(1, 1).u(1, 1)            # zone, other: defaults
         w.u(1, 0)                        # b_add_table_data
     w.u(1, 0)                            # b_oamd_extension_present
+
+
+def _ajoc_side_bits(w, n_umx, lfe):
     w.u(3, 0)                            # ajoc_num_decorr 0
     for _ in range(n_umx):
         w.u(1, 0)                        # ajoc_object_present
@@ -692,17 +751,20 @@ def _ajoc_sub(rng, n_dmx, n_umx, lfe, pos, iframe=True):
     w.u(1, 0).u(1, 1)                    # b_umx_timing 0, derive
     for k in range(n_umx + (1 if lfe else 0)):
         w.u(1, 1).u(1, 0)                # inactive, no table data
-    return EW.element(w), tracks
+    return EW.element(w)
 
 
-def _ajoc_frames(rng, n_dmx=3, n_umx=4, lfe=1, pos=None, n=4):
+def _ajoc_frames(rng, n_dmx=3, n_umx=4, lfe=1, pos=None, n=4, aspx=False,
+                 static=False):
     from test_inputs import syncframe  # noqa: F401
     pos = pos or [(0, 0, 0), (62, 0, 0), (31, 62, 15)][:n_dmx] + \
         [(31, 31, 0)] * max(0, n_dmx - 3)
     frames, tracks = [], []
     for i in range(n):
-        sub, tr = _ajoc_sub(rng, n_dmx, n_umx, lfe, pos, iframe=(i == 0))
-        toc = _ajoc_toc(len(sub), 5 + i, int(i == 0), n_dmx, n_umx, lfe)
+        sub, tr = _ajoc_sub(rng, n_dmx, n_umx, lfe, pos, iframe=(i == 0),
+                            aspx=aspx, static=static)
+        toc = _ajoc_toc(len(sub), 5 + i, int(i == 0), n_dmx, n_umx, lfe,
+                        static)
         frames.append(toc + bytes(2) + sub)
         tracks.append(tr)
     return frames, tracks
@@ -754,3 +816,82 @@ def test_ajoc_core_renders_objects():
     assert np.allclose(R[:, i["C"]], [0, 0, 0, 0, np.sqrt(.5), np.sqrt(.5)])
     assert R[3, i["lfe"]] == 1.0
     assert np.abs(pcm).max() > 0
+
+
+@pytest.mark.parametrize("n_dmx", [2, 3, 5, 6])
+def test_ajoc_core_aspx(n_dmx):
+    """The var_channel_element in codec mode ASPX (aspx_config,
+    companding_control, the pairs' and the odd signal's A-SPX blocks):
+    every frame closes, every downmix signal sounds."""
+    from ac4.decoder import Decoder, probe_ajoc_info
+    rng = np.random.default_rng(100 + n_dmx)
+    frames, _ = _ajoc_frames(rng, n_dmx=n_dmx, n=6, aspx=True)
+    info = probe_ajoc_info(frames)
+    dec = Decoder("ajoc", guard=False, ajoc_info=info, layout="7.1.4")
+    dec.hf_ratio = None
+    y = dec.decode_pass(frames)
+    assert dec.n_concealed == 0, dict(dec.concealed.reasons)
+    assert np.abs(y[3 * 1536:]).max() > 0
+
+
+def test_ajoc_static_dmx():
+    """b_static_dmx: the downmix is a 5.1 audio_data_chan; rendered as a
+    5.1 bed."""
+    from ac4.decoder import Decoder, probe_ajoc_info
+    rng = np.random.default_rng(111)
+    frames, exps = _ajoc_frames(rng, n_dmx=5, n=4, static=True)
+    info = probe_ajoc_info(frames)
+    assert info["static"] == 1
+    s = SC.Ac4Stream("ajoc", ajoc_info=info)
+    wins, lengths, groups, counts = s.decode_frames(frames)
+    assert s.n_bad == 0, s.status
+    for i, exp in enumerate(exps):
+        for k, ref in exp.items():
+            assert np.allclose(np.asarray(wins[k][i]), ref), (i, k)
+    dec = Decoder("ajoc", guard=False, ajoc_info=info)
+    dec.hf_ratio = None
+    y = dec.decode_pass(frames)
+    d0 = Decoder("5_X", guard=False)
+    d0.hf_ratio = None
+    assert dec.chans == d0.chans
+
+
+def _c_vs_python_ajoc(tmp_path, frames, layout):
+    import os
+    import subprocess
+    from ac4.decoder import Decoder, probe_ajoc_info
+    from test_inputs import syncframe
+    cli = os.environ.get("AC4_C_CLI", C_CLI)
+    if not os.path.exists(cli):
+        pytest.skip("c/ac4dec-c not built")
+    src = tmp_path / "e.ac4"
+    src.write_bytes(b"".join(syncframe(f) for f in frames))
+    raw = tmp_path / "e.f64"
+    args = [cli, str(src), str(tmp_path / "e.wav"), "--legacy-level",
+            "--f64", str(raw), "--internal", "--no-guard", "-q"]
+    if layout:
+        args += ["--layout", layout]
+    subprocess.run(args, check=True)
+    dec = Decoder("ajoc", guard=False, ajoc_info=probe_ajoc_info(frames),
+                  layout=layout)
+    dec.hf_ratio = None
+    ref = dec.decode_pass(frames)
+    assert dec.n_concealed == 0
+    got = np.fromfile(raw, "<f8").reshape(-1, len(dec.chans))
+    assert got.shape == ref.shape
+    assert np.abs(got - ref).max() <= 1e-9 * np.abs(ref).max()
+
+
+@pytest.mark.parametrize("n_dmx,aspx,static,layout", [
+    (1, False, False, None), (3, False, False, "2.0"),
+    (5, True, False, "7.1.4"), (7, False, False, "5.1.2"),
+    (6, True, False, None), (5, False, True, "2.0")])
+def test_c_ajoc(tmp_path, n_dmx, aspx, static, layout):
+    """The C decoder's A-JOC core decoding and object rendering against
+    the Python, within 1e-9."""
+    rng = np.random.default_rng(120 + n_dmx)
+    frames, _ = _ajoc_frames(rng, n_dmx=n_dmx, n=6, aspx=aspx,
+                             static=static,
+                             pos=[(9 * k, 61 - 8 * k, 2 * k)
+                                  for k in range(n_dmx)])
+    _c_vs_python_ajoc(tmp_path, frames, layout)

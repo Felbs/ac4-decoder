@@ -23,7 +23,8 @@ for listening to object content at all.
   (cos / sin of z * 90 degrees); z <= 0, or a layout without a top
   ring, renders to the ear ring alone.
 * An LFE object goes to the LFE channel (dropped when the layout has
-  none). Gains are per object (object_gain), per frame: the last
+  none). A bed object goes to its channel when the layout has it, else
+  it is panned from its channel's position (bed_position). Gains are per object (object_gain), per frame: the last
   metadata block of a frame holds for the whole frame (no ramps)."""
 from __future__ import annotations
 
@@ -35,6 +36,15 @@ AZ = {"L": 45.0, "R": -45.0, "C": 0.0, "Lb": 135.0, "Rb": -135.0,
       "Tfl": 45.0, "Tfr": -45.0, "Tbl": 135.0, "Tbr": -135.0,
       "Tsl": 90.0, "Tsr": -90.0, "Lw": 60.0, "Rw": -60.0}
 TOP = {"Tfl", "Tfr", "Tbl", "Tbr", "Tsl", "Tsr"}
+
+
+def bed_position(name):
+    """The room position (6.3.9.8.4) of a bed channel: on the unit circle
+    at its Table A.30 azimuth (the surrounds at +-110), z 1 for the top
+    channels."""
+    a = math.radians({"Ls": 110.0, "Rs": -110.0}.get(name, AZ.get(name, 0.0)))
+    return ((1.0 - math.sin(a)) / 2.0, (1.0 - math.cos(a)) / 2.0,
+            1.0 if name in TOP else 0.0)
 
 
 def speaker_azimuths(chans):

@@ -92,9 +92,13 @@ typedef enum {
     AC4DEC_ELEMENT_3_0 = 4,    /* 3_0_channel_element (L R C) */
     AC4DEC_ELEMENT_5_0 = 5,    /* 5_X without LFE (L R C Ls Rs) */
     AC4DEC_ELEMENT_7X = 6,     /* 7_X_channel_element (config ch_mode) */
-    AC4DEC_ELEMENT_ICE = 7     /* immersive_channel_element (TS 103 190-2
+    AC4DEC_ELEMENT_ICE = 7,    /* immersive_channel_element (TS 103 190-2
                                   6.2.4.1; ch_mode 11 / 12: 7.0.4 /
                                   7.1.4), immersive_codec_mode ASPX_ACPL_2 */
+    AC4DEC_ELEMENT_AJOC = 8    /* an A-JOC substream in core decoding mode
+                                  (a presentation without channel-coded
+                                  substreams): its downmix objects
+                                  rendered to the layout (default 5.1) */
 } ac4dec_element;
 
 /* Output layouts (ac4dec_config.layout), channel order L R C LFE, the
