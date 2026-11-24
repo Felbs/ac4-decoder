@@ -51,7 +51,7 @@ CENTRE_ASPX = True
 
 class Ac4Stream:
     def __init__(self, element="5_X", presentation=None, language=None,
-                 ch_mode=None, substream=0):
+                 ch_mode=None, substream=0, ajoc_info=None):
         # "5_X" = the 5.1 programme element. "pair" = the stereo
         # channel_pair_element (Table 22). "mono", "3_0", "5_0" (5_X
         # without LFE) and "7_X" (ch_mode 5 - 10 of Table 88): elements.py
@@ -61,8 +61,20 @@ class Ac4Stream:
         if element == "ice" and ch_mode is None:
             ch_mode = 12
         self.ch_mode = ch_mode
-        self.CHANS = EL.channels_of(element, ch_mode)
-        self.PAIRS = EL.aspx_pairs(element, ch_mode)
+        # A-JOC (core decoding): the substream's ac4_substream_info_ajoc
+        # (toc.substream_info_ajoc), and the objects' and A-JOC state
+        # between frames (elements.ajoc_tail)
+        self.ajoc_info = ajoc_info
+        self.obj_state = {}
+        if element == "ajoc":
+            self.CHANS = EL.ajoc_slots(ajoc_info)
+            self.PAIRS = ({0: ("L", "R"), 1: ("Ls", "Rs"), 2: ("C", "C")}
+                          if ajoc_info["static"] else
+                          {0: ("L", "R"), 1: ("Ls", "Rs"), 2: ("C", "C"),
+                           3: ("Tfl", "Tfr")})
+        else:
+            self.CHANS = EL.channels_of(element, ch_mode)
+            self.PAIRS = EL.aspx_pairs(element, ch_mode)
         # presentation choice (toc.choose): None = the first enabled,
         # decodable one (preferring `language`, then complete main); an int
         # = by position in the TOC; "id:N" = by presentation_id
@@ -173,7 +185,7 @@ class Ac4Stream:
         # "acpl": per frame the A-CPL parameters of an ASPX_ACPL_3 frame
         # (acpl.render's frame dict), None without, CONCEALED
         groups = {"lr": [], "sr": [], "c": [], "xr": [], "acpl": [],
-                  "de": []}
+                  "de": [], "obj": []}
         self.status = []
         self.seq_break = []
         self.meta = []
@@ -184,6 +196,10 @@ class Ac4Stream:
             fstate0 = dict(self.fstate)
             acpl_q0 = list(self.acpl_q)
             acpl_q10 = [list(x) for x in self.acpl_q1]
+            obj0 = None
+            if self.element == "ajoc":
+                import copy
+                obj0 = copy.deepcopy(self.obj_state)
             seq = None
             brk = False
             resume = None       # the counter to expect after an outlier
@@ -360,6 +376,19 @@ class Ac4Stream:
                                     timeslots=tuple(fr_a["param_timeslot"]),
                                     clamped=AP.out_of_range_2ch(q, acfg)))
                             got_acpl = mods[0] if acpl3 else mods
+                got_obj = None
+                if r.get("tail") == "ajoc" and (cfg or not has_aspx):
+                    # the rest of audio_data_ajoc: OAMD, A-JOC side info
+                    from .toc import Bits
+                    bt = Bits(sub)
+                    bt.p = end
+                    try:
+                        got_obj = EL.ajoc_tail(bt, r["ajoc_info"], ifr,
+                                               self.obj_state)
+                    except Exception as e:                     # noqa: BLE001
+                        raise RB.Damaged("element.parse", str(e)[:60]) \
+                            if not isinstance(e, RB.Damaged) else e
+                    end = bt.p
                 r["end"] = end
                 # every block of audio_data() parsed?  Not before the first
                 # aspx_config (the A-SPX blocks cannot be sized) nor, for
@@ -367,9 +396,11 @@ class Ac4Stream:
                 complete = ((bool(cfg) or not has_aspx)
                             and (not (acpl3 or acpl1)
                                  or bool(r.get("acpl") or self.acpl_cfg)))
+                if r.get("tail") and not (cfg or not has_aspx):
+                    complete = False
                 if on:
                     RB.check_closure(r, len(sub), complete)
-                    if not cfg and has_aspx:
+                    if not cfg and has_aspx and not r.get("tail"):
                         pending.append(dict(
                             fi=fi, sub=sub, bits=r["bits"], ifr=ifr,
                             start=r["audio_start"], size=r["audio_size"],
@@ -529,7 +560,7 @@ class Ac4Stream:
                     lr_idx = (0, 0) if acpl1 == "pair" else (0, 1)
                     cidx = r.get("compand_idx") or {}
                     for grp, idx in ((got_lr, cidx.get(0, lr_idx)),
-                                     (got_sr, (3, 4)),
+                                     (got_sr, cidx.get(1, (3, 4))),
                                      (got_c, cidx.get(2, (2, 2)))):
                         if isinstance(grp, list):
                             for ch, i in zip(grp, idx):
@@ -558,6 +589,9 @@ class Ac4Stream:
                 self.fstate = fstate0
                 self.acpl_q = acpl_q0
                 self.acpl_q1 = acpl_q10
+                if obj0 is not None:
+                    self.obj_state = obj0
+                got_obj = CONCEALED
                 reason = RB.reason_of(e)
                 fl = self.frame_len or RT.DEFAULT_FRAME
                 if self.frame_len is None:
@@ -595,6 +629,7 @@ class Ac4Stream:
             groups["xr"].append(got_x)
             groups["de"].append(got_de)
             groups["acpl"].append(got_acpl)
+            groups["obj"].append(got_obj)
         if early and self.frame_len not in (None, RT.DEFAULT_FRAME):
             # frames concealed before the rate was learnt in this pass take
             # the stream's frame length (one window each)
@@ -625,6 +660,9 @@ class Ac4Stream:
         if el == "ice":
             return EL.immersive_channel_element(sub, self.Tf, self.ch_mode,
                                                 b_iframe=ifr)
+        if el == "ajoc":
+            return EL.ajoc_element(sub, self.Tf, self.ajoc_info,
+                                   b_iframe=ifr)
         return C.decode_element(sub, self.Tf, b_iframe=ifr,
                                 has_lfe=el != "5_0")
 

@@ -369,3 +369,169 @@ def immersive_channel_element(sub, T, ch_mode, b_iframe=False):
     out.update(bits=b.p, nbits=len(sub) * 8, audio_size=asz,
                audio_start=a0, mode=("ice", mode))
     return out
+
+
+# ---------------------------------------------------------------- A-JOC
+# The downmix signals of a var_channel_element (TS 103 190-2 6.2.4.4) as
+# the decoder's track slots, in bitstream order: the pairs on (L, R), (Ls,
+# Rs), (Tfl, Tfr) (A-SPX block groups 0, 1, 3), an odd last signal on C
+# (group 2). Up to seven full-band signals.
+VAR_SLOTS = {1: ("C",), 2: ("L", "R"), 3: ("L", "R", "C"),
+             4: ("L", "R", "Ls", "Rs"), 5: ("L", "R", "Ls", "Rs", "C"),
+             6: ("L", "R", "Ls", "Rs", "Tfl", "Tfr"),
+             7: ("L", "R", "Ls", "Rs", "Tfl", "Tfr", "C")}
+VAR_PAIR_GROUPS = (0, 1, 3)
+
+
+def ajoc_slots(info):
+    """The decoder track slots of an A-JOC substream's downmix (core
+    decoding): ("lfe" first when b_lfe) + VAR_SLOTS, or the 5_X
+    element's for b_static_dmx."""
+    lfe = ("lfe",) if info["b_lfe"] else ()
+    if info["static"]:
+        return ("L", "R", "C") + lfe + ("Ls", "Rs")
+    return lfe + VAR_SLOTS[info["n_dmx"]]
+
+
+def var_channel_element(b, T, b_iframe, n, b_lfe, out):
+    """6.2.4.4 into out (the element dict): tracks on VAR_SLOTS[n], the
+    processing steps, the A-SPX blocks (pairs then the odd signal) and
+    companding_control's channel order."""
+    slots = VAR_SLOTS[n]
+    mode = b.u(1)                                   # var_codec_mode
+    if mode == 1:
+        if b_iframe:
+            out["aspx"] = C.aspx_config(b)
+        if n <= 5:
+            out["compand"] = C.companding_control(b, n)
+    order = []
+    if b_lfe:
+        out["lfe"] = C.mono_data(b, T, b_lfe=True)
+        order.append("lfe")
+    steps = []
+    n_pairs = n // 2
+
+    def pair(k0, k1):
+        x, y, st = C.two_channel_data(b, T)
+        out[k0], out[k1] = x, y
+        steps.append(((k0, k1), MC.two_channel_step(st)))
+        order.extend((k0, k1))
+
+    if n % 2:
+        if n == 1:
+            out["C"] = C.mono_data(b, T, b_lfe=False)
+            order.append("C")
+        else:
+            for p in range(n_pairs - 1):
+                pair(slots[2 * p], slots[2 * p + 1])
+            k0, k1, k2 = slots[2 * n_pairs - 2], slots[2 * n_pairs - 1], \
+                slots[-1]
+            if b.u(1) == 0:                         # var_coding_config
+                pair(k0, k1)
+                out[k2] = C.mono_data(b, T, b_lfe=False)
+                order.append(k2)
+            else:
+                tr, s3 = MC.three_channel_data(b, T)
+                out.update({k0: tr[0], k1: tr[1], k2: tr[2]})
+                steps.append(((k0, k1, k2), s3))
+                order += [k0, k1, k2]
+    else:
+        for p in range(n_pairs):
+            pair(slots[2 * p], slots[2 * p + 1])
+    blocks = []
+    cidx = {}
+    if mode == 1:
+        for p in range(n_pairs):
+            g = VAR_PAIR_GROUPS[p]
+            blocks.append((g, True))
+            cidx[g] = (2 * p, 2 * p + 1)
+        if n % 2:
+            blocks.append((2, False))
+            cidx[2] = (n - 1, n - 1)
+    out.update(steps=steps, order=tuple(order), aspx_blocks=tuple(blocks),
+               compand_idx=cidx, codec_mode=mode)
+    return mode
+
+
+def ajoc_element(sub, T, info, b_iframe=False):
+    """ac4_substream of an A-JOC substream (6.2.2.2, audio_data_ajoc
+    6.2.3.4), up to its A-SPX blocks; out["tail"] parses the rest (after
+    the A-SPX data): the downmix's OAMD (timing, oamd_dyndata_single, the
+    extension), ajoc() side information, ajoc_dmx_de_data, the upmix's
+    timing and oamd_dyndata_single.
+
+    b_static_dmx: the downmix is a 5.0 / 5.1 audio_data_chan (5_X
+    element); otherwise a var_channel_element of n_dmx signals (at most
+    seven here; more are concealed, element.parse)."""
+    if info["static"]:
+        out = C.decode_element(sub, T, b_iframe=b_iframe,
+                               has_lfe=bool(info["b_lfe"]))
+        out["mode"] = ("ajoc", "static") + tuple(out["mode"][1:])
+    else:
+        n = info["n_dmx"]
+        if n not in VAR_SLOTS:
+            raise Damaged("element.parse", f"A-JOC with {n} downmix "
+                          "signals not built")
+        b, asz, a0 = _head(sub)
+        b_inactive = b.u(1)                         # b_some_signals_inactive
+        if b_inactive:
+            b.u(n)                                  # dmx_active_signals_mask
+        out = dict(aspx=None, compand=None)
+        mode = var_channel_element(b, T, b_iframe, n, info["b_lfe"], out)
+        out.update(bits=b.p, nbits=len(sub) * 8, audio_size=asz,
+                   audio_start=a0, mode=("ajoc", mode), acpl_blocks=0)
+    out["ajoc_info"] = info
+    out["tail"] = "ajoc"
+    return out
+
+
+def ajoc_tail(b, info, ifr, st):
+    """The rest of audio_data_ajoc after the downmix's A-SPX blocks ->
+    dict(dmx=[ObjState] (the downmix objects' metadata, core decoding),
+    side=ajoc(), de=ajoc_dmx_de_data, umx=[ObjState]). st holds the
+    objects' states and the A-JOC state between frames (Ac4Stream)."""
+    from . import ajoc as AJ
+    from . import oamd as O
+    lfe = bool(info["b_lfe"])
+    n_dmx = info["n_dmx"] + (1 if lfe else 0)
+    n_umx = info["n_upmix"] + (1 if lfe else 0)
+    dmx_t = (["lfe"] if lfe else []) + list(info["dmx_types"])
+    umx_t = (["lfe"] if lfe else []) + list(info["umx_types"])
+
+    def types(ts):
+        return ([O.BED if t not in ("DYN", "ISF") else t for t in ts],
+                [1 if t == "lfe" else 0 for t in ts])
+
+    out = {}
+    dmx_s = st.setdefault("dmx", [O.ObjState() for _ in range(n_dmx)])
+    umx_s = st.setdefault("umx", [O.ObjState() for _ in range(n_umx)])
+    nb = st.get("blocks", 1)
+    if not info["static"]:
+        if b.u(1):                                  # b_dmx_timing
+            out["dmx_timing"] = O.oamd_timing_data(b)
+            nb = len(out["dmx_timing"]["blocks"])
+        ot, lf = types(dmx_t)
+        O.oamd_dyndata_single(b, dmx_s, nb, ifr, 0, ot, lf)
+        if b.u(1):                                  # b_oamd_extension
+            bits = (b.vb(3) + 1) * 8
+            p0 = b.p
+            if b.u(1):                              # ajoc_bed_info
+                b.u(3)
+            rest = bits - (b.p - p0)
+            if rest < 0:
+                raise Damaged("element.parse", "oamd extension overrun")
+            b.p += rest
+    out["side"] = AJ.ajoc(b, info["n_dmx"], info["n_upmix"])
+    out["de"] = AJ.dmx_de_data(b, info["n_dmx"], info["n_upmix"],
+                               st.setdefault("de", {}))
+    if b.u(1):                                      # b_umx_timing
+        out["umx_timing"] = O.oamd_timing_data(b)
+        nb = len(out["umx_timing"]["blocks"])
+    else:
+        b.u(1)                                      # b_derive_timing_from_dmx
+    ot, lf = types(umx_t)
+    O.oamd_dyndata_single(b, umx_s, nb, ifr, 0, ot, lf)
+    st["blocks"] = nb
+    out["dmx"] = [s.copy() for s in dmx_s]
+    out["umx"] = [s.copy() for s in umx_s]
+    return out

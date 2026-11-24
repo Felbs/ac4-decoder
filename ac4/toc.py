@@ -319,6 +319,52 @@ def bed_dyn_obj_assignment(b, n_signals):
     return sum(1 for _ in range(n_bed) if b.u(4) != 3)
 
 
+# Tables 63 (A-JOC coded beds), 64, 65 (TS 103 190-2 6.3.2.10.8)
+BED_AJOC_CH = (("L", "R"), ("L", "R", "C"), ("L", "R", "C", "Ls", "Rs"),
+               ("L", "R", "C", "Ls", "Rs", "Tsl", "Tsr"),
+               ("L", "R", "C", "Ls", "Rs", "Tfl", "Tfr", "Tbl", "Tbr"),
+               ("L", "R", "C", "Ls", "Rs", "Lb", "Rb"),
+               ("L", "R", "C", "Ls", "Rs", "Lb", "Rb", "Tsl", "Tsr"),
+               ("L", "R", "C", "Ls", "Rs", "Lb", "Rb", "Tfl", "Tfr", "Tbl",
+                "Tbr"))
+NONSTD_CH = ("L", "R", "C", "lfe", "Ls", "Rs", "Lb", "Rb", "Tfl", "Tfr",
+             "Tsl", "Tsr", "Tbl", "Tbr", "Lw", "Rw", "lfe2")
+STD_CH = (("L", "R"), ("C",), ("lfe",), ("Ls", "Rs"), ("Lb", "Rb"),
+          ("Tfl", "Tfr"), ("Tsl", "Tsr"), ("Tbl", "Tbr"), ("Lw", "Rw"),
+          ("lfe2",))
+
+
+def obj_assignment(b, n_signals):
+    """bed_dyn_obj_assignment (6.2.1.10) -> per signal its type: a bed
+    channel name (Tables 63 - 66), "ISF", or "DYN" (the signals the
+    assignment leaves; n_signals long)."""
+    types = []
+    if not b.u(1):                        # b_dyn_objects_only
+        if b.u(1):                        # b_isf
+            types = ["ISF"] * _isf_n(b)
+        elif b.u(1):                      # b_ch_assign_code
+            types = list(BED_AJOC_CH[b.u(3)])
+        elif b.u(1):                      # b_channel_assignment_flags_present
+            if b.u(1):
+                fl = b.u(17)
+                types = [NONSTD_CH[i] for i in range(17)
+                         if (fl >> (16 - i)) & 1 and i not in (3, 16)]
+            else:
+                fl = b.u(10)
+                for i in range(10):
+                    if (fl >> (9 - i)) & 1 and i not in (2, 9):
+                        types += list(STD_CH[i])
+        else:
+            n_bed = 1
+            if n_signals > 1:
+                n_bed = b.u(max(1, (n_signals - 1).bit_length())) + 1
+            for _ in range(n_bed):
+                v = b.u(4)
+                if v != 3:
+                    types.append(NONSTD_CH[v])
+    return (types + ["DYN"] * n_signals)[:n_signals]
+
+
 def oamd_common_data(b):
     """6.2.2.x: skipped by its own size fields."""
     if b.u(1) == 0:                       # b_default_screen_size_ratio
@@ -334,18 +380,21 @@ def oamd_common_data(b):
 
 def substream_info_ajoc(b, present, frf, st):
     s = dict(kind="ajoc", b_lfe=b.u(1))
-    if b.u(1):                            # b_static_dmx
+    s["static"] = b.u(1)                  # b_static_dmx
+    if s["static"]:
         s["n_dmx"] = 5
+        s["dmx_types"] = ["L", "R", "C", "Ls", "Rs"]
     else:
         s["n_dmx"] = b.u(4) + 1
-        bed_dyn_obj_assignment(b, s["n_dmx"])
+        s["dmx_types"] = obj_assignment(b, s["n_dmx"])
     if b.u(1):                            # b_oamd_common_data_present
         oamd_common_data(b)
     n = b.u(4) + 1
     if n == 16:
         n += b.vb(3)
     s["n_upmix"] = n
-    s["n_bed_isf"] = bed_dyn_obj_assignment(b, n)
+    s["umx_types"] = obj_assignment(b, n)
+    s["n_bed_isf"] = sum(1 for t in s["umx_types"] if t != "DYN")
     _sf_bitrate_ndot_index(b, present, frf, st, s)
     return s
 
@@ -676,7 +725,20 @@ def audio_substreams(st, pi):
         if (s["kind"] == "chan" and s.get("index") is not None
                 and s["index"] < len(st["substream_sizes"])):
             out.append((gi, g, s))
+    if not out and AJOC_CORE:
+        # no channel-coded substream: the A-JOC substreams, decoded in
+        # core decoding mode (their downmix and its OAMD; elements.py)
+        for gi, g, s in presentation_substreams(st, pi):
+            if (gi != de_group and s["kind"] == "ajoc"
+                    and s.get("index") is not None
+                    and s["index"] < len(st["substream_sizes"])):
+                out.append((gi, g, s))
     return out
+
+
+# decode A-JOC substreams (core decoding) when a presentation has no
+# channel-coded one; False: such presentations are not decodable
+AJOC_CORE = True
 
 
 def audio_substream(st, pi, k=0):

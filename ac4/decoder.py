@@ -60,7 +60,7 @@ HF_TAIL = 2                 # frames after a burst frame that also play core
 # level written at 0.9 of full scale. Hand-tuned; the decoder's true full
 # scale is NOT established. Used for the default burst limit and by the CLI.
 REF_PEAK = {"5_X": 9.0e5, "pair": 2.0e5, "mono": 2.0e5, "3_0": 9.0e5,
-            "5_0": 9.0e5, "7_X": 9.0e5, "ice": 9.0e5}
+            "5_0": 9.0e5, "7_X": 9.0e5, "ice": 9.0e5, "ajoc": 9.0e5}
 ELEMENTS = tuple(REF_PEAK)
 # the burst guard's limit: twice full scale (loudness.FULL_SCALE)
 BURST_LIMIT = 2.0 * RB._FULL_SCALE
@@ -140,7 +140,7 @@ class Decoder:
     def __init__(self, element="5_X", channels=None, burst_limit=None,
                  guard=True, presentation=None, language=None,
                  target_level=None, drc="auto", ch_mode=None, de_level=0.0,
-                 substream=0, present=None, layout=None):
+                 substream=0, present=None, layout=None, ajoc_info=None):
         """The frame length follows the stream (TS 103 190-1 Table 83):
         `frame` is FRAME (1536) until the first frame whose rate the
         decoder takes (see Ac4Stream), then that frame_len_base; out_rate
@@ -152,9 +152,12 @@ class Decoder:
         a mode ID) -- loudness.Leveler. None: decoder scale, untouched."""
         if element not in ELEMENTS:
             raise ValueError(f"element {element!r}: one of {ELEMENTS}")
+        if element == "ajoc" and ajoc_info is None:
+            raise ValueError("element 'ajoc' needs the substream's "
+                             "ajoc_info (probe_ajoc_info)")
         self.stream = Ac4Stream(element=element, presentation=presentation,
                                 language=language, ch_mode=ch_mode,
-                                substream=substream)
+                                substream=substream, ajoc_info=ajoc_info)
         full = self.stream.CHANS
         # the channels decoded inside (ichans) and given out (chans): the
         # same except for the immersive element, whose A-CPL makes the
@@ -169,6 +172,13 @@ class Decoder:
             self.ichans = tuple(k for k in EL.ICE_FULL
                                 if k != "lfe" or EL.CH_MODE_ICE[cm][0])
             full = EL.ice_channels(cm, present)
+        if element == "ajoc":
+            # the downmix objects (core decoding) are rendered to a layout
+            # (objrender.py): 5.1 unless one is asked for
+            if channels == 2 and layout is None:
+                layout = "2.0"
+            channels = None
+            layout = layout or "5.1"
         if channels is None:
             channels = len(full)
         if channels not in (2, len(full)) or (channels == 2
@@ -185,7 +195,11 @@ class Decoder:
         # when one is asked for (render.py: TS 103 190-2 5.10.2)
         self.dchans = self.chans
         self.renderer = None
-        if layout is not None:
+        self.obj_renderer = None
+        if element == "ajoc":
+            self.obj_renderer = ObjectRenderer(self.dchans, ajoc_info, layout)
+            self.chans = self.obj_renderer.out
+        elif layout is not None:
             from .render import Renderer
             self.renderer = Renderer(self.dchans, layout)
             self.chans = self.renderer.out
@@ -393,6 +407,10 @@ class Decoder:
             meta = (list(self.stream.meta) + [None] * len(frames))[
                 :len(frames)]
             y = self.renderer.process(y, meta, self.frame)
+        if self.obj_renderer is not None:
+            objs = (list(getattr(self, "_obj_frames", None) or [])
+                    + [None] * len(frames))[:len(frames)]
+            y = self.obj_renderer.process(y, objs, self.frame)
         self.last_status = status            # per frame of this pass
         self.last_concealed = bad | fired
         return y
@@ -401,6 +419,7 @@ class Decoder:
         chans = self.ichans
         dec = self.stream
         wins, lens, grp, cnts = dec.decode_frames(frames, chans)
+        self._obj_frames = grp.get("obj")
         self._adopt_frame()
         FRAME = self.frame
         pcm, self.fb_state = FB.synthesise_frames(
@@ -619,6 +638,84 @@ class Decoder:
         return np.column_stack([pcm[k] for k in chans])
 
 
+class ObjectRenderer:
+    """The downmix objects of an A-JOC substream (core decoding) to a
+    layout: bed objects routed as channels (render.matrix), dynamic
+    objects panned from their OAMD (objrender.py, not Dolby's renderer),
+    the LFE to the LFE; per frame with the metadata of its last block,
+    held through frames without (concealed ones)."""
+
+    def __init__(self, slots, info, layout):
+        from .render import LAYOUTS
+        self.slots = tuple(slots)
+        self.info = info
+        self.layout = layout
+        self.out = LAYOUTS[layout]
+        self.objs = None
+
+    def _matrix(self):
+        import math
+        from . import objrender as OR
+        from . import render as RD
+        info = self.info
+        M = np.zeros((len(self.out), len(self.slots)))
+        lfe = bool(info["b_lfe"])
+        if info["static"]:
+            # 5.0 / 5.1 bed: channels
+            return RD.matrix(self.slots, self.layout)
+        types = (["lfe"] if lfe else []) + list(info["dmx_types"])
+        for j, k in enumerate(self.slots):
+            t = types[j] if j < len(types) else "DYN"
+            st = self.objs[j] if self.objs and j < len(self.objs) else None
+            gdb = st.gain if st is not None else 0.0
+            if st is not None and not st.active:
+                gdb = -math.inf
+            g = 0.0 if gdb == -math.inf else 10.0 ** (gdb / 20.0)
+            if t == "lfe":
+                if "lfe" in self.out:
+                    M[self.out.index("lfe"), j] = g
+            elif t in ("DYN", "ISF"):
+                pos = st.position() if st is not None else (0.5, 0.0, 0.0)
+                M[:, j] = g * OR.gains(pos, self.out)
+            else:
+                M[:, j] = g * RD.matrix((t,), self.layout)[:, 0]
+        return M
+
+    def process(self, y, objs, frame):
+        out = np.zeros((len(y), len(self.out)))
+        n_f = (len(y) + frame - 1) // frame
+        R = None
+        for f in range(n_f):
+            o = objs[f] if f < len(objs) else None
+            if isinstance(o, dict):
+                self.objs = o.get("dmx")
+                R = None
+            if R is None:
+                R = self._matrix()
+            s = slice(f * frame, (f + 1) * frame)
+            out[s] = y[s] @ R.T
+        return out
+
+
+def probe_ajoc_info(frames, limit=64, presentation=None, language=None,
+                    substream=0):
+    """The ac4_substream_info_ajoc dict of the A-JOC substream that would
+    be decoded (a presentation without channel-coded substreams), or
+    None."""
+    from . import toc as M
+    for f in frames[:limit]:
+        try:
+            st = M.parse(f)
+        except Exception:                                      # noqa: BLE001
+            continue
+        pi = M.choose(st, presentation, language)
+        sel = M.audio_substream(st, pi, substream)
+        if sel is None:
+            continue
+        return sel if sel.get("kind") == "ajoc" else None
+    return None
+
+
 def probe_rate(frames, limit=64):
     """(fs_index, frame_rate_index) of the first frame whose TOC parses and
     whose next frame agrees, or None."""
@@ -661,6 +758,8 @@ def probe_ch_mode(frames, limit=64, presentation=None, language=None,
         sel = M.audio_substream(st, pi, substream)
         if sel is None:
             continue
+        if sel.get("kind") == "ajoc":
+            return "ajoc"
         cm = sel["channel_mode"]
         if (pi is not None and cm in IMS_CH_MODES
                 and st["presentations"][pi].get("version") == 2):
@@ -697,8 +796,10 @@ def probe_element(frames, limit=64, presentation=None, language=None,
     the presentation that would be decoded (toc.choose).
     -> "mono", "pair", "3_0", "5_0", "5_X" (5.1), "7_X", or None if not
     recognised."""
-    return ELEMENT_OF_CH_MODE.get(probe_ch_mode(frames, limit, presentation,
-                                                language, substream))
+    cm = probe_ch_mode(frames, limit, presentation, language, substream)
+    if cm == "ajoc":
+        return "ajoc"
+    return ELEMENT_OF_CH_MODE.get(cm)
 
 
 def decode(frames, element=None, channels=None, max_pass=1800,
@@ -724,6 +825,9 @@ def decode(frames, element=None, channels=None, max_pass=1800,
     ch_mode = (probe_ch_mode(frames, presentation=presentation,
                              language=language)
                if element in ("7_X", "ice") else None)
+    ajoc_info = (probe_ajoc_info(frames, presentation=presentation,
+                                 language=language)
+                 if element == "ajoc" else None)
     present = (probe_present(frames, presentation=presentation,
                              language=language)
                if element == "ice" else None)
@@ -739,7 +843,7 @@ def decode(frames, element=None, channels=None, max_pass=1800,
         dec = Decoder(element, channels, presentation=presentation,
                       language=language, target_level=target_level, drc=drc,
                       ch_mode=ch_mode, de_level=de_level, present=present,
-                      layout=layout)
+                      layout=layout, ajoc_info=ajoc_info)
     rs = StreamResampler(up, down)
     out = []
     for i in range(0, len(frames), max(1, max_pass)):

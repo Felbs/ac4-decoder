@@ -180,6 +180,10 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
     present = (probe_present(frames, presentation=presentation,
                              language=language)
                if element == "ice" else None)
+    from .decoder import probe_ajoc_info
+    ajoc_info = (probe_ajoc_info(frames, presentation=presentation,
+                                 language=language)
+                 if element == "ajoc" else None)
     try:
         dec = None
         if mix:
@@ -199,7 +203,8 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
                           presentation=presentation, language=language,
                           target_level=None if legacy else target_level,
                           drc=drc, ch_mode=ch_mode, de_level=de_level,
-                          present=present, layout=layout)
+                          present=present, layout=layout,
+                          ajoc_info=ajoc_info)
     except ValueError as e:
         say(str(e))
         return 1

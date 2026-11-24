@@ -447,3 +447,310 @@ def test_c_layout(tmp_path, layout):
     got = np.fromfile(raw, "<f8").reshape(-1, len(dec.chans))
     assert got.shape == ref.shape
     assert np.abs(got - ref).max() <= 1e-9 * np.abs(ref).max()
+
+
+# ------------------------------------------------ OAMD, A-JOC side info
+def test_oamd_object_blocks():
+    """object_info_block (TS 103 190-2 6.2.8.5 - 6.2.8.11) written bit by
+    bit: an I-frame block with gain and position, a differential position
+    update, a reuse, extended precision, an inactive object."""
+    import math
+    from ac4 import oamd as O
+    from ac4.toc import Bits
+    w = BW()
+    # block 1 (no delta, dynamic): active, basic info: gain 0b0 + value 3
+    # (12 dB), position x 10 y 50 z + 9
+    w.u(1, 0)                                  # b_object_not_active
+    w.u(1, 0).u(1, 0).u(1, 0).u(6, 3)          # not default, md 0b0, gain
+    w.u(6, 10).u(6, 50).u(1, 1).u(4, 9)        # pos3D_X Y, Z sign, Z
+    w.u(1, 1)                                  # b_grouped_zone_defaults
+    w.u(1, 1)                                  # b_grouped_other_defaults
+    w.u(1, 0)                                  # b_add_table_data
+    # block 2 (delta allowed): basic reuse, render partial reuse with a
+    # differential position (+3, -4, -1) and ext precision on X (+2)
+    w.u(1, 0).u(1, 1)                          # active, b_basic_info_reuse
+    w.u(1, 0).u(1, 1)                          # not reuse, partial reuse
+    w.u(1, 0).u(1, 0).u(1, 1)                  # mask: position only
+    w.u(1, 1).u(3, 3).u(3, 4).u(3, 7)          # diff coding: 3, -4, -1
+    w.u(1, 1).u(4, 0)                          # add_table_data, 1 byte
+    w.u(1, 0).u(1, 1).u(3, 0b100).u(2, 1)      # trim, ext X = 2
+    w.u(1, 0)                                  # b_headphone (8 bits)
+    # block 3: inactive
+    w.u(1, 1).u(1, 0)
+    b = Bits(w.align().bytes())
+    st = O.ObjState()
+    O.object_info_block(b, st, True, True)
+    assert st.active and st.gain == 12.0
+    assert st.position() == (10 / 62, 50 / 62, 9 / 15)
+    O.object_info_block(b, st, False, True)
+    assert st.gain == 12.0
+    assert np.allclose(st.position(), (13 / 62 + 2 / 310, 46 / 62, 8 / 15))
+    O.object_info_block(b, st, False, True)
+    assert not st.active and st.gain == -math.inf
+    assert st.position() == (0.5, 0.5, 0.0)
+
+
+def test_oamd_timing():
+    from ac4 import oamd as O
+    from ac4.toc import Bits
+    w = BW().u(1, 1).u(1, 0).u(1, 1).u(1, 1)    # 0b10, code 0b11: 24
+    w.u(3, 2)
+    w.u(6, 5).u(2, 1)                            # 512
+    w.u(6, 9).u(2, 3).u(1, 0).u(11, 1000)
+    t = O.oamd_timing_data(Bits(w.align().bytes()))
+    assert t == dict(sample_offset=24, blocks=[(5, 512), (9, 1000)])
+
+
+def _ajoc_put(w, dt, qs, kind, val):
+    from ac4 import ajoc as AJ
+    h, off = AJ.books()[(dt, "COARSE" if qs else "FINE", kind)]
+    EW.huff_put(w, h, val + off)
+
+
+def test_ajoc_side_info():
+    """ajoc() (6.2.5) written with the Annex A.1.1 codebooks: control
+    info, a sparse object, frequency then time differential data;
+    Pseudocode 16 and Tables 29 - 32."""
+    from ac4 import ajoc as AJ
+    from ac4.toc import Bits
+    n_dmx, n_umx = 2, 2
+    w = BW()
+    w.u(3, 1).u(1, 1)                            # one decorrelator, on
+    w.u(1, 1).u(1, 1)                            # both objects present
+    w.u(2, 1).u(5, 3).u(6, 7)                    # one data point 3, 8
+    w.u(3, 7).u(1, 1).u(1, 0)                    # obj 0: 1 band, coarse
+    w.u(3, 6).u(1, 0).u(1, 1)                    # obj 1: 3 bands, fine,
+    w.u(1, 1).u(1, 0).u(1, 1)                    # sparse: dry 0, wet 0
+    w.u(1, 1)                                    # ajoc_b_nodt
+    # object 0: dry ch0, ch1, wet d0 (one band each, F0)
+    _ajoc_put(w, "DRY", 1, "F0", 30)
+    _ajoc_put(w, "DRY", 1, "F0", 25)
+    _ajoc_put(w, "WET", 1, "F0", 12)
+    # object 1 (fine, 3 bands): dry ch0 F0 60, DF +1, DF +45 (wraps)
+    _ajoc_put(w, "DRY", 0, "F0", 60)
+    _ajoc_put(w, "DRY", 0, "DF", 1)
+    _ajoc_put(w, "DRY", 0, "DF", 45)
+    _ajoc_put(w, "WET", 0, "F0", 21)
+    _ajoc_put(w, "WET", 0, "DF", 0)
+    _ajoc_put(w, "WET", 0, "DF", 40)
+    b = Bits(w.align().bytes())
+    s = AJ.ajoc(b, n_dmx, n_umx)
+    assert s["dpoints"] == [(3, 8)] and s["num_bands"] == [1, 3]
+    assert s["dry_present"][1] == [1, 0]
+    prev = {}
+    q = AJ.quantised(s, prev)
+    assert q[0][0][0] == [[30], [25]] and q[0][0][1] == [[12]]
+    assert q[1][0][0] == [[60, 61, 5], [50, 50, 50]]
+    assert q[1][0][1] == [[21, 21, 20]]
+    assert np.allclose(AJ.dequant_dry([0, 25, 50], 1),
+                       [-5.0048828, 0, 5.0048828], atol=1e-7)
+    assert np.allclose(AJ.dequant_dry([1, 99], 0), [-4.90478516, 4.904785156],
+                       atol=1e-8)
+    assert np.allclose(AJ.dequant_wet([0, 11], 1), [-2.001953125,
+                                                     0.200195313], atol=1e-8)
+    assert np.allclose(AJ.dequant_wet([39], 0), [1.901855469], atol=1e-8)
+    # a time-differential frame against the held values
+    w = BW().u(1, 0)                             # ajoc_b_nodt 0
+    w.u(1, 1)
+    _ajoc_put(w, "DRY", 0, "DT", -2)
+    for _ in range(2):
+        _ajoc_put(w, "DRY", 0, "DT", 1)
+    w.u(1, 1)
+    for v in (1, 0, -1):
+        _ajoc_put(w, "WET", 0, "DT", v)
+    side = dict(s)
+    side.update(present=[0, 1])
+    b = Bits(w.align().bytes())
+    side["b_nodt"] = b.u(1)
+    side["data"] = [[], [([AJ.huff_data(b, "DRY", 3, 0, False), None],
+                          [AJ.huff_data(b, "WET", 3, 0, False)])]]
+    q = AJ.quantised(side, prev)
+    assert q[1][0][0][0] == [58, 62, 6]
+    assert q[1][0][1][0] == [22, 21, 19]
+
+
+def test_ajoc_band_map():
+    from ac4 import ajoc as AJ
+    m = AJ.sb_to_pb(23)
+    assert m[0] == 0 and m[11] == 11 and m[13] == 12 and m[63] == 22
+    assert list(AJ.sb_to_pb(7)[[3, 4, 13, 14, 25]]) == [2, 3, 4, 5, 6]
+    assert set(AJ.sb_to_pb(1)) == {0}
+
+
+def test_object_panner():
+    """objrender: power preserved, a source at a loudspeaker feeds it
+    alone, left / right mirror, the top ring used from z > 0."""
+    from ac4 import objrender as OR
+    from ac4 import render as RD
+    lay = RD.LAYOUTS["7.1.4"]
+    i = {k: n for n, k in enumerate(lay)}
+    for pos in ((0.1, 0.2, 0.0), (0.7, 0.9, 0.4), (0.5, 0.5, 1.0),
+                (0.5, 0.0, 0.0), (0.3, 0.6, -0.5)):
+        g = OR.gains(pos, lay)
+        assert np.isclose((g ** 2).sum(), 1.0)
+    g = OR.gains((0.0, 0.0, 0.0), lay)              # front left corner
+    assert np.isclose(g[i["L"]], 1.0) and np.isclose((g ** 2).sum(), 1.0)
+    gl = OR.gains((0.2, 0.3, 0.5), lay)
+    gr = OR.gains((0.8, 0.3, 0.5), lay)
+    for a, b_ in (("L", "R"), ("Ls", "Rs"), ("Tfl", "Tfr"), ("Tbl", "Tbr")):
+        assert np.isclose(gl[i[a]], gr[i[b_]])
+    assert gl[i["Tfl"]] > 0
+    g2 = OR.gains((0.2, 0.3, 0.5), RD.LAYOUTS["5.1"])
+    assert np.isclose((g2 ** 2).sum(), 1.0)          # no top ring
+    assert OR.gains((0.5, 0.5, 0), lay, lfe=True)[i["lfe"]] == 1.0
+
+
+def test_ajoc_dmx_de_data():
+    """ajoc_dmx_de_data (6.2.3.5, Table 82)."""
+    from ac4 import ajoc as AJ
+    from ac4.toc import Bits
+    w = BW().u(1, 1).u(1, 0).u(2, 2)             # cfg, new coeffs, max 2
+    w.u(1, 0).u(1, 1).u(1, 0)                    # objects: 1 is dialogue
+    w.u(1, 0)                                    # dmx 0: 0
+    w.u(1, 1).u(3, 7)                            # dmx 1: 1
+    w.u(1, 1).u(3, 2).u(1, 1)                    # dmx 2: 0b10101 -> 6/15
+    st = {}
+    d = AJ.dmx_de_data(Bits(w.align().bytes()), 3, 3, st)
+    assert st == dict(de_max_gain=2, dlg=[1])
+    assert np.allclose(d["coeffs"], [[0.0, 1.0, 6 / 15]])
+
+
+# ------------------------------------------------ A-JOC core decoding
+def _ajoc_toc(sub_len, seq, iframe, n_dmx, n_umx, lfe):
+    """A TOC with one presentation whose only audio substream is A-JOC
+    coded (ac4_substream_info_ajoc, 6.2.1.9): dynamic objects only."""
+    from test_phase_a import presentation
+    w = BW().u(2, 2).u(10, seq).u(1, 0).u(1, 1).u(4, 3).u(1, iframe)
+    w.u(1, 1).u(1, 0).u(1, 0)            # one presentation, no base, no id
+    presentation(w, groups=[0], pres_sub=0)
+    # ac4_substream_group_info: present, no hsf, single, object coded
+    w.u(1, 1).u(1, 0).u(1, 1).u(1, 0)
+    w.u(1, 0)                            # b_oamd_substream
+    w.u(1, 1)                            # b_ajoc
+    w.u(1, lfe).u(1, 0).u(4, n_dmx - 1)  # b_lfe, not static, n_dmx
+    w.u(1, 1)                            # dmx: b_dyn_objects_only
+    w.u(1, 0)                            # b_oamd_common_data_present
+    w.u(4, n_umx - 1).u(1, 1)            # n_umx, dynamic only
+    w.u(1, 0).u(1, 0)                    # b_sf_multiplier, b_bitrate_info
+    w.u(1, iframe)                       # b_audio_ndot
+    w.u(2, 1)                            # substream_index 1
+    w.u(1, 0)                            # b_content_type
+    w.u(2, 2).u(1, 0).u(10, 2).u(1, 0).u(10, sub_len)
+    return w.bytes()
+
+
+def _ajoc_sub(rng, n_dmx, n_umx, lfe, pos, iframe=True):
+    """audio_data_ajoc (6.2.3.4) with a SIMPLE var_channel_element of
+    n_dmx signals (+ LFE), downmix OAMD with the positions pos, an A-JOC
+    side info with no data points, no DE data, the upmix OAMD inactive.
+    -> (bytes, the dequantised tracks in bitstream order)."""
+    T = CH.load_tables()
+    w = BW().u(1, 0)                     # b_some_signals_inactive
+    w.u(1, 0)                            # var_codec_mode SIMPLE
+    tracks = []
+    if lfe:
+        t = EW.Track(rng, 2)
+        EW.lfe(w, T, t)
+        tracks.append(t.deq())
+    n = 10
+    for p in range(n_dmx // 2 - (1 if n_dmx % 2 else 0)):
+        tr = [EW.Track(rng, n), EW.Track(rng, n)]
+        EW.two_channel(w, T, tr, EW.St(rng, 0, n))
+        tracks += [x.deq() for x in tr]
+    if n_dmx % 2:
+        if n_dmx > 1:
+            w.u(1, 0)                    # var_coding_config: pair + mono
+            tr = [EW.Track(rng, n), EW.Track(rng, n)]
+            EW.two_channel(w, T, tr, EW.St(rng, 0, n))
+            tracks += [x.deq() for x in tr]
+        t = EW.Track(rng, n)
+        EW.mono(w, T, t)
+        tracks.append(t.deq())
+    w.u(1, 1)                            # b_dmx_timing
+    w.u(1, 0).u(3, 1).u(6, 0).u(2, 0)    # offset 0, one block, ramp 0
+    for k in range(n_dmx + (1 if lfe else 0)):
+        w.u(1, 0)                        # active
+        if not iframe:
+            w.u(1, 0)                    # basic info: new
+        w.u(1, 1)                        # b_default_basic_info_md (0 dB)
+        if not (lfe and k == 0):
+            if not iframe:
+                w.u(1, 0).u(1, 0)        # render: new
+            x, y, z = pos[k - (1 if lfe else 0)]
+            if not iframe:
+                w.u(1, 0)                # b_diff_pos_coding
+            w.u(6, x).u(6, y).u(1, 1).u(4, z)
+            w.u(1, 1).u(1, 1)            # zone, other: defaults
+        w.u(1, 0)                        # b_add_table_data
+    w.u(1, 0)                            # b_oamd_extension_present
+    w.u(3, 0)                            # ajoc_num_decorr 0
+    for _ in range(n_umx):
+        w.u(1, 0)                        # ajoc_object_present
+    w.u(2, 0)                            # no data points
+    w.u(1, 1)                            # ajoc_b_nodt
+    w.u(1, 0).u(1, 1)                    # dmx_de: no cfg, keep
+    w.u(1, 0).u(1, 1)                    # b_umx_timing 0, derive
+    for k in range(n_umx + (1 if lfe else 0)):
+        w.u(1, 1).u(1, 0)                # inactive, no table data
+    return EW.element(w), tracks
+
+
+def _ajoc_frames(rng, n_dmx=3, n_umx=4, lfe=1, pos=None, n=4):
+    from test_inputs import syncframe  # noqa: F401
+    pos = pos or [(0, 0, 0), (62, 0, 0), (31, 62, 15)][:n_dmx] + \
+        [(31, 31, 0)] * max(0, n_dmx - 3)
+    frames, tracks = [], []
+    for i in range(n):
+        sub, tr = _ajoc_sub(rng, n_dmx, n_umx, lfe, pos, iframe=(i == 0))
+        toc = _ajoc_toc(len(sub), 5 + i, int(i == 0), n_dmx, n_umx, lfe)
+        frames.append(toc + bytes(2) + sub)
+        tracks.append(tr)
+    return frames, tracks
+
+
+@pytest.mark.parametrize("n_dmx", [1, 2, 3, 4, 5, 7])
+def test_ajoc_core_parse(n_dmx):
+    """An A-JOC substream (6.2.3.4) walked to audio_size: the downmix
+    tracks of the var_channel_element (6.2.4.4) on their slots, the
+    downmix objects' positions, the side information."""
+    from ac4 import decoder as D
+    from ac4 import toc as M
+    rng = np.random.default_rng(70 + n_dmx)
+    frames, tracks = _ajoc_frames(rng, n_dmx=n_dmx)
+    st = M.parse(frames[0])
+    info = M.audio_substream(st, 0)
+    assert info["kind"] == "ajoc" and info["n_dmx"] == n_dmx
+    assert D.probe_element(frames) == "ajoc"
+    s = SC.Ac4Stream("ajoc", ajoc_info=info)
+    wins, lengths, groups, counts = s.decode_frames(frames)
+    assert s.n_bad == 0, s.status
+    slots = EL.ajoc_slots(info)
+    order = ("lfe",) + EL.VAR_SLOTS[n_dmx]
+    for i in range(4):
+        for k, ref in zip(order, tracks[i]):
+            assert np.allclose(np.asarray(wins[k][i]), ref), (i, k)
+        o = groups["obj"][i]
+        assert len(o["dmx"]) == n_dmx + 1 and o["side"]["num_decorr"] == 0
+    p = groups["obj"][0]["dmx"][1].position()
+    assert p == (0.0, 0.0, 0.0)
+    assert set(slots) == set(order)
+
+
+def test_ajoc_core_renders_objects():
+    """Core decoding to 5.1: an object at the front left corner plays on
+    L only, one at the front right corner on R, one at the back ceiling
+    on the surrounds (no top ring in 5.1)."""
+    from ac4.decoder import decode
+    rng = np.random.default_rng(81)
+    frames, _ = _ajoc_frames(rng, n_dmx=3, n=6)
+    pcm, dec = decode(frames, max_pass=100)
+    assert dec.n_concealed == 0 and dec.chans == ("L", "R", "C", "lfe",
+                                                   "Ls", "Rs")
+    # each object alone: zero the others' tracks through the renderer
+    R = dec.obj_renderer._matrix()
+    i = {k: n for n, k in enumerate(dec.dchans)}
+    assert np.allclose(R[:, i["L"]], [1, 0, 0, 0, 0, 0])
+    assert np.allclose(R[:, i["R"]], [0, 1, 0, 0, 0, 0])
+    assert np.allclose(R[:, i["C"]], [0, 0, 0, 0, np.sqrt(.5), np.sqrt(.5)])
+    assert R[3, i["lfe"]] == 1.0
+    assert np.abs(pcm).max() > 0
