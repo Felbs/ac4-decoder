@@ -41,6 +41,7 @@ this repository.
 | 7.1.4 / 5.1.4 (`immersive_channel_element`, TS 103 190-2) | immersive_codec_mode ASPX_ACPL_2 (the public 5.1.4 test streams): the 7CH_STATIC core, A-SPX on its four blocks, the four one-channel A-CPL modules to Ls Lb Rs Rb Tfl Tbl Tfr Tbr, L R C at twice their A-SPX output; the channels the substream signals absent are left out (the kit's back pair: 5.1.4). Every core_5ch_grouping and b_use_sap_add_ch on synthetic streams only. SCPL, ASPX_SCPL, ASPX_ACPL_1, ASPX_AJCC (A-JCC) and 9.X.4 are concealed (`element.parse`). See [Phase C](#phase-c-immersive-and-objects) |
 | "IMS" (the kit's immersive-stereo streams) | presentation_version 2 with a 7.1 channel mode: the substream is a channel_pair_element (see Interpretations); its stereo core is decoded, both kit streams without a concealed frame, and rendered as any stereo programme (`--layout`). What makes it "immersive" (it carries EMDF payload 18, an ID registered outside ETSI) is not in the standard at hand (Phase C) |
 | Objects (A-JOC substreams) | a presentation with no channel-coded substream decodes its A-JOC substream in full decoding mode (phase D): the downmix (a var_channel_element of 1 - 7 signals, SIMPLE or ASPX, or a static 5.X element) is upmixed by the A-JOC tool (TS 103 190-2 5.7) to up to 64 objects, which are rendered from their OAMD (with its block updates and ramps, 5.9) by a plain panner that is not Dolby's (`ac4/objrender.py`). `--core-decoding` (C `ajoc_core`) renders the downmix objects instead (phase C). On synthetic streams only (no object stream at hand). See [Phase D](#phase-d-objects-downmixes-dialogue-enhancement) |
+| Objects (direct-coded, phase E) | object substreams without A-JOC (audio_data_objs: an LFE plus a mono, stereo, 3.0 or 5.0 element, SIMPLE or ASPX), their metadata from the group's oamd_substream (oamd_dyndata_multi), dynamic objects through the same panner, bed objects as channels of their bed, ISF objects through the ISF matrices of TS 103 190-2 Annex A.2.1 (5.10.3); several object substreams, and object with channel substreams, mixed (4.8.4). On synthetic streams only. See [Phase E](#phase-e-direct-coded-objects-isf-version-0--1-metadata) |
 | Output layouts | `--layout 2.0 / 5.1 / 5.1.2 / 5.1.4 / 7.1 / 7.1.2 / 7.1.4`: the channel renderer of TS 103 190-2 5.10.2 with the stream's custom downmix coefficients (custom_dmx_data, parsed) or their defaults; stereo as the LoRo downmix of TS 103 190-1 6.2.17.4, or LtRt / its Pro Logic II form, or the stream's preferred one (`--stereo-dmx loro|ltrt|pl2|auto`, phase D); the stream's downmix loudness correction (loud_corr) applied to downmixes (phase D) |
 | Core (ASF/MDCT) | Huffman spectral data, scale factors, long and short frames with block switching, KBD windows, stereo processing (sap_mode 1 and 2: M/S; sap_mode 3: full SAP with prediction coefficients, see below), spectral noise fill (clause 5.1.4, the standard's own noise generator; no capture here signals it), LFE |
 | A-SPX | parsed and rendered on the L/R and Ls/Rs pairs and the centre: 64-band complex QMF, envelope decoding (1.5 and 3 dB steps), HF generation with TNA and pre-flattening, envelope adjustment with the limiter, noise, additional harmonics (sinusoids), FIC/TIC (interleaved waveform coding), joint-balance rendering; companding (5.7.5) of the core |
@@ -48,7 +49,7 @@ this repository.
 | Output | 48 kHz (44,1 kHz) via the resampler of TS 103 190-1 Table 83 for the stream's frame rate (1001/960 at 29.97 fps; without it audio runs 4.27 % fast). Every channel is 577 samples (12 ms) after the MDCT core: the A-SPX channels through the QMF bank, the others (LFE, a pair without A-SPX) through a delay line of the same length, so all channels are time-aligned. Channel order checked on a public 2.0 channel-identification signal against its AAC version (envelope correlation L-L 0.947, R-R 0.949; crossed 0.90, 0.89) |
 | Loudness, DRC | applied (`ac4/loudness.py`, C `src/loudness.c`): dialnorm normalised to a target level (default -24 dB, `--target-level`), the stream's DRC decoder mode for that level (5.7.9.2): E-AC-3 profiles, transmitted curves, transmitted gains (`--drc auto|off|N`). The CLIs write this; `--legacy-level` / `--ref-peak` keep the old fixed-reference rule |
 | Metadata | parsed: further loudness information; dialogue enhancement config and parameters; EMDF payload ids (`tools/survey.py` reports them) |
-| Dialogue enhancement | de_method 0 (parametric, channel independent, with the M/S form; TS 103 190-1 5.7.8.7) applied in the QMF domain at a user gain (`--de-level dB`, `Decoder(de_level=)`, C `de_level`; default 0: off, output unchanged), capped by the stream's maximum. Both broadcasters and the kit send method 0 (centre, or L/R). Phase D: method 1 (cross-channel, 5.7.8.8) applied (synthetic streams only); methods 2 and 3 (waveform-parametric hybrid) on their parametric data alone, as 5.7.8.1 allows (synthetic streams only: the kit's immersive-stereo streams signal method 2, but their substream metadata does not parse to its size here, so no DE reaches them, as before) |
+| Dialogue enhancement | de_method 0 (parametric, channel independent, with the M/S form; TS 103 190-1 5.7.8.7) applied in the QMF domain at a user gain (`--de-level dB`, `Decoder(de_level=)`, C `de_level`; default 0: off, output unchanged), capped by the stream's maximum. Both broadcasters and the kit send method 0 (centre, or L/R). Phase D: method 1 (cross-channel, 5.7.8.8) applied (synthetic streams only); methods 2 and 3 (waveform-parametric hybrid) on their parametric data alone, as 5.7.8.1 allows (synthetic streams only). The kit's immersive-stereo streams send method 0 on L / R and get DE like any stereo stream (phase E: the method 2 reported before was the survey reading their metadata with the 7.1 channel mode) |
 | I-frames | decoding can start mid-stream; A-SPX starts at the first I-frame |
 | Damaged input | never raises, never changes the output length; damaged frames are concealed (see below) |
 
@@ -286,7 +287,8 @@ nothing else in it is specific to version 2. The kit's IMS presentations
 (version 2, b_pre_virtualized 0) signal 7.1 (3/4/0) for a substream that
 is a channel_pair_element, carry EMDF payload 18 in about half their
 frames (a payload ID registered outside ETSI) and dialogue enhancement
-methods 0 and 2; their `dac4` lists the same presentation a second time
+method 0 (phase E; "methods 0 and 2" here before was a misreading, see
+Phase E); their `dac4` lists the same presentation a second time
 as a version 1 stereo presentation for older decoders. What the standard
 defines is therefore decoded: the stereo pair (with its A-SPX, DRC and
 loudness). The rendering choice: it is a stereo programme, rendered by
@@ -512,6 +514,176 @@ B's upmixed 5.1 2.8x / 23.9x, its stereo 5.4x / 53.2x, the 5.1.4
 identification stream 0.6x / 9.1x (phase C: 18.2x, 47.7x, 23.7x, 53.9x,
 9.1x for the C); the synthetic A-JOC stream (5 ASPX downmix signals, 6
 objects, 3 decorrelators, rendered to 5.1) 1.1x / 10.7x.
+
+### Phase E: direct-coded objects, ISF, version 0 / 1 metadata
+
+Everything new here is in both decoders (Python first, the C held to it
+within 1e-9, in fact ~1e-14). **No stream at hand carries objects,
+bitstream_version 0 / 1 or presentation_config 7**: those parts are
+checked on synthetic streams written bit by bit from the syntax
+(`tests/test_phase_e.py`) and C against Python; they are unverified on
+real streams.
+
+**Object substreams without A-JOC** (TS 103 190-2 6.2.1.11, 6.2.2.4,
+6.2.3.2). ac4_substream_info_obj is read in full and the objects of an
+object-coded substream group are shared out over its substreams
+(`toc.obj_split`). audio_data_objs is decoded as the LFE's mono_data
+followed by the mono, stereo, 3.0 or 5.0 element of
+objs_to_channel_mode (SIMPLE or ASPX codec mode), through the A-JOC
+core-decoding path (`elements.objs_element`, C `ac4_parse_objs`). The
+objects' metadata comes from the group's oamd_substream
+(oamd_common_data, oamd_timing_data, oamd_dyndata_multi over every
+object of the group; `elements.objs_tail`, C `ac4_objs_tail`), each
+substream taking its own objects, with the block updates and ramps of
+phase D. Dynamic objects go through the plain panner of phase C, bed
+objects are rendered as channels of their bed by the channel renderer,
+ISF objects through the ISF matrix of the layout (5.10.3, Annex A.2.1:
+the coefficients banked from ts_103190_tables_part2.c as
+`ac4/tables/ac4_isf.json`, all six stacked-ring formats, the seven
+layouts), each with its OAMD gain. Several object substreams, and object
+with channel substreams, are mixed as phase B3 mixes channel substreams
+(4.8.4): each object substream is decoded by its own decoder, rendered
+to the main substream's layout (or the layout asked for, or 5.1), and
+summed with the others (divided by their number for presentation_version
+1 and above, as printed); an object main substream is rendered before
+the mix. Checks (synthetic): the tracks of 1, 2, 3 and 5 objects with
+and without an LFE land on their slots and every frame closes on
+audio_size; object positions read back; a 5.1 bed split over two
+substreams (L R C + LFE, then Ls Rs) plus two dynamic objects renders
+each bed channel to its loudspeaker and the objects to L and to R at
+their -6 dB gain; ISF SR3.1.0.0 and SR5.3.0.0 split over two substreams
+render by the Annex A.2.1 rows (2.0, 5.1, 5.1.4, 7.1.4), with an ISF
+object's gain; C against Python on five object configurations.
+
+Fixed on the way (both decoders, synthetic streams only): a bed object
+alone ("R") was taken by the channel renderer for a mono input and sent
+to the centre; bed objects now render as channels of their bed (the
+group's, or the A-JOC substream's bed channels; a lone channel other
+than C as a channel of the 2.0, 5.1 or 7.1.4 bed that holds it), and bed
+channels the channel renderer has no input for (Lw / Rw, Tsl / Tsr) are
+panned at their Table A.30 position.
+
+Interpretations (objects):
+
+* 6.2.1.11 restarts n_objs in each ac4_substream_info_obj, while the
+  group's one oamd_substream covers all of them: oamd_dyndata_multi is
+  read over the objects of every substream of the group in TOC order
+  (an A-JOC substream's upmix objects counted as A-JOC coded, which
+  dyndata_multi skips).
+* Table 60 counts the LFE on top of n_objects_code's objects, while the
+  syntax loops num_objects with the LFE as object 0: the Table 60 count
+  is taken (the LFE first, then n_objects coded signals), which is what
+  audio_data_objs decodes. n_objects_code 5 (7 objects) has no
+  objs_to_channel_mode: concealed (`element.parse`).
+* A bed (ISF) is shared out in its assignment order: each substream
+  takes the next n_objects non-LFE channels and the first LFE not yet
+  taken (6.3.2.10.6: one LFE per substream, LFE2 in the second); a
+  substream with b_bed_start / b_isf_start 0 continues the group's last
+  bed (ISF); more signals than assigned channels are dynamic objects.
+* An object substream whose group has no oamd_substream in the table,
+  or whose group object count changes, is concealed (`element.parse`).
+* With b_alternative the objects keep their last states (the
+  per-substream oamd_dyndata_single is not read).
+
+**Intermediate spatial format.** The ISF tool runs at the output layout
+(5.10.3 step 3: y = M t); its matrices' speaker columns are the layout's
+loudspeakers without the LFE in Table A.27 order (which the coefficients
+bear out: SR3.1.0.0's M1 goes to L / R / C, U1 only to the top
+loudspeakers).
+
+**The kit's immersive-stereo streams and dialogue enhancement** (open
+item of phases B2 - D). They do not signal method 2: `tools/survey.py`
+read their metadata() with the 7.1 channel mode of the TOC, which does
+not close and decodes noise as "method 2"; the decoders read it with
+the stereo channel mode of the channel_pair_element they carry (phase
+B2), where it closes in every frame of all 20 IMS inputs of the kit (the
+elementary streams and their MP4, TS and DASH containers; 800 - 2128
+frames each): DE method 0, with no
+channels in most frames and on L / R (channel_config 6) in 69 of 800
+(identification programme, 25 fps) to 1493 of 2128 frames (music
+programme, English); one frame of the French music programme sends
+channel_config 2. Both decoders have applied it since phase B2 (the
+phase D statement that no DE reached them was wrong): at 9 dB the
+English music programme's output changes in 1933 of 1995 frames, by
++5.3 dB overall. The survey now reads them as the decoder does; the
+decoders are unchanged.
+
+**bitstream_version 0 / 1 metadata** (TS 103 190-1 Table 66, 69; TS
+103 190-2 4.8.5.2, 4.8.6). The metadata() of a version 0 / 1 audio
+substream is read in full: basic_metadata, extended_metadata with
+b_associated / b_dialog as the presentation sets them (4.3.12.4.1 / .2),
+and the tools block's drc_frame (`metadata.v0_substream_metadata`, C
+`ac4_v0_sub_metadata`). dialnorm, truepk and the DRC frame come from the
+associated substream when the presentation has one (4.8.5.2), else from
+the substream of Table 16 (presentation_config 0 and 3: the dialogue
+substream, the others main); the associated substream's scale_main,
+scale_main_centre, scale_main_front and pan_associated (a mono
+substream) reach the mixer as the presentation substream's do for
+version 1 and above; dialog_max_gain gives g_dialog_max = (1 +
+dialog_max_gain) x 3 dB (4.3.12.4.11, from the PDF's formula; 0 dB from
+an I-frame of the dialogue substream that does not send it, held
+otherwise), the cap of the user's dialogue gain (`MixDecoder(
+dialog_gain=)`; the C API has no dialogue gain, so there it changes
+nothing). What parses is kept: a substream whose metadata stops
+parsing still gives its dialnorm and truepk.
+
+**presentation_config 7 of bitstream_version 1** (TS 103 190-2 6.2.1.5,
+6.2.1.7): the ac4_presentation_v1_info inside
+presentation_config_ext_info, padded to a byte and within n_skip_bytes,
+is the presentation decoded; its ac4_sgi_specifier elements carry the
+substream groups inline, with each channel-coded substream's sus_ver. It
+decodes sample for sample as the same audio under a version 2 TOC
+(synthetic, with and without bytes after it to skip). A sus_ver 0
+substream of such a presentation gets no DE (its tools metadata is not
+read).
+
+**Damaged input.** `make test` / `make asan` now also damage four more
+synthetic streams (`c/tests/data`, written by `tests/gen_fuzz_streams.py`
+at a realistic level, `tests/elem_writer.SF_REF`): a bed split over two
+substreams plus two dynamic objects, ISF over two substreams, version 0
+main + associated audio with metadata and DRC, and version 1
+presentation_config 7.
+
+Not done in this phase (see [What it does not do yet](#what-it-does-not-do-yet)):
+
+* immersive_codec_mode SCPL / ASPX_SCPL (S-CPL, 5.2.3.2, 5.3),
+  ASPX_ACPL_1 (its residual tracks), ASPX_AJCC (A-JCC, 5.6), b_5fronts
+  (9.X.4), the 22_2_channel_element, and 7_X in ASPX_ACPL_1 / _2: still
+  concealed (`element.parse`). Each is a tool of its own (A-JCC alone is
+  12 pages of the standard: its own parameter bands, quantisation,
+  interpolation, decorrelators and two decoding modes; S-CPL needs the
+  residual tracks of Table 20 with their full-SAP parameters and an
+  A-SPX pass over up to eight block pairs; 22.2 needs output layouts
+  beyond the seven here), no stream at hand uses any of them, and they
+  were left for a later phase rather than built half-way on synthetic
+  data alone.
+* The SSF speech frontend (TS 103 190-1 5.2, with its arithmetic coder):
+  not built, for the same reasons; frames that use it are concealed.
+
+**Phase E figures** (2026-11-24): every capture and public kit stream
+(32 inputs) decodes bit-identically to phase D with the C CLI (decoder
+scale, statuses, loudness-normalised WAVs, `--layout 2.0` WAVs and DE at
+9 dB: 224 of 224 outputs identical). Against the Python (`compare.py`,
+one pass): 1.31e-14 of full scale at decoder scale, 8.99e-15
+loudness-normalised, 2.49e-14 with dialogue enhancement at 9 dB, 1.31e-14
+at `--layout 2.0` (LoRo and `--stereo-dmx auto`) and `--layout 5.1`;
+16-bit WAVs identical, the same per-frame statuses (the same figures as
+phase D). Synthetic object, ISF, version 0 / 1 streams: C within 1e-9 of
+the Python (in fact ~1e-14). `check_inputs.py` (40 inputs, clean and with
+30 byte changes each): the same frames. Damaged input
+(`robust_compare.py`): worst peak 1.94x, 0 LOUD, 86 undamaged frames
+concealed, 0 gate failures (lookahead 8: 1.98x, 0, 102, 0), unchanged.
+`make test` and `make asan`: FUZZ GATE PASS; worst damaged frame against
+the clean peak 1.08x / 1.12x (the A-JOC streams, as before), 1.78x (bed +
+dynamic objects), 2.46x (ISF), 1.53x (version 0 with associated audio),
+1.00x (presentation_config 7). The ISF figure is above 2x: damage to an
+oamd_substream changes object gains and ISF matrices that no structural
+check can see. pytest: 472 passed. Speed (`speed.py`, best of 2, one
+thread, decode time; Python / C): broadcaster A's 5.1 1.9x / 18.2x, its
+stereo 5.0x / 47.7x, broadcaster B's upmixed 5.1 2.8x / 23.8x, its stereo
+5.3x / 53.2x, the 5.1.4 identification stream 0.6x / 9.0x, the synthetic
+A-JOC stream 1.1x / 10.7x, the synthetic bed + objects stream 3.2x /
+10.0x.
 
 ## Changes against the standard
 
@@ -999,22 +1171,22 @@ immersive-stereo streams the burst guard no longer replaces 19 / 27 and
   (9.X.4) are concealed; the 22_2_channel_element is not read. The
   loud_corr "core" corrections (core decoding of 5.X.2 cores) are parsed,
   not used.
-* **Objects**: object substreams without A-JOC (audio_data_objs and the
-  oamd_substream); ISF; alternative presentations' object metadata
-  (parsed, dropped); A-JOC substreams with more than seven downmix
+* **Objects**: alternative presentations' object metadata (b_alternative:
+  the oamd_dyndata_single of each substream's metadata is not read; the
+  objects keep their last states); object substreams in other codec
+  modes than SIMPLE / ASPX, or with 7 objects (objs_to_channel_mode
+  defines none), are concealed; A-JOC substreams with more than seven downmix
   signals or 64 upmix objects; dialogue enhancement of objects (ajoc_dmx
   de_data parsed, not applied). Object rendering is a plain panner, not
   Dolby's.
 * **IMS**: the rendering of an immersive-stereo presentation beyond its
   stereo core (EMDF payload 18; see Phase D).
-* **Mixing**: the associated audio's gains of a presentation_version 0
-  presentation (in the associated substream's extended_metadata) and
-  pan_dialog / g_dialog limits (dialog_max_gain) are not read. Object
-  audio substreams are not mixed.
-* **Bitstream versions 0 / 1** (phase B3): the sus_ver 0 DRC frame is not
-  read (no DRC on such streams); presentation_config 7 of version 1 is
-  skipped; the `dac4` box of version 0 is not parsed (`--list` reads the
-  TOC).
+* **Mixing**: pan_dialog is parsed, not applied; dialog_max_gain is read
+  for bitstream_version 0 only (the version 2 substream metadata's is
+  parsed, not used); the C API has no user dialogue gain.
+* **Bitstream versions 0 / 1**: the `dac4` box of version 0 is not parsed
+  (`--list` reads the TOC); a sus_ver 0 substream of a presentation_config
+  7 presentation gets no DE.
 * The SSF speech frontend (TS 103 190-1 5.2): frames that use it are
   concealed (`element.parse`); 7_X in ASPX_ACPL_1 / _2.
 
@@ -1037,7 +1209,7 @@ streams of both broadcasters and the 18 distinct public test signals
 | stereo processing | sap_mode 1-3, short blocks | the same |
 | dialnorm | -24 dBFS | -23 (2.0, 5.1), -19 (7.1.4, IMS), -16 dBFS |
 | DRC | 4 default modes (home theatre, flat panel TV, portable speakers, headphones), all "default profile", E-AC-3 profile "none" | default profiles and one transmitted compression curve; E-AC-3 profiles film standard / film light / music light; no transmitted gains anywhere |
-| dialogue enhancement | method 0 (channel independent), max gain 9 dB, on the centre (5.1) or L/R (stereo) | method 0; IMS also method 2 (hybrid) |
+| dialogue enhancement | method 0 (channel independent), max gain 9 dB, on the centre (5.1) or L/R (stereo) | method 0 (IMS: on L/R in some frames, none in the others; phase E) |
 | EMDF payloads | none | payload id 18 in the IMS streams |
 | loudness info | loudrelgat, loudspchgat, truepk, loudstrm3s, rtll_comp | the same |
 
@@ -1364,6 +1536,15 @@ new stream's first I-frame, and requires that nothing is concealed, and the
 guard changes nothing, on the clean cuts. Its negative control turns the checks and the guard off
 (`robust.CHECKS = False`, `guard=False`) and requires the same gate to
 fail.
+
+Phase E added `tests/test_phase_e.py`: direct-coded object substreams
+(1, 2, 3, 5 objects, with and without LFE) walked to audio_size with
+their oamd_substream; the share-out of a bed and of ISF over substreams;
+bed, dynamic and ISF objects rendered and mixed; the ISF matrices;
+version 0 metadata (associated gains, dialnorm source, dialog_max_gain,
+DRC) written bit by bit; presentation_config 7 of version 1 against the
+same audio under a version 2 TOC; and the C decoder against the Python
+on all of these.
 
 Phase D added `tests/test_phase_d.py`: an A-JOC writer with data
 points, decorrelators, upmix OAMD with block updates, ramps and gains;
