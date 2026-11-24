@@ -598,6 +598,21 @@ channels (the five upmixed ones, and the core pair before the upmix,
 which the level checks judge); the A-CPL itself is 12 %. A and B stereo
 are unchanged within the spread between runs.
 
+**Phase B2 figures** (2026-11-23): against the Python on the 12 capture
+files, both broadcasters' 42 s captures and the 8 public kit streams it
+decodes (2.0, 5.1, both IMS, at 25 and 29.97 fps): largest difference
+8.9e-15 of full scale (decoder scale and loudness-normalised), WAVs
+identical; the two longest kit streams (over 1800 frames) differ by up to
+6.3e-4 at the Python's pass boundary (the known issue), 3.7e-15 against
+a one-pass Python. With dialogue enhancement at 9 dB: 1.1e-14 or less.
+Every synthetic mono, 3.0, 5.0, 7.x and 5_X stream of the tests: within
+1e-9. Damaged input (`robust_compare.py`, all captures' cuts, 12 kinds x
+20 seeds): unchanged from phase B's code on the same run (3 LOUD, 139
+undamaged frames concealed, 6 gate messages, worst peak 8.1x; at
+lookahead 8: 5, 159, 10). Speed (`speed.py`, best of 2): 5.1 codec mode 1
+17.9x, its stereo 47.7x, broadcaster B's upmixed 5.1 23.9x (phase B's
+code 23.8x on the same run).
+
 ## What it does not do yet
 
 * **frame_rate_factor / frame_rate_fraction above 1** (high frame rates,
@@ -912,6 +927,13 @@ guard changes nothing, on the clean cuts. Its negative control turns the checks 
 (`robust.CHECKS = False`, `guard=False`) and requires the same gate to
 fail.
 
+Phase B2 added `tests/test_phase_b2.py` (Tables 178, 179 and 5.3.3.4
+entry by entry, Tables B.8 - B.19, every 5_X coding_config and 2ch_mode,
+ASPX_ACPL_1's side tracks, C against Python), `tests/test_elements_b2.py`
+(mono, 3.0, 5.0, all six 7.x modes, C against Python) and
+`tests/test_de.py` (dialogue enhancement); `tests/elem_writer.py` writes
+their streams bit by bit.
+
 ## Layout
 
 | module | role |
@@ -923,6 +945,8 @@ fail.
 | `hcb.py`, `spectral.py` | Huffman codebooks and decoding |
 | `sfb.py` | scale-factor band offsets |
 | `channels.py`, `pair.py` | `5_X` channel element; `channel_pair_element` |
+| `multichannel.py`, `elements.py` | three / four / five_channel_data, max_sfb_master; mono, 3.0 and 7_X elements |
+| `de.py` | dialogue enhancement (de_method 0) |
 | `audio.py` | dequantisation, stereo processing (M/S and full SAP), noise fill |
 | `acpl_parse.py` | A-CPL side data: parsing, cb_off, differential decoding |
 | `acpl.py` | A-CPL: dequantisation, interpolation, decorrelators, ducker, the ASPX_ACPL_3 upmix |
