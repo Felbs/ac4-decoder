@@ -1213,6 +1213,24 @@ streams of both broadcasters and the 18 distinct public test signals
 | EMDF payloads | none | payload id 18 in the IMS streams |
 | loudness info | loudrelgat, loudspchgat, truepk, loudstrm3s, rtll_comp | the same |
 
+The survey's frame walk (`ac4/frameinfo.py`, every element and its A-SPX
+and A-CPL side data read to `audio_size`) now uses the stream's frame
+length as the decoder does: the transform lengths and num_aspx_timeslots
+(the A-SPX time grid, hence aspx_framing's border widths) of a 25 fps
+stream (frame length 2048) are not those of 1536. Before, it parsed every
+stream as 1536 and reported "Damaged: aspx.borders" or a read past the end
+on 2 - 42 frames of streams that decode cleanly. It also walks the A-CPL
+data of ASPX_ACPL_1 / _2 (one acpl_data_1ch per module) and every codec
+mode of the pair and the 5_X element; a walk that reads past audio_size
+is counted as an error. On the 22 elementary streams (32 presentations)
+of a second, older public test kit, the public test signals above and
+the captures, every walked frame closes (2026-11-24). Still reported, and
+not looked into: the metadata() of the public 5.1.4 streams fails to
+parse in about 3 % of frames (and their dialogue enhancement data comes
+before any de_config in most frames), as does that of 2 frames of one
+broadcaster capture; the decoder reads it the same way and only uses it
+for dialogue enhancement, which it then skips for those frames.
+
 ## Damaged input
 
 AC-4 in MP4 carries no frame CRC, and every Huffman codebook is a complete
@@ -1589,6 +1607,43 @@ ASPX_ACPL_1's side tracks, C against Python), `tests/test_elements_b2.py`
 (mono, 3.0, 5.0, all six 7.x modes, C against Python) and
 `tests/test_de.py` (dialogue enhancement); `tests/elem_writer.py` writes
 their streams bit by bit.
+
+`tests/test_conformance.py` checks the expected playback of a set of
+public conformance test streams (none in this repository; put them under
+`AC4_TEST_DIR`, they are recognised by their SHA-256), as the kit's
+playback test procedure describes it, measured on the decoded output
+(c/ac4dec-c when built, else the Python package): every presentation of
+every stream decodes without a concealed frame and lasts what the
+procedure says; in the channel-identification streams (2.0, 5.1 in English
+and French, the immersive-stereo version, and the two-language stream's
+two presentations, at 25 and 29.97 fps) the channels speak one at a time
+in the expected order, each announcement 40 dB or more above every other
+channel (median per announcement: 51 - 70 dB; the
+immersive-stereo one 56 dB and up); the Lo/Ro and Lt/Rt downmixes route each
+voice as the procedure's table says; `--language fr` and the default pick
+the right presentation, and each presentation of a multi-presentation
+stream is sample-identical to the single stream it repeats; the 25 and
+29.97 fps versions line up. Two things the procedure says that the
+streams do not bear out, neither a decoder error: the LFE "100 Hz tone"
+measures 61 Hz (the LFE path keeps frequencies: on another kit signal
+FFmpeg's decode of the E-AC-3 version puts the LFE content at the same
+frequency), and the 2.0 / 5.1 stream described as 159 s long is 72 s
+long. (None of the programme streams is digital silence: they carry a
+film soundtrack.) The kit's test tools (an MP4-to-XML
+dumper and MP4 / HLS validators) are binaries only and were not run.
+
+`c/tests/compare.py` takes `--all-presentations` (both decoders with
+`--presentation N` for each presentation of the table of contents) and,
+with no file, the captures and elementary streams under `AC4_TEST_DIR`;
+`AC4_CPORT_KEEP=0` deletes each comparison's outputs. On the 32
+presentations of the 22 conformance streams (one pass,
+`AC4_MAX_PASS=1000000`): worst max |C - Python| 1.7e-14 of full scale,
+no concealed frame on either side, the 16-bit WAVs identical. (compare.py
+now also gives the C CLI `--max-pass`: both CLIs apply the legacy level
+rule pass by pass, and on the 29.97 fps stereo streams longer than 1800
+frames the C's default passes and the Python's single pass lowered the
+gain at different points, 0.1 dB apart; the decoders' samples were equal.)
+`c/tests/check_inputs.py` with no file reads the same inputs.
 
 ## Layout
 
