@@ -895,3 +895,19 @@ def test_c_ajoc(tmp_path, n_dmx, aspx, static, layout):
                              pos=[(9 * k, 61 - 8 * k, 2 * k)
                                   for k in range(n_dmx)])
     _c_vs_python_ajoc(tmp_path, frames, layout)
+
+
+def test_ice_upmix_with_dialogue_enhancement():
+    """DE on: the immersive upmix (no L / R / C in it) still runs (it
+    used to raise inside DE and fall back to the core band)."""
+    from ac4.decoder import Decoder
+    rng = np.random.default_rng(15)
+    frames, _ = _ice_frames(rng, n=6)
+    ys = []
+    for de in (0.0, 9.0):
+        d = Decoder("ice", guard=False, ch_mode=12, present=(1, 1, 3),
+                    de_level=de)
+        d.hf_ratio = None
+        ys.append(d.decode_pass(frames))
+        assert d.n_hf_fail == 0, d.log
+    assert np.array_equal(ys[0][:, 4:], ys[1][:, 4:])

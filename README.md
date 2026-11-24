@@ -341,7 +341,29 @@ corrupted the L / R envelopes; the late check's record of a frame kept
 three of four A-SPX blocks. Both are fixed; every capture and kit stream
 decodes bit-identically to before.
 
-**Phase C figures** (2026-11-23): PHASE_C_FIGURES
+**Phase C figures** (2026-11-23): against the Python on the 14 capture files and 11 public kit streams
+(2.0, 5.1, both IMS, the three 5.1.4; one decode pass): largest
+difference 1.38e-14 of full scale at decoder scale, 8.2e-15
+loudness-normalised, 2.5e-14 with dialogue enhancement at 9 dB; 16-bit
+WAVs identical and the same per-frame statuses everywhere. The 5.1.4
+streams rendered to 2.0, 5.1 and 7.1.4: within 3.3e-15, WAVs identical.
+Every capture and pre-existing kit decode is bit-identical to phase B3's
+(C, decoder scale and loudness-normalised WAVs, statuses). Synthetic
+immersive, layout and A-JOC streams: within 1e-9 (in fact ~1e-15).
+`check_inputs.py` (25 inputs, clean and with 30 byte changes each): the
+same frames. Damaged input (`robust_compare.py`, unchanged from phase
+B3): worst peak 1.94x, 0 LOUD, 86 undamaged frames concealed, 0 gate
+failures (lookahead 8: 1.98x, 0, 102, 0). `make test`, `make asan`, and
+the AddressSanitizer fuzz gate on the 5.1.4 music stream (11 damage
+kinds; worst frame 1.10x its clean peak): clean. Found by the dialogue
+enhancement comparison and fixed: with DE on, the Python's immersive
+upmix raised inside DE (the upmix has no L / R / C) and fell back to the
+core band. Speed (`speed.py`, best of 2, one thread, decode time; Python /
+C): broadcaster A's 5.1 1.9x / 18.2x, its stereo 5.0x / 47.7x,
+broadcaster B's upmixed 5.1 2.8x / 23.7x, its stereo 5.3x / 53.9x
+(phase B3's C: 18.5x, 50.0x, 24.1x, 56.1x: the same within the spread
+of a machine shared with other jobs); the 5.1.4 identification stream
+0.6x / 9.1x.
 
 ## Changes against the standard
 

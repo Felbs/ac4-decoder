@@ -501,8 +501,10 @@ def _de_up(up, de, geo):
     if not de or not de.get("up") or not de.get("level"):
         return
     from . import de as DE
-    DE.apply({k: up[k] for k in ("L", "R", "C") if k in up}, de["frames"],
-             de["level"], geo["nts"], geo["ts_offset"])
+    chans = {k: up[k] for k in ("L", "R", "C") if k in up}
+    if not chans:
+        return              # (the immersive upmix: no L / R / C in it)
+    DE.apply(chans, de["frames"], de["level"], geo["nts"], geo["ts_offset"])
 
 
 def _upmix(QL, QR, acpl_groups, state0, log, w, geo, acpl_1ch=None,
