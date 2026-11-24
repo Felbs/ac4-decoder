@@ -157,6 +157,9 @@ typedef struct {
     int ndot;              /* the first b_audio_ndot */
     long index;            /* substream_index, -1 when not present */
     int sf_multiplier;     /* -1: none; 0: 96 kHz; 1: 192 kHz */
+    /* ch_mode 11 - 14 (TS 103 190-2 6.3.2.7): b_4_back_channels_present,
+       b_centre_present, top_channels_present (1, 1, 3 otherwise) */
+    int back4, centre, top;
 } ac4_toc_sub;
 
 typedef struct {
@@ -329,6 +332,9 @@ typedef struct {                /* acpl_config_1ch(), Table 59 */
 #define AC4_ACPL1_NONE 0
 #define AC4_ACPL1_5X 1          /* 5_X ASPX_ACPL_1 / _2 (two modules) */
 #define AC4_ACPL1_PAIR 2        /* channel pair ASPX_ACPL_1 / _2 */
+#define AC4_ACPL1_ICE 3         /* immersive_channel_element ASPX_ACPL_2
+                                   (four modules: two on Ls / Rs, two on
+                                   Tfl / Tfr) */
 typedef struct {
     int mode;                   /* 5_X_codec_mode or stereo_codec_mode */
     int acpl3;
@@ -388,6 +394,11 @@ void ac4_parse_3_0(ac4_bits *b, const ac4_books *bk, int b_iframe,
                    ac4_element *e);
 void ac4_parse_7x(ac4_bits *b, const ac4_books *bk, int b_iframe,
                   int ch_mode, ac4_element *e);
+/* immersive_channel_element (TS 103 190-2 6.2.4.1), b_5fronts 0 (ch_mode
+   11, 12), immersive_codec_mode ASPX_ACPL_2: tracks A .. G on L R C Ls Rs
+   X1 (Tfl) X2 (Tfr); the other modes and 9.X.4 raise element.parse */
+void ac4_parse_ice(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                   int ch_mode, ac4_element *e);
 
 /* ------------------------------------------------------------ A-SPX
  * Port of ac4/aspx_bands.py, aspx_parse.py, aspx_env.py, aspx_envadj.py,
@@ -452,16 +463,18 @@ typedef struct {
     int xover;                  /* aspx_xover_subband_offset in force */
 } ac4_aspx_grp;
 
-/* previous_stop_pos per (channel group 0..2, channel 0..1) */
+/* previous_stop_pos per (channel group 0..3, channel 0..1); group 3 is
+   the fourth pair of a 7_X or immersive element (it overran the arrays
+   when they held three groups) */
 typedef struct {
-    int stop[3][2];
-    uint8_t has[3][2];
+    int stop[4][2];
+    uint8_t has[4][2];
     int missing;                /* a missing previous_stop_pos was read */
     /* aspx_tsg_ptr and num_atsg_sig of the previous interval, per channel
        (Pseudocode 92), and whether there was one */
-    int ptr[3][2], nenv[3][2];
-    uint8_t has_ptr[3][2];
-    int xover[3];               /* aspx_xover_subband_offset per block */
+    int ptr[4][2], nenv[4][2];
+    uint8_t has_ptr[4][2];
+    int xover[4];               /* aspx_xover_subband_offset per block */
 } ac4_aspx_state;
 
 typedef struct {
@@ -561,7 +574,7 @@ void ac4_acpl_data_1ch(ac4_bits *b, const ac4_aspx_books *bk,
    tool's (prev[2 m], prev[2 m + 1] = module m's alpha, beta). */
 void ac4_acpl1_run(ac4_acpl_state *s, ac4_acpl_work *w,
                    const ac4_acpl1_frame *frames, int kind, int nm, int n,
-                   int nts, int split,
+                   int nts, int split, int dec,
                    const double (*x0r[2])[64], const double (*x0i[2])[64],
                    const double (*x1r[2])[64], const double (*x1i[2])[64],
                    double (*z0r[2])[64], double (*z0i[2])[64],
@@ -676,6 +689,11 @@ typedef struct {
        analysis, the upmixed channels' QMF slots (L, R, C, Ls, Rs) and
        their synthesis banks */
     int acpl_on;
+    int acpl_dec;               /* acpl_on 4 (the immersive element: two
+                                   modules on the pair's own channels,
+                                   outputs z0, z1 of each times sqrt 2):
+                                   the decorrelator of both (D0 for Ls /
+                                   Rs, D1 for Tfl / Tfr) */
     double rana[2][640];
     double rre[2][AC4_QRING][64], rim[2][AC4_QRING][64];
     ac4_acpl_state acpl;
@@ -806,7 +824,7 @@ int ac4_rs_push(const ac4_rs_filter *f, ac4_rs_state *s, const double *x,
                            /* IMDCT_K * 2^14.5 (needs math.h) */
 #define AC4_DRC_AUTO (-1)
 #define AC4_DRC_OFF (-2)
-#define AC4_LEV_CH 8
+#define AC4_LEV_CH 16
 
 typedef struct {
     int id;

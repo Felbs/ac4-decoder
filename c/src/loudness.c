@@ -559,11 +559,14 @@ static const double KA2[3] = { 1.0, -1.99004745483398, 0.99007225036621 };
 void ac4_leveler_init(ac4_leveler *lv, int n_ch, const int *slot,
                       int backs, double target, int drc, double rate)
 {
-    /* per slot (decoder.c CH_*: L R C LFE Ls Rs X1 X2): BS.1770 weights
-       (LFE 0, surrounds 1.41; the 7_X pair 1.41 when it is Lb / Rb) and
-       the transmitted-gain channel groups (Table 168: L R LFE, C, rest) */
-    static const double W[8] = { 1.0, 1.0, 1.0, 0.0, 1.41, 1.41, 1.0, 1.0 };
-    static const int GRP[8] = { 0, 0, 1, 0, 2, 2, 2, 2 };
+    /* per slot (decoder.c CH_*: L R C LFE Ls Rs X1 X2, then the immersive
+       element's Lb Rb Tbl Tbr): BS.1770 weights (LFE 0, surrounds and
+       back pair 1.41; the 7_X pair 1.41 when it is Lb / Rb; the top
+       channels 1.0) and the transmitted-gain channel groups (Table 168: L
+       R LFE, C, rest) */
+    static const double W[12] = { 1.0, 1.0, 1.0, 0.0, 1.41, 1.41, 1.0, 1.0,
+                                   1.41, 1.41, 1.0, 1.0 };
+    static const int GRP[12] = { 0, 0, 1, 0, 2, 2, 2, 2, 2, 2, 2, 2 };
     int k;
     memset(lv, 0, sizeof(*lv));
     lv->n_ch = n_ch;
@@ -573,7 +576,9 @@ void ac4_leveler_init(ac4_leveler *lv, int n_ch, const int *slot,
     lv->mode_id = -1;
     for (k = 0; k < n_ch; k++) {
         int sl = slot[k];
-        lv->w[k] = (backs && sl >= 6) ? 1.41 : W[sl];
+        if (sl < 0 || sl >= 12)
+            sl = 6;
+        lv->w[k] = (backs && (sl == 6 || sl == 7)) ? 1.41 : W[sl];
         lv->grp[k] = GRP[sl];
     }
 }

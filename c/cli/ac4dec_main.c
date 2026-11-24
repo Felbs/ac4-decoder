@@ -50,7 +50,7 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage: ac4dec-c IN OUT.wav "
-            "[--element auto|5_X|pair|mono|3_0|5_0|7_X]\n"
+            "[--element auto|5_X|pair|mono|3_0|5_0|7_X|ice]\n"
             "                [--channels N]\n"
             "                [--presentation N|id:N] [--language xx]\n"
             "                [--seconds S] [--max-pass N] [--target-level L]\n"
@@ -64,8 +64,8 @@ static void usage(void)
 }
 
 static const char *const KIND[4] = { "unknown", "mp4", "sync", "ts" };
-static const char *const EL_NAME[7] = { "auto", "5_X", "pair", "mono",
-                                        "3_0", "5_0", "7_X" };
+static const char *const EL_NAME[8] = { "auto", "5_X", "pair", "mono",
+                                        "3_0", "5_0", "7_X", "ice" };
 static const char *const CMODE[11] = {
     "Mono", "Stereo", "3.0", "5.0", "5.1", "7.0 (3/4/0)", "7.1 (3/4/0.1)",
     "7.0 (5/2/0)", "7.1 (5/2/0.1)", "7.0 (3/2/2)", "7.1 (3/2/2.1)"
@@ -422,6 +422,8 @@ int main(int argc, char **argv)
         element = AC4DEC_ELEMENT_5_0;
     else if (!strcmp(el_arg, "7_X"))
         element = AC4DEC_ELEMENT_7X;
+    else if (!strcmp(el_arg, "ice"))
+        element = AC4DEC_ELEMENT_ICE;
     else if (strcmp(el_arg, "auto")) {
         usage();
         return 2;
@@ -511,10 +513,15 @@ int main(int argc, char **argv)
 
     t0 = now();
     cfg.element = element;
-    if (element == AC4DEC_ELEMENT_7X)
+    if (element == AC4DEC_ELEMENT_7X || element == AC4DEC_ELEMENT_ICE)
         for (long f = 0; f < n_frames && f < 64 && !cfg.ch_mode; f++)
             if (smp[f].len)
                 cfg.ch_mode = ac4dec_probe_ch_mode(&cfg, smp[f].p,
+                                                   smp[f].len);
+    if (element == AC4DEC_ELEMENT_ICE)
+        for (long f = 0; f < n_frames && f < 64 && !cfg.present; f++)
+            if (smp[f].len)
+                cfg.present = ac4dec_probe_present(&cfg, smp[f].p,
                                                    smp[f].len);
     cfg.channels = channels;
     cfg.internal_rate = 1;          /* the level rule runs before resampling */

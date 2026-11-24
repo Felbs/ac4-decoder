@@ -256,6 +256,8 @@ static void info_chan(ac4_bits *b, int present, int frf, ac4_toc *t,
     memset(s, 0, sizeof(*s));
     s->kind = 0;
     s->channel_mode = cm;
+    s->back4 = s->centre = 1;
+    s->top = 3;
     if (t->n_cmodes < AC4_MAX_CMODES)
         t->cmodes[t->n_cmodes] = cm;
     if (t->n_cmodes < 1 << 30)
@@ -263,9 +265,9 @@ static void info_chan(ac4_bits *b, int present, int frf, ac4_toc *t,
     /* the spec compares the channel_mode code with 0b11111100,
        0b11111101, 0b111111100 and 0b111111101: ch_mode 11 .. 14 */
     if (cm >= 11 && cm <= 14) {
-        ac4_bit(b);                     /* b_4_back_channels_present */
-        ac4_bit(b);                     /* b_centre_present */
-        ac4_u(b, 2);                    /* top_channels_present */
+        s->back4 = (int)ac4_bit(b);     /* b_4_back_channels_present */
+        s->centre = (int)ac4_bit(b);    /* b_centre_present */
+        s->top = (int)ac4_u(b, 2);      /* top_channels_present */
     }
     sub_tail(b, present, frf, t->fs_index, s);
 }

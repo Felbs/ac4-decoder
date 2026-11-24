@@ -79,7 +79,7 @@ extern "C" {
 /* Most samples one frame can give at the external rate (2048 at index 13;
    1536 * 1001 / 960 = 1601.6 at 29.97 fps). */
 #define AC4DEC_MAX_OUT 2050
-#define AC4DEC_MAX_CHANNELS 8
+#define AC4DEC_MAX_CHANNELS 16
 
 #define AC4DEC_MIN_LOOKAHEAD 8
 #define AC4DEC_DEFAULT_LOOKAHEAD 180
@@ -91,7 +91,10 @@ typedef enum {
     AC4DEC_ELEMENT_MONO = 3,   /* single_channel_element (C) */
     AC4DEC_ELEMENT_3_0 = 4,    /* 3_0_channel_element (L R C) */
     AC4DEC_ELEMENT_5_0 = 5,    /* 5_X without LFE (L R C Ls Rs) */
-    AC4DEC_ELEMENT_7X = 6      /* 7_X_channel_element (config ch_mode) */
+    AC4DEC_ELEMENT_7X = 6,     /* 7_X_channel_element (config ch_mode) */
+    AC4DEC_ELEMENT_ICE = 7     /* immersive_channel_element (TS 103 190-2
+                                  6.2.4.1; ch_mode 11 / 12: 7.0.4 /
+                                  7.1.4), immersive_codec_mode ASPX_ACPL_2 */
 } ac4dec_element;
 
 typedef enum {
@@ -136,8 +139,9 @@ typedef struct {
     int drc;               /* 0 = the stream's DRC mode for target_level,
                               -1 = off, n > 0 = DRC mode ID n - 1 */
     int ch_mode;           /* 7_X: the channel mode (Table 88 ch_mode 5 -
-                              10); 0 = from the stream (AUTO) or 6 (7.1
-                              3/4/0) */
+                              10); ICE: 11 or 12 (TS 103 190-2 Table 56);
+                              0 = from the stream (AUTO) or 6 (7.1 3/4/0),
+                              12 (7.1.4) */
     double de_level;       /* dialogue enhancement gain in dB (TS 103
                               190-1 5.7.8, de_method 0; capped by the
                               stream's maximum); 0 = off */
@@ -146,6 +150,13 @@ typedef struct {
                               decodes only that one, unmixed */
     int no_mix;            /* 1 = the main substream only (see MIXING) */
     double assoc_gain;     /* associated audio gain g_assoc, dB <= 0 */
+    int present;           /* ICE: the channels the substream signals
+                              present, as ac4dec_probe_present() gives
+                              them (bit 4 set: valid; bit 0
+                              b_4_back_channels_present, bit 1
+                              b_centre_present, bits 2 - 3
+                              top_channels_present); 0 = from the stream
+                              (AUTO) or all (7.X.4) */
 } ac4dec_config;
 
 /* MIXING (TS 103 190-2 4.8.3.17, 4.8.3.18, 4.8.4; ac4/mix.py). When the
@@ -206,8 +217,12 @@ typedef struct ac4dec ac4dec;
 
 /* Channel order: 6 channels = L R C LFE Ls Rs (WAV 5.1 order); 2 = L R;
    mono C; 3.0 L R C; 5.0 L R C Ls Rs; 7.x L R C [LFE] Ls Rs and the
-   layout's pair (Lb Rb, Lw Rw or Tfl Tfr). Every channel is 577 samples
-   late (the QMF bank, or a delay line of the same length). */
+   layout's pair (Lb Rb, Lw Rw or Tfl Tfr); 7.X.4 (ICE) L R C [LFE] Ls Rs
+   Lb Rb Tfl Tfr Tbl Tbr, without the channels the stream signals absent
+   (ac4_substream_info_chan: Lb Rb when b_4_back_channels_present is 0,
+   giving 5.X.4; the top channels by top_channels_present). Every channel
+   is 577 samples late (the QMF bank, or a delay line of the same
+   length). */
 
 /* -> a decoder, or NULL (out of memory or a bad config). cfg NULL = auto
    element, default channels, 48 kHz output, default lookahead, guard on. */
@@ -221,6 +236,11 @@ int ac4dec_channels(const ac4dec *d);
 /* The 7_X channel mode (Table 88 ch_mode 5 - 10) of a frame's chosen
    audio substream, or 0. */
 int ac4dec_probe_ch_mode(const ac4dec_config *cfg, const uint8_t *data,
+                         size_t len);
+
+/* The immersive presence flags of a frame's chosen audio substream (see
+   ac4dec_config.present), or 0 when it has no immersive channel mode. */
+int ac4dec_probe_present(const ac4dec_config *cfg, const uint8_t *data,
                          size_t len);
 
 /* The decoder's delay in frames (the lookahead). */

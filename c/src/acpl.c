@@ -396,7 +396,8 @@ void ac4_acpl_run(ac4_acpl_state *s, ac4_acpl_work *w,
 /* Pseudocode 111 then 112-114 for decorrelator d on n slots of w->vr/vi[d]
    (after the HIST slots of history taken from s), into w->ur/ui[d]
    (after MAXL slots), the state carried on: the loops of ac4_acpl_run */
-static void decorr_duck(ac4_acpl_state *s, ac4_acpl_work *w, int d, int n)
+static void decorr_duck(ac4_acpl_state *s, ac4_acpl_work *w, int d, int cd,
+                        int n)
 {
     double (*vr)[NSB] = w->vr[d], (*vi)[NSB] = w->vi[d];
     double (*ur)[NSB] = w->ur[d], (*ui)[NSB] = w->ui[d];
@@ -410,7 +411,7 @@ static void decorr_duck(ac4_acpl_state *s, ac4_acpl_work *w, int d, int n)
         double a[MAXL + 1], b[MAXL + 1];
         a[0] = 1.0;
         for (i = 1; i <= L; i++)
-            a[i] = COEF[d][r][i - 1];
+            a[i] = COEF[cd][r][i - 1];
         for (i = 0; i <= L; i++)
             b[i] = a[L - i];
         for (t = 0; t < n; t++) {
@@ -483,7 +484,7 @@ static void band_values_1ch(const ac4_acpl1_frame *f, int ps, double *a,
 
 void ac4_acpl1_run(ac4_acpl_state *s, ac4_acpl_work *w,
                    const ac4_acpl1_frame *frames, int kind, int nm, int n,
-                   int nts, int split,
+                   int nts, int split, int dec,
                    const double (*x0r[2])[64], const double (*x0i[2])[64],
                    const double (*x1r[2])[64], const double (*x1i[2])[64],
                    double (*z0r[2])[64], double (*z0i[2])[64],
@@ -561,7 +562,9 @@ void ac4_acpl1_run(ac4_acpl_state *s, ac4_acpl_work *w,
                 w->vr[m][HIST + t][sb] = 2.0 * x0r[m][t][sb];
                 w->vi[m][HIST + t][sb] = 2.0 * x0i[m][t][sb];
             }
-        decorr_duck(s, w, m, n);
+        /* module m on decorrelator D_m, or every module on D_dec (the
+           immersive element: two instances of one decorrelator) */
+        decorr_duck(s, w, m, dec >= 0 ? dec : m, n);
     }
     for (m = 0; m < nm; m++) {
         int qb = s->qb[m];

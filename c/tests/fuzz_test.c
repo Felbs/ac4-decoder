@@ -87,7 +87,8 @@ static void take(acc_t *a, const ac4dec_frame *o)
           o->n_samples, want);
     a->total += o->n_samples;
     a->next++;
-    CHECK(o->n_channels >= 1 && o->n_channels <= 6, "channels %d",
+    CHECK(o->n_channels >= 1 && o->n_channels <= AC4DEC_MAX_CHANNELS,
+          "channels %d",
           o->n_channels);
     for (c = 0; c < o->n_channels; c++)
         for (k = 0; k < o->n_samples; k++) {
@@ -174,15 +175,16 @@ static void synthetic(void)
     /* garbage of any bitstream_version can set any rate: the per-frame
        sample count is checked against the rate the decoder took */
     g_any_rate = 1;
-    for (el = 0; el <= 2; el++)
+    /* auto, 5_X, pair, and the immersive element on garbage */
+    for (el = 0; el <= 3; el++)
         for (internal = 0; internal <= 1; internal++) {
-            run(fr, 300, (ac4dec_element)el, internal, &n_conc, NULL, NULL);
-            run_la(fr, 300, (ac4dec_element)el, internal,
-                   AC4DEC_MIN_LOOKAHEAD, &n_conc, NULL, NULL);
-            run_la(fr, 3, (ac4dec_element)el, internal, 0, &n_conc, NULL,
+            ac4dec_element e = el == 3 ? AC4DEC_ELEMENT_ICE
+                                       : (ac4dec_element)el;
+            run(fr, 300, e, internal, &n_conc, NULL, NULL);
+            run_la(fr, 300, e, internal, AC4DEC_MIN_LOOKAHEAD, &n_conc, NULL,
                    NULL);
-            run_la(fr, 0, (ac4dec_element)el, internal, 0, &n_conc, NULL,
-                   NULL);
+            run_la(fr, 3, e, internal, 0, &n_conc, NULL, NULL);
+            run_la(fr, 0, e, internal, 0, &n_conc, NULL, NULL);
         }
     /* the MP4 reader on garbage */
     for (i = 0; i < 200; i++) {

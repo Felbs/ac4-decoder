@@ -71,8 +71,11 @@ void ac4_spectra_init(void);
 #define G_TP_NEAR_DB 12.0
 #define G_TP_STEP 0.25
 
-enum { CH_L, CH_R, CH_C, CH_LFE, CH_LS, CH_RS, CH_X1, CH_X2 };
-#define NCH AC4_NCH
+enum { CH_L, CH_R, CH_C, CH_LFE, CH_LS, CH_RS, CH_X1, CH_X2,
+       CH_LB, CH_RB, CH_TBL, CH_TBR };
+#define NCH AC4_NCH                /* coded track slots (CH_L .. CH_X2) */
+#define NOUT AC4DEC_MAX_CHANNELS   /* output slots: the tracks, then the
+                                      immersive A-CPL's Lb Rb Tbl Tbr */
 
 /* the QMF-path "pairs" (the A-SPX block groups): L/R, Ls/Rs, the centre
    as C/C (its aspx_data_1ch rendered as the same channel twice,
@@ -137,7 +140,7 @@ typedef struct {
     size_t sub_len;
     size_t bits, start, size;
     int ifr, acpl3, n_acpl1;
-    int n_blocks, blk_grp[3], blk_two[3];
+    int n_blocks, blk_grp[4], blk_two[4];
 } pending_t;
 
 /* an output frame waiting for the guard */
@@ -151,13 +154,13 @@ typedef struct {
     int ok;
     int n;                      /* samples (the frame length) */
     ac4_meta meta;
-    double pcm[NCH][FRAME];
+    double pcm[NOUT][FRAME];
 } outf_t;
 
 typedef struct {
     double floor, init, ref;
     int seeded;
-    double last[NCH];
+    double last[NOUT];
     int has_last, muted;
     int forced_hist[G_NEAR];    /* forced flags of the last frames judged */
     double tp_hist[G_TP_WIN];   /* truepk of the last frames judged */
@@ -172,8 +175,11 @@ struct ac4dec {
     int N, L, G;
     int element;                /* resolved ac4dec_element, 0 = not yet */
     int n_ch;
-    int ch_mode;                /* 7_X: Table 88 ch_mode */
-    int out_ch[NCH];            /* output channel c is slot out_ch[c] */
+    int ch_mode;                /* 7_X: Table 88 ch_mode; ICE: 11 / 12 */
+    int ice_back4, ice_top;     /* ICE: b_4_back_channels_present,
+                                   top_channels_present */
+    int ice_known;              /* ... read from the stream's TOC */
+    int out_ch[NOUT];           /* output channel c is slot out_ch[c] */
     int el_mask;                /* the element's slots */
     int pair_ch[NPAIR][2];
     /* the stream's rate (rates.py): (fs_index, frame_rate_index) of its
@@ -214,8 +220,8 @@ struct ac4dec {
     ac4_acpl_cfg pcfg;
     ac4_aspx_state fstate;
     ac4_acpl_qstate aq;         /* A-CPL q_prev (Pseudocode 121) */
-    int aq1[2][2][AC4_ACPL_NB]; /* the 1ch modules' alpha1 / beta1 q_prev */
-    int aq1n[2][2];
+    int aq1[4][2][AC4_ACPL_NB]; /* the 1ch modules' alpha1 / beta1 q_prev */
+    int aq1n[4][2];
     int has_pcfg1;
     ac4_acpl1_cfg pcfg1;
     pending_t *pend;
@@ -250,6 +256,7 @@ struct ac4dec {
     int path_on[NPAIR];
     int finished;
     double hf[NPAIR][2][FRAME];     /* the pairs' A-SPX output frames */
+    double reorder[NOUT][FRAME];    /* assemble: output order scratch */
     double dcore[NPAIR][2][FRAME];  /* and their cores, 577 samples late */
 
     /* ---- guard (ring of G + 2) */
@@ -259,8 +266,8 @@ struct ac4dec {
     guard_t guard;
 
     /* ---- output */
-    ac4_rs_state rs[NCH];
-    double pcm_out[NCH][AC4DEC_MAX_OUT + 2];
+    ac4_rs_state rs[NOUT];
+    double pcm_out[NOUT][AC4DEC_MAX_OUT + 2];
     outf_t cur;                 /* the frame last given out */
     int flushing;
 
@@ -419,6 +426,8 @@ static ac4dec_element element_of_toc(const ac4dec_config *c, const ac4_toc *t)
             return AC4DEC_ELEMENT_PAIR;
         return AC4DEC_ELEMENT_7X;
     }
+    if (cm >= 11 && cm <= 14)
+        return AC4DEC_ELEMENT_ICE;
     return AC4DEC_ELEMENT_AUTO;
 }
 
@@ -426,7 +435,7 @@ static ac4dec_element element_of_toc(const ac4dec_config *c, const ac4_toc *t)
 static int ch_mode_of_toc(const ac4dec_config *c, const ac4_toc *t)
 {
     const ac4_toc_sub *s = chosen_sub(c, t);
-    return s && s->channel_mode >= 5 && s->channel_mode <= 10
+    return s && s->channel_mode >= 5 && s->channel_mode <= 14
            ? (int)s->channel_mode : 0;
 }
 
@@ -481,9 +490,27 @@ int ac4dec_probe_ch_mode(const ac4dec_config *cfg, const uint8_t *data,
         c = *cfg;
     if (len > MAX_FRAME_BYTES || toc_try(data, len, &t) != 0)
         return 0;
-    if (element_of_toc(&c, &t) != AC4DEC_ELEMENT_7X)
+    if (element_of_toc(&c, &t) != AC4DEC_ELEMENT_7X
+        && element_of_toc(&c, &t) != AC4DEC_ELEMENT_ICE)
         return 0;
     return ch_mode_of_toc(&c, &t);
+}
+
+int ac4dec_probe_present(const ac4dec_config *cfg, const uint8_t *data,
+                         size_t len)
+{
+    ac4_toc t;
+    ac4dec_config c;
+    const ac4_toc_sub *s;
+    memset(&c, 0, sizeof(c));
+    if (cfg)
+        c = *cfg;
+    if (len > MAX_FRAME_BYTES || toc_try(data, len, &t) != 0)
+        return 0;
+    s = chosen_sub(&c, &t);
+    if (!s || s->channel_mode < 11 || s->channel_mode > 14)
+        return 0;
+    return 16 | (s->back4 ? 1 : 0) | (s->centre ? 2 : 0) | (s->top << 2);
 }
 
 int ac4dec_channels(const ac4dec *d)
@@ -588,6 +615,34 @@ double ac4dec_ref_peak(ac4dec_element e)
                                                                 : 9.0e5;
 }
 
+/* elements.ice_channels: the output slots of an immersive channel mode
+   (ch_mode 11 / 12) given b_4_back_channels_present and
+   top_channels_present: L R C [LFE] Ls Rs [Lb Rb] [Tfl Tfr] [Tbl Tbr] */
+static int ice_slots(int ch_mode, int back4, int top, int *slot)
+{
+    int n = 0;
+    slot[n++] = CH_L;
+    slot[n++] = CH_R;
+    slot[n++] = CH_C;
+    if (ch_mode == 12 || ch_mode == 14)
+        slot[n++] = CH_LFE;
+    slot[n++] = CH_LS;
+    slot[n++] = CH_RS;
+    if (back4) {
+        slot[n++] = CH_LB;
+        slot[n++] = CH_RB;
+    }
+    if (top == 1 || top == 3) {
+        slot[n++] = CH_X1;
+        slot[n++] = CH_X2;
+    }
+    if (top == 2 || top == 3) {
+        slot[n++] = CH_TBL;
+        slot[n++] = CH_TBR;
+    }
+    return n;
+}
+
 /* the element's output channels (slots, in output order) -> count */
 static int element_slots(int element, int ch_mode, int *slot)
 {
@@ -613,6 +668,8 @@ static int element_slots(int element, int ch_mode, int *slot)
             n = 7;
         }
         break;
+    case AC4DEC_ELEMENT_ICE:
+        return ice_slots(ch_mode, 1, 3, slot);
     default: break;
     }
     for (i = 0; i < n; i++)
@@ -623,21 +680,41 @@ static int element_slots(int element, int ch_mode, int *slot)
 static void set_element(ac4dec *d, int element)
 {
     double ref;
-    int slot[NCH], n, i;
+    int slot[NOUT], n, i;
     d->element = element;
     if (element == AC4DEC_ELEMENT_7X && !d->ch_mode)
         d->ch_mode = d->cfg.ch_mode ? d->cfg.ch_mode : 6;
-    n = element_slots(element, d->ch_mode, slot);
-    d->el_mask = 0;
-    for (i = 0; i < n; i++)
-        d->el_mask |= 1 << slot[i];
+    if (element == AC4DEC_ELEMENT_ICE && !d->ch_mode)
+        d->ch_mode = d->cfg.ch_mode ? d->cfg.ch_mode : 12;
+    if (element == AC4DEC_ELEMENT_ICE) {
+        /* the coded tracks (L R C [LFE] Ls Rs Tfl Tfr); the outputs by
+           what the substream signals present */
+        int pr = d->cfg.present;
+        if (pr & 16) {
+            d->ice_back4 = pr & 1;
+            d->ice_top = (pr >> 2) & 3;
+        } else if (!d->ice_known) {
+            d->ice_back4 = 1;
+            d->ice_top = 3;
+        }
+        n = ice_slots(d->ch_mode, d->ice_back4, d->ice_top, slot);
+        d->el_mask = (1 << CH_L) | (1 << CH_R) | (1 << CH_C) | (1 << CH_LS)
+                     | (1 << CH_RS) | (1 << CH_X1) | (1 << CH_X2);
+        if (d->ch_mode == 12 || d->ch_mode == 14)
+            d->el_mask |= 1 << CH_LFE;
+    } else {
+        n = element_slots(element, d->ch_mode, slot);
+        d->el_mask = 0;
+        for (i = 0; i < n; i++)
+            d->el_mask |= 1 << slot[i];
+    }
     if (d->cfg.channels == 2 && n > 2 && (d->el_mask & 3) == 3) {
         n = 2;
         slot[0] = CH_L;
         slot[1] = CH_R;
     }
     d->n_ch = n;
-    for (i = 0; i < NCH; i++)
+    for (i = 0; i < NOUT; i++)
         d->out_ch[i] = i < n ? slot[i] : i;
     /* A-SPX block groups -> channel pairs (Table 213) */
     d->pair_ch[0][0] = CH_L;
@@ -802,7 +879,7 @@ static void stream_reset(ac4dec *d)
     }
     if (d->element)
         set_element(d, d->element);
-    for (i = 0; i < NCH; i++)
+    for (i = 0; i < NOUT; i++)
         ac4_rs_init(&d->rs[i]);
     d->flushing = 0;
 }
@@ -816,16 +893,22 @@ ac4dec *ac4dec_open(const ac4dec_config *cfg)
     memset(&c, 0, sizeof(c));
     if (cfg)
         c = *cfg;
-    if (c.channels < 0 || c.channels > NCH)
+    if (c.channels < 0 || c.channels > NOUT)
         return NULL;
     if ((int)c.element < AC4DEC_ELEMENT_AUTO
-        || (int)c.element > AC4DEC_ELEMENT_7X)
+        || (int)c.element > AC4DEC_ELEMENT_ICE)
         return NULL;
-    if (c.ch_mode != 0 && (c.ch_mode < 5 || c.ch_mode > 10))
+    if (c.ch_mode != 0 && (c.ch_mode < 5 || c.ch_mode > 14))
         return NULL;
     if (c.element != AC4DEC_ELEMENT_AUTO && c.channels) {
-        int slot[NCH], n = element_slots(c.element, c.ch_mode ? c.ch_mode
-                                                              : 6, slot);
+        int slot[NOUT], n;
+        if (c.element == AC4DEC_ELEMENT_ICE)
+            n = (c.present & 16)
+                ? ice_slots(c.ch_mode ? c.ch_mode : 12, c.present & 1,
+                            (c.present >> 2) & 3, slot)
+                : ice_slots(c.ch_mode ? c.ch_mode : 12, 1, 3, slot);
+        else
+            n = element_slots(c.element, c.ch_mode ? c.ch_mode : 6, slot);
         if (c.channels != n && !(c.channels == 2 && n > 2
                                  && c.element != AC4DEC_ELEMENT_MONO))
             return NULL;
@@ -1161,7 +1244,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     volatile int first_cfg = 0;
     ac4_aspx_state fstate0 = d->fstate;
     ac4_acpl_qstate aq0 = d->aq;
-    int aq10[2][2][AC4_ACPL_NB], aq1n0[2][2];
+    int aq10[4][2][AC4_ACPL_NB], aq1n0[4][2];
     int code = AC4E_NONE, k, ifr = 0, has_aspx, acpl3, acpl1, complete;
     int silent, need;
     size_t o, sub_len = 0;
@@ -1287,6 +1370,9 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     case AC4DEC_ELEMENT_7X:
         ac4_parse_7x(&b, &d->books, ifr, d->ch_mode, e);
         break;
+    case AC4DEC_ELEMENT_ICE:
+        ac4_parse_ice(&b, &d->books, ifr, d->ch_mode, e);
+        break;
     default: ac4_parse_5x(&b, &d->books, ifr, e); break;
     }
     if (changed == AC4E_NONE && d->mode >= 0 && e->mode != d->mode)
@@ -1337,10 +1423,14 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         }
         if (acpl1 && pc1) {
             b.eof_code = AC4E_ACPL_PARSE;
-            for (i = 0; i < e->n_acpl1; i++)
+            for (i = 0; i < e->n_acpl1; i++) {
+                /* the immersive element: modules 0, 1 to the Ls / Rs
+                   pair, 2, 3 to the Tfl / Tfr pair */
+                int pg = acpl1 == AC4_ACPL1_ICE ? (i < 2 ? 1 : 3) : 0;
                 ac4_acpl_data_1ch(&b, &d->abk, pc1, d->aq1[i], d->aq1n[i],
-                                  &r->af[0].acpl1[i]);
-            r->af[0].acpl1_kind = AC4_GRP_DATA;
+                                  &r->af[pg].acpl1[i & 1]);
+                r->af[pg].acpl1_kind = AC4_GRP_DATA;
+            }
             end = b.p;
         }
     }
@@ -1562,9 +1652,10 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
        mode */
     r->de.kind = AC4_DE_NONE;
     if (d->cfg.de_level != 0.0 && !d->v0) {
-        static const int CM[7] = { 4, 4, 1, 0, 2, 3, 6 };
-        int cm = d->element == AC4DEC_ELEMENT_7X ? d->ch_mode
-                                                 : CM[d->element];
+        static const int CM[8] = { 4, 4, 1, 0, 2, 3, 6, 12 };
+        int cm = d->element == AC4DEC_ELEMENT_7X
+                 || d->element == AC4DEC_ELEMENT_ICE ? d->ch_mode
+                                                     : CM[d->element];
         const ac4_huff *bks[4];
         for (k = 0; k < 4; k++)
             bks[k] = &d->de_hcb[k];
@@ -1622,8 +1713,17 @@ static void parse_held(ac4dec *d, const uint8_t *nx, size_t nx_len,
                  && toc_try(data, d->raw_len, &tt) == 0;
         ac4dec_element el = ok ? element_of_toc(&d->cfg, &tt)
                                : AC4DEC_ELEMENT_AUTO;
-        if (el == AC4DEC_ELEMENT_7X && !d->cfg.ch_mode)
+        if ((el == AC4DEC_ELEMENT_7X || el == AC4DEC_ELEMENT_ICE)
+            && !d->cfg.ch_mode)
             d->ch_mode = ch_mode_of_toc(&d->cfg, &tt);
+        if (el == AC4DEC_ELEMENT_ICE) {
+            const ac4_toc_sub *s = chosen_sub(&d->cfg, &tt);
+            if (s) {
+                d->ice_back4 = s->back4;
+                d->ice_top = s->top;
+                d->ice_known = 1;
+            }
+        }
         if (el != AC4DEC_ELEMENT_AUTO)
             set_element(d, el);
     }
@@ -1647,7 +1747,7 @@ static int pair_capable(const ac4dec *d, int p)
         return p == 0 && d->mode >= 1;
     if (p == 0)
         return (d->el_mask & 1) != 0;   /* L/R: every element but mono */
-    if (p == 1 && d->acpl1)
+    if (p == 1 && d->acpl1 && d->acpl1 != AC4_ACPL1_ICE)
         return 0;                   /* ASPX_ACPL_1 / _2: no Ls/Rs A-SPX */
     if (d->acpl3 || d->n_ch <= 2)
         return 0;
@@ -1758,6 +1858,10 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
         memcpy(o->pcm[k], x, sizeof(double) * (size_t)d->fl);
         memcpy(d->core_tail[k], x + d->fl, sizeof(double) * HF_DELAY);
     }
+    /* the immersive A-CPL's own channels (Lb Rb Tbl Tbr): silent until
+       the upmix runs */
+    for (k = NCH; k < NOUT; k++)
+        memset(o->pcm[k], 0, sizeof(o->pcm[k]));
     for (p = 0; p < NPAIR; p++) {
         double *y[2], *dc[2];
         if (!d->path_on[p] && d->pair_active[p] && have[p])
@@ -1798,13 +1902,62 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
                            sizeof(o->pcm[0]));
             }
         }
+        if (d->pair[p].acpl_on == 4) {
+            /* the immersive element (decoder.py ice_up): z0, z1 of the
+               pair's two modules; a frame the checks gave its core plays
+               the core at gain 2 (core decoding mode) on Ls / Rs (Tfl /
+               Tfr) and nothing on Lb / Rb (Tbl / Tbr) */
+            int sl[4], c, i;
+            sl[0] = d->pair_ch[p][0];
+            sl[2] = d->pair_ch[p][1];
+            sl[1] = p == 1 ? CH_LB : CH_TBL;
+            sl[3] = p == 1 ? CH_RB : CH_TBR;
+            for (c = 0; c < 4; c++) {
+                if (bad && (c == 1 || c == 3))
+                    memset(o->pcm[sl[c]], 0, sizeof(o->pcm[0]));
+                else if (bad)
+                    for (i = 0; i < d->fl; i++)
+                        o->pcm[sl[c]][i] = 2.0 * o->pcm[sl[c]][i];
+                else
+                    memcpy(o->pcm[sl[c]], d->pair[p].upout[c],
+                           sizeof(o->pcm[0]));
+            }
+        }
     }
-    /* the output channels in order (output c is slot out_ch[c] >= c) */
-    for (k = 0; k < d->n_ch; k++)
-        if (d->out_ch[k] != k)
-            memcpy(o->pcm[k], o->pcm[d->out_ch[k]], sizeof(o->pcm[k]));
+    if (d->element == AC4DEC_ELEMENT_ICE) {
+        /* Pseudocode 2: z0, z2, z4 = 2 x (L, R, C); the core decoding
+           mode's gain 2 on the others where there is no upmix */
+        int i, up = d->pair[1].acpl_on == 4 || d->pair[3].acpl_on == 4;
+        for (k = 0; k < NCH; k++) {
+            if (k == CH_LFE)
+                continue;
+            if (k == CH_L || k == CH_R || k == CH_C || (!up && d->n_ch > 2))
+                for (i = 0; i < d->fl; i++)
+                    o->pcm[k][i] = 2.0 * o->pcm[k][i];
+        }
+    }
+    /* the output channels in order (output c is slot out_ch[c]); through
+       a copy when a slot an earlier output overwrote is still needed */
+    {
+        int need_copy = 0;
+        for (k = 0; k < d->n_ch; k++)
+            if (d->out_ch[k] < k)
+                need_copy = 1;
+        if (need_copy) {
+            double (*tmp)[FRAME] = d->reorder;
+            for (k = 0; k < d->n_ch; k++)
+                memcpy(tmp[k], o->pcm[d->out_ch[k]], sizeof(tmp[k]));
+            for (k = 0; k < d->n_ch; k++)
+                memcpy(o->pcm[k], tmp[k], sizeof(tmp[k]));
+        } else {
+            for (k = 0; k < d->n_ch; k++)
+                if (d->out_ch[k] != k)
+                    memcpy(o->pcm[k], o->pcm[d->out_ch[k]],
+                           sizeof(o->pcm[k]));
+        }
+    }
     /* channels a frame does not have are silent */
-    for (k = d->n_ch; k < NCH; k++)
+    for (k = d->n_ch; k < NOUT; k++)
         memset(o->pcm[k], 0, sizeof(o->pcm[k]));
     o->n = d->fl;
     o->pk = frame_peak(o, d->n_ch, d->fl);
@@ -1859,6 +2012,13 @@ static void synth_one(ac4dec *d)
             if (p == 0 && d->acpl1 == AC4_ACPL1_5X && d->n_ch == 6
                 && d->element == AC4DEC_ELEMENT_5X)
                 d->pair[0].acpl_on = 3;
+            /* the immersive element's A-CPL (decoder.py ice_up): two
+               modules on Ls / Rs (D0) and on Tfl / Tfr (D1) */
+            if ((p == 1 || p == 3) && d->acpl1 == AC4_ACPL1_ICE
+                && d->n_ch > 2) {
+                d->pair[p].acpl_on = 4;
+                d->pair[p].acpl_dec = p == 1 ? 0 : 1;
+            }
             /* dialogue enhancement (decoder.py de_arg): on the upmix's
                L / R / C, or on a pair of L, R or C */
             if (d->cfg.de_level != 0.0) {
@@ -2162,7 +2322,7 @@ static void emit(ac4dec *d, ac4dec_frame *out)
         d->rs_fixed = 1;
     }
     if (d->cfg.loudness) {
-        double *pp[NCH];
+        double *pp[NOUT];
         if (!d->lev) {
             int drc = d->cfg.drc == 0 ? AC4_DRC_AUTO
                       : d->cfg.drc < 0 ? AC4_DRC_OFF : d->cfg.drc - 1;
@@ -2358,7 +2518,7 @@ static void pan_gains(double angle, int mask, double *g)
     static const double AZ[5] = { -110.0, -30.0, 0.0, 30.0, 110.0 };
     int sp[6], n = 0, i;
     double az[6], a;
-    for (i = 0; i < NCH; i++)
+    for (i = 0; i < NOUT; i++)
         g[i] = 0.0;
     for (i = 0; i < 5; i++)
         if (mask & (1 << SL[i])) {
@@ -2390,7 +2550,7 @@ static void pan_gains(double angle, int mask, double *g)
    decoder's substream, after its guard) becomes the mix */
 static void mix_frame(ac4dec *d, outf_t *o, ac4dec_frame *out)
 {
-    double y[NCH][FRAME];
+    double y[NOUT][FRAME];
     int s, c, j, i, has_assoc = 0, conc = 0;
     const ac4_meta *m = &o->meta;
     if (m->valid) {
@@ -2408,10 +2568,10 @@ static void mix_frame(ac4dec *d, outf_t *o, ac4dec_frame *out)
             has_assoc = 1;
     memset(y, 0, sizeof(y));
     for (s = 0; s < d->mix_n; s++) {
-        double gm[NCH][NCH];          /* [output c][source j] */
+        double gm[NOUT][NOUT];        /* [output c][source j] */
         int n_src;
-        const double *src[NCH];
-        int src_slot[NCH];
+        const double *src[NOUT];
+        int src_slot[NOUT];
         if (s == 0) {
             n_src = d->n_ch;
             for (j = 0; j < n_src; j++) {
@@ -2434,7 +2594,7 @@ static void mix_frame(ac4dec *d, outf_t *o, ac4dec_frame *out)
         if (n_src == 1 && src_slot[0] == CH_C
             && ((d->mix_type[s] == 2 && d->mix_has_assoc && d->mix_has_sc[3])
                 || !(d->el_mask & (1 << CH_C)))) {
-            double pg[NCH];
+            double pg[NOUT];
             double ang = d->mix_type[s] == 2 && d->mix_has_assoc
                          && d->mix_has_sc[3] ? d->mix_sc[3] : 0.0;
             pan_gains(ang, d->el_mask, pg);

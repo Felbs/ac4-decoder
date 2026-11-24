@@ -284,3 +284,42 @@ def test_ice_decodes_to_pcm():
     dec2.hf_ratio = None
     y2 = dec2.decode_pass(frames)
     assert np.allclose(y2, y[:, :2], atol=1e-9 * np.abs(y).max())
+
+
+# ------------------------------------------------ the C decoder
+def _c_vs_python_ice(tmp_path, frames, channels, present):
+    import os
+    import subprocess
+    from ac4.decoder import Decoder
+    from test_inputs import syncframe
+    if not os.path.exists(C_CLI):
+        pytest.skip("c/ac4dec-c not built")
+    src = tmp_path / "e.ac4"
+    src.write_bytes(b"".join(syncframe(f) for f in frames))
+    raw = tmp_path / "e.f64"
+    subprocess.run([C_CLI, str(src), str(tmp_path / "e.wav"),
+                    "--legacy-level", "--f64", str(raw), "--internal",
+                    "--no-guard", "-q", "--channels", str(channels)],
+                   check=True)
+    got = np.fromfile(raw, "<f8").reshape(-1, channels)
+    dec = Decoder("ice", channels=channels, guard=False, ch_mode=12,
+                  present=present)
+    dec.hf_ratio = None
+    ref = dec.decode_pass(frames)
+    assert dec.n_concealed == 0
+    assert got.shape == ref.shape
+    assert np.abs(got - ref).max() <= 1e-9 * np.abs(ref).max()
+
+
+@pytest.mark.parametrize("grouping,sap,top", [
+    (0, False, (1, 1, 3)), (1, True, (0, 1, 3)), (3, True, (1, 1, 2))])
+def test_c_ice(tmp_path, grouping, sap, top):
+    """The C decoder against the Python on synthetic 7.1.4 streams (the
+    A-SPX of the fourth pair, the four A-CPL modules, the output
+    selection by the presence flags): within 1e-9."""
+    rng = np.random.default_rng(60 + grouping)
+    frames, _ = _ice_frames(rng, n=8, grouping=grouping, sap_add=sap,
+                            top=top)
+    n = len(EL.ice_channels(12, top))
+    _c_vs_python_ice(tmp_path, frames, n, top)
+    _c_vs_python_ice(tmp_path, frames, 2, top)

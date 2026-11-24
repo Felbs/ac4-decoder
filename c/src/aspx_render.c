@@ -1271,7 +1271,7 @@ static void acpl1_frame(ac4_aspx_pair *p, const ac4_aspx_frame *fr,
     long long a = (long long)p->nts * f + p->tso, z = a + p->nts, ts;
     const double (*x0r[2])[64], (*x0i[2])[64], (*x1r[2])[64], (*x1i[2])[64];
     double (*z0r[2])[64], (*z0i[2])[64], (*z1r[2])[64], (*z1i[2])[64];
-    int c, n, i, nm = p->acpl_on == 3 ? 2 : 1, kind;
+    int c, n, i, nm = p->acpl_on >= 3 ? 2 : 1, kind;
     const double sq2 = sqrt(2.0);
     if (z > nts)
         z = nts;
@@ -1292,6 +1292,8 @@ static void acpl1_frame(ac4_aspx_pair *p, const ac4_aspx_frame *fr,
         x0i[c] = (const double (*)[64])w->xi[c];
         x1r[c] = (const double (*)[64])w->zr[c];
         x1i[c] = (const double (*)[64])w->zi[c];
+        if (p->acpl_on == 4)            /* ASPX_ACPL_2: no residual */
+            x1r[c] = x1i[c] = NULL;
     }
     z0r[0] = w->zr[2];
     z0i[0] = w->zi[2];
@@ -1303,10 +1305,22 @@ static void acpl1_frame(ac4_aspx_pair *p, const ac4_aspx_frame *fr,
     z1i[1] = p->tmp1i[1];
     kind = fr ? fr->acpl1_kind : AC4_GRP_NONE;
     ac4_acpl1_run(&p->acpl, w, fr ? fr->acpl1 : NULL, kind, nm, n, p->nts,
-                  p->acpl_on == 2, x0r, x0i, x1r, x1i, z0r, z0i, z1r, z1i);
+                  p->acpl_on == 2, p->acpl_on == 4 ? p->acpl_dec : -1,
+                  x0r, x0i, x1r, x1i, z0r, z0i, z1r, z1i);
     for (i = 0; i < n; i++) {
         ts = a + i;
-        if (nm == 1) {
+        if (p->acpl_on == 4) {
+            /* the immersive element: z0, z1 of module c, both times
+               sqrt 2, to upmix slots 2 c, 2 c + 1 */
+            int k;
+            for (c = 0; c < 2; c++)
+                for (k = 0; k < 64; k++) {
+                    p->ure[2 * c][QI(ts)][k] = z0r[c][i][k] * sq2;
+                    p->uim[2 * c][QI(ts)][k] = z0i[c][i][k] * sq2;
+                    p->ure[2 * c + 1][QI(ts)][k] = z1r[c][i][k] * sq2;
+                    p->uim[2 * c + 1][QI(ts)][k] = z1i[c][i][k] * sq2;
+                }
+        } else if (nm == 1) {
             memcpy(p->ure[0][QI(ts)], z0r[0][i], sizeof(z0r[0][i]));
             memcpy(p->uim[0][QI(ts)], z0i[0][i], sizeof(z0i[0][i]));
             memcpy(p->ure[1][QI(ts)], z1r[0][i], sizeof(z1r[0][i]));
@@ -1335,13 +1349,19 @@ static void acpl_lead(ac4_aspx_pair *p)
         /* render_1ch's passthrough: split (a pair) x0 + x1, x0 - x1;
            else x0 on z0, nothing on z1 */
         for (ts = 0; ts < p->tso; ts++) {
-            int k, nm = p->acpl_on == 3 ? 2 : 1;
+            int k, nm = p->acpl_on >= 3 ? 2 : 1;
             for (c = 0; c < nm; c++)
                 for (k = 0; k < 64; k++) {
                     double ar = p->qre[c][QI(ts)][k], ai = p->qim[c][QI(ts)][k];
                     double br = p->rre[c][QI(ts)][k], bi = p->rim[c][QI(ts)][k];
                     int o0 = c, o1 = nm == 1 ? 1 : 3 + c;
-                    if (p->acpl_on == 2) {
+                    if (p->acpl_on == 4) {
+                        /* x0 on z0, nothing on z1, times sqrt 2 */
+                        p->ure[2 * c][QI(ts)][k] = ar * sqrt(2.0);
+                        p->uim[2 * c][QI(ts)][k] = ai * sqrt(2.0);
+                        p->ure[2 * c + 1][QI(ts)][k] = 0.0 * sqrt(2.0);
+                        p->uim[2 * c + 1][QI(ts)][k] = 0.0 * sqrt(2.0);
+                    } else if (p->acpl_on == 2) {
                         p->ure[o0][QI(ts)][k] = ar + br;
                         p->uim[o0][QI(ts)][k] = ai + bi;
                         p->ure[o1][QI(ts)][k] = ar - br;
@@ -1454,7 +1474,8 @@ static void synth_frame(ac4_aspx_pair *p, const ac4_qmf_tables *q,
             }
     if (p->acpl_on)
         for (c = 0; c < 5; c++) {
-            if ((p->acpl_on == 2 && c >= 2) || (p->acpl_on == 3 && c == 2))
+            if ((p->acpl_on == 2 && c >= 2) || (p->acpl_on == 3 && c == 2)
+                || (p->acpl_on == 4 && c == 4))
                 continue;
             for (i = 0; i < p->nts; i++) {
                 long long ts = slot0 + i;

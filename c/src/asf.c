@@ -1134,3 +1134,82 @@ void ac4_parse_7x(ac4_bits *b, const ac4_books *bk, int b_iframe,
     }
     e->bits_end = b->p;
 }
+
+/* immersive_channel_element (TS 103 190-2 6.2.4.1), b_5fronts 0, in
+   immersive_codec_mode ASPX_ACPL_2 (elements.immersive_channel_element):
+   the 7CH_STATIC core as tracks A .. G (Table 19; A L, B R, C C, D Ls, E
+   Rs, F X1 = Tfl, G X2 = Tfr), the b_use_sap_add_ch side steps on (D, F)
+   and (E, G) (5.2.3.2 step 4, read with D's / E's framing), A-SPX on
+   (A, B), (D, E), (F, G), C (Table 8) and four acpl_data_1ch() */
+void ac4_parse_ice(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                   int ch_mode, ac4_element *e)
+{
+    int has_lfe = ch_mode == 12 || ch_mode == 14, grouping, i, s0 = -1;
+    int mono_c = 0;
+    element_reset(e);
+    audio_size(b, e);
+    e->mode = ac4_bit(b) ? 4 : (int)ac4_u(b, 2);   /* Table 73 */
+    if (ch_mode >= 13 || e->mode != 3)     /* 9.X.4; other codec modes */
+        ac4_fail(b, AC4E_ELEMENT_PARSE);
+    if (b_iframe) {                        /* immers_cfg (6.2.4.2) */
+        aspx_config(b, &e->aspx_cfg);
+        e->has_aspx_cfg = 1;
+        acpl_config_1ch(b, 0, &e->acpl1_cfg);
+        e->has_acpl_cfg = 1;
+    }
+    if (has_lfe)
+        mono_data(b, bk, 1, e, K_LFE);
+    grouping = (int)ac4_u(b, 2);           /* core_5ch_grouping */
+    if (grouping == 0) {
+        if (ac4_bit(b)) {                  /* 2ch_mode 1: (A, D), (B, E) */
+            two_ch(b, bk, e, K_L, K_LS, 0);
+            two_ch(b, bk, e, K_R, K_RS, 0);
+        } else {
+            two_ch(b, bk, e, K_L, K_R, 0);
+            two_ch(b, bk, e, K_LS, K_RS, 0);
+        }
+        mono_c = 1;
+    } else if (grouping == 1) {
+        static const int K3[3] = { K_L, K_R, K_C };
+        n_ch(b, bk, e, 3, K3);
+        two_ch(b, bk, e, K_LS, K_RS, 0);
+    } else if (grouping == 2) {
+        static const int K4[4] = { K_L, K_R, K_LS, K_RS };
+        n_ch(b, bk, e, 4, K4);
+        mono_c = 1;
+    } else {
+        static const int K5[5] = { K_L, K_R, K_C, K_LS, K_RS };
+        n_ch(b, bk, e, 5, K5);
+    }
+    if (mono_c)
+        mono_data(b, bk, 0, e, K_C);
+    if (ac4_bit(b)) {                      /* b_use_sap_add_ch */
+        s0 = e->n_st;
+        for (i = 0; i < 2; i++)
+            chparam_info(b, bk, &e->fr[i ? K_RS : K_LS], new_st(b, e));
+    }
+    two_ch(b, bk, e, K_X1, K_X2, 0);       /* F, G */
+    if (s0 >= 0) {
+        for (i = 0; i < 2; i++) {
+            const ac4_framing *fb = &e->fr[i ? K_RS : K_LS];
+            const ac4_framing *fa = &e->fr[i ? K_X2 : K_X1];
+            int w;
+            if (fb->num_windows != fa->num_windows)
+                ac4_fail(b, AC4E_ADD_CH);
+            for (w = 0; w < fb->num_windows; w++)
+                if (fb->glen[fb->w2g[w]] != fa->glen[fa->w2g[w]])
+                    ac4_fail(b, AC4E_ADD_CH);
+            e->side[i].ka = i ? K_RS : K_LS;
+            e->side[i].kb = i ? K_X2 : K_X1;
+            e->side[i].st = s0 + i;
+        }
+        e->n_side = 2;
+    }
+    /* A-SPX (Table 8): (A'', B''), (D'', E''), (F'', G''), C'' */
+    set_blocks(e, 4, 0, 1, 1, 1, 3, 1);
+    e->blk_grp[3] = 2;
+    e->blk_two[3] = 0;
+    e->acpl1 = AC4_ACPL1_ICE;
+    e->n_acpl1 = 4;
+    e->bits_end = b->p;
+}
