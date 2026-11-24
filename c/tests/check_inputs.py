@@ -2,7 +2,10 @@
 """Check that the C input layer (c/src/input.c, mp4.c) reads the same
 frames as ac4/container.py.
 
-    python3 c/tests/check_inputs.py FILE ...
+    python3 c/tests/check_inputs.py [--damage N] [FILE ...]
+
+With no FILE: the captures (*.m4s, *.mp4) and elementary streams (*.ac4)
+under AC4_TEST_DIR (tests/capture_util.py).
 
 For each file both sides give the kind, the frame count, the CRC-failed
 and skipped counts and, per frame, its length and FNV-1a hash; any
@@ -20,6 +23,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.join(REPO, "tests"))
 
 from ac4 import container                                  # noqa: E402
 
@@ -71,6 +75,11 @@ def main(argv):
     if argv and argv[0] == "--damage":
         n_dmg = int(argv[1])
         argv = argv[2:]
+    if not argv:
+        import capture_util as CU
+        argv = CU.capture_files() + CU.elementary_streams()
+        if not argv:
+            sys.exit("pass input files or set AC4_TEST_DIR")
     bad = 0
     for p in argv:
         data = open(p, "rb").read()

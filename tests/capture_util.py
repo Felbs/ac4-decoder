@@ -4,7 +4,9 @@ and (optionally) run the original receiver's audio worker on the same cut.
 
 Captures are NEVER part of this repository. Point AC4_TEST_DIR at a folder
 of fragmented-MP4 AC-4 files (*.m4s / *.mp4); the integration tests skip
-when it is unset or holds none.
+when it is unset or holds none. Elementary streams (*.ac4) under the same
+folder are found by elementary_streams() (tests/test_conformance.py,
+c/tests/compare.py, c/tests/check_inputs.py).
 
 To also prove the copy is unchanged against the code it was copied from,
 set AC4_REFERENCE_REPO to a checkout of that receiver (it must contain
@@ -28,6 +30,17 @@ def capture_files():
     for pat in ("*.m4s", "*.mp4"):
         out += glob.glob(os.path.join(d, "**", pat), recursive=True)
     return sorted(out)
+
+
+def elementary_streams():
+    """The raw AC-4 elementary streams (*.ac4: sync frames, or bare
+    raw_ac4_frames) under AC4_TEST_DIR, recursively -- public test signals
+    such as conformance test streams; never part of this repository. []
+    when AC4_TEST_DIR is unset."""
+    d = os.environ.get("AC4_TEST_DIR")
+    if not d or not os.path.isdir(d):
+        return []
+    return sorted(glob.glob(os.path.join(d, "**", "*.ac4"), recursive=True))
 
 
 def cut_fragments(src, dst, n_frag):

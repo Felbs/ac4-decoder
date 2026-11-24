@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compare the C decoder (c/ac4dec-c) with the Python reference (ac4/).
 
-    python3 c/tests/compare.py [FILE ...]
+    python3 c/tests/compare.py [--all-presentations] [FILE ...]
 
 FILE: any input the decoders read (MP4, AC-4 sync frames, MPEG-TS).
+--all-presentations: compare every presentation of the table of contents
+(--presentation N on both sides), not only the one decoded by default.
 
-With no arguments the captures are the *.m4s / *.mp4 files under
-AC4_TEST_DIR (recursively), as the Python integration tests find them.
+With no arguments the inputs are the *.m4s / *.mp4 captures and the *.ac4
+elementary streams under AC4_TEST_DIR (recursively), as the Python tests
+find them (tests/capture_util.py), with every presentation.
 Captures are never part of the repository; every output goes to
 AC4_CPORT_OUT (default ~/.cache/ac4-cport).
 
@@ -28,7 +31,6 @@ The reference is the plain Python package (no test-side changes).
 """
 from __future__ import annotations
 
-import glob
 import os
 import subprocess
 import sys
@@ -39,8 +41,10 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.join(REPO, "tests"))
 
 from ac4 import container                             # noqa: E402
+from ac4 import toc as M                              # noqa: E402
 from ac4 import cli as PYCLI                          # noqa: E402
 from ac4 import rates as RT                           # noqa: E402
 from ac4.decoder import Decoder, REF_PEAK, probe_element, probe_rate  # noqa
@@ -65,21 +69,36 @@ DE_LEVEL = float(os.environ.get("AC4_DE_LEVEL", "0"))
 LAYOUT = os.environ.get("AC4_LAYOUT") or None
 # AC4_STEREO_DMX=loro|ltrt|pl2|auto: the 2.0 downmix of both decoders
 STEREO_DMX = os.environ.get("AC4_STEREO_DMX") or "loro"
+# AC4_CPORT_KEEP=0: delete each input's outputs once compared (long
+# multi-presentation inputs write hundreds of MB each)
+KEEP = os.environ.get("AC4_CPORT_KEEP", "1") != "0"
 FRAME = 1536
 
-def python_reference(path, max_pass=MAX_PASS):
+def n_presentations(path):
+    """-> the number of presentations in the first table of contents that
+    parses (the indices --presentation takes), 1 when none parses."""
+    for f in container.read_frames(path)[:64]:
+        try:
+            return max(1, len(M.parse(f).get("presentations") or []))
+        except Exception:                                  # noqa: BLE001
+            continue
+    return 1
+
+
+def python_reference(path, max_pass=MAX_PASS, presentation=None):
     """-> (float64 (n, ch) at 48 kHz, decoder scale; element; Decoder;
     per-frame status list)."""
     from ac4.decoder import probe_ch_mode, probe_present
     frames = container.read_frames(path)
-    element = probe_element(frames)
+    pk = dict(presentation=presentation)
+    element = probe_element(frames, **pk)
     dec = Decoder(element, target_level=-24.0 if LOUDNESS else None,
                   de_level=DE_LEVEL,
-                  ch_mode=(probe_ch_mode(frames)
+                  ch_mode=(probe_ch_mode(frames, **pk)
                            if element in ("7_X", "ice") else None),
-                  present=(probe_present(frames) if element == "ice"
+                  present=(probe_present(frames, **pk) if element == "ice"
                            else None), layout=LAYOUT,
-                  stereo_dmx=STEREO_DMX)
+                  stereo_dmx=STEREO_DMX, **pk)
     rate = probe_rate(frames)
     rs = StreamResampler(*(RT.ratio(*rate) if rate and RT.ratio(*rate)
                            else RT.ratio(1, 3)))
@@ -120,7 +139,7 @@ def _row(nm, a, b, fs, sl=slice(None)):
     return md, md / fs, snr
 
 
-def compare(path, tag):
+def compare(path, tag, presentation=None):
     os.makedirs(OUT, exist_ok=True)
     c_wav = os.path.join(OUT, tag + ".c.wav")
     c_raw = os.path.join(OUT, tag + ".c.f64")
@@ -130,13 +149,16 @@ def compare(path, tag):
     lvl += ["--de-level", str(DE_LEVEL)]
     if LAYOUT:
         lvl += ["--layout", LAYOUT, "--stereo-dmx", STEREO_DMX]
+    if presentation is not None:
+        lvl += ["--presentation", str(presentation)]
     r = subprocess.run([C_CLI, path, c_wav] + lvl + ["--f64", c_raw,
                         "--status", c_st, "-q"], capture_output=True,
                        text=True)
     if r.returncode != 0:
         print(f"{tag}: ac4dec-c failed rc={r.returncode}: {r.stderr}")
         return None
-    ref, element, dec, py_status = python_reference(path)
+    ref, element, dec, py_status = python_reference(
+        path, presentation=presentation)
     n_frames = len(py_status)
     got = np.fromfile(c_raw, "<f8").reshape(-1, ref.shape[1])
     c_status = read_status(c_st)
@@ -145,7 +167,7 @@ def compare(path, tag):
     py_wav = os.path.join(OUT, tag + ".py.wav")
     PYCLI.decode_file(path, py_wav, quiet=True, max_pass=MAX_PASS,
                       de_level=DE_LEVEL, layout=LAYOUT,
-                      stereo_dmx=STEREO_DMX,
+                      stereo_dmx=STEREO_DMX, presentation=presentation,
                       ref_peak=0.0 if LOUDNESS else REF_PEAK[element])
     w_py, w_c = read_wav16(py_wav), read_wav16(c_wav)
     print(f"\n{tag}  ({os.path.basename(path)}, element {element}"
@@ -174,18 +196,22 @@ def compare(path, tag):
     else:
         print(f"  16-bit WAVs: shapes differ {w_py.shape} {w_c.shape}")
     print(f"  ({time.time() - t0:.1f} s)")
+    if not KEEP:
+        for p in (c_wav, c_raw, c_st, py_wav):
+            if os.path.exists(p):
+                os.remove(p)
     return rows
 
 
 def main(argv):
-    files = argv
+    all_pres = "--all-presentations" in argv
+    files = [a for a in argv if a != "--all-presentations"]
     if not files:
-        d = os.environ.get("AC4_TEST_DIR")
-        if not d:
+        import capture_util as CU
+        files = CU.capture_files() + CU.elementary_streams()
+        if not files:
             sys.exit("pass capture files or set AC4_TEST_DIR")
-        for pat in ("*.m4s", "*.mp4"):
-            files += glob.glob(os.path.join(d, "**", pat), recursive=True)
-        files = sorted(files)
+        all_pres = True
     if not os.path.exists(C_CLI):
         sys.exit(f"build {C_CLI} first (make -C c)")
     worst = 0.0
@@ -197,11 +223,14 @@ def main(argv):
         seen[tag] = seen.get(tag, 0) + 1
         if seen[tag] > 1:
             tag += f"_{seen[tag]}"
-        rows = compare(p, tag)
-        if rows is None:
-            worst = float("inf")
-            continue
-        worst = max([worst] + [r[3] for r in rows])
+        n_pres = n_presentations(p) if all_pres else 1
+        for pi in range(n_pres):
+            rows = compare(p, tag + (f"_p{pi}" if n_pres > 1 else ""),
+                           pi if n_pres > 1 else None)
+            if rows is None:
+                worst = float("inf")
+                continue
+            worst = max([worst] + [r[3] for r in rows])
     ok = worst < 1e-6
     print(f"\nworst max |C - Python| relative to full scale: {worst:.2e} "
           f"({'PASS' if ok else 'FAIL'} against 1e-6)")
