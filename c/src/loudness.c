@@ -74,7 +74,150 @@ static void further_loudness_info(ac4_bits *b, ac4_meta *m)
 /* the substream group gains and the associated audio mixing metadata
    after drc_frame (TS 103 190-2 6.2.2.3; metadata.presentation_substream):
    each part is kept only when it is read whole */
-static void mix_metadata(ac4_bits *b, long n_groups, ac4_meta *m)
+/* Tables 128, 129 and TS 103 190-1 4.3.12.2.8 (index 7: -inf) */
+static const double GAIN_F1[8] = { 3.0, 1.5, 0.0, -1.5, -3.0, -4.5, -6.0,
+                                   -INFINITY };
+static const double GAIN_CODE[8] = { 0.0, -1.5, -3.0, -4.5, -6.0, -9.0,
+                                     -12.0, -INFINITY };
+
+static void cdmx_set(ac4_cdmx *c, int occ, int k, double v)
+{
+    c->g[occ][k] = v;
+    c->has_g[occ][k] = 1;
+}
+
+/* tool_t4_to_f_s_b (back) / tool_t4_to_f_s: the top front, then the top
+   back pair */
+static void cdmx_t4(ac4_bits *b, ac4_cdmx *c, int occ, int back)
+{
+    int h;
+    for (h = 0; h < 2; h++) {
+        int a = h ? AC4_G_T2D : AC4_G_T2A, s = h ? AC4_G_T2E : AC4_G_T2B,
+            cc = h ? AC4_G_T2F : AC4_G_T2C;
+        if (ac4_bit(b)) {               /* b_top_*_to_front */
+            cdmx_set(c, occ, a, GAIN_CODE[ac4_u(b, 3)]);
+            cdmx_set(c, occ, s, GAIN_CODE[7]);
+        } else if (back) {
+            if (ac4_bit(b)) {           /* b_top_*_to_side */
+                cdmx_set(c, occ, s, GAIN_CODE[ac4_u(b, 3)]);
+            } else {
+                cdmx_set(c, occ, cc, GAIN_CODE[ac4_u(b, 3)]);
+                cdmx_set(c, occ, s, GAIN_CODE[7]);
+            }
+        } else {
+            cdmx_set(c, occ, s, GAIN_CODE[ac4_u(b, 3)]);
+        }
+    }
+}
+
+/* tool_t2_to_f_s_b (back) / tool_t2_to_f_s */
+static void cdmx_t2(ac4_bits *b, ac4_cdmx *c, int occ, int back)
+{
+    if (ac4_bit(b)) {                   /* b_top_to_front */
+        cdmx_set(c, occ, AC4_G_T2A, GAIN_CODE[ac4_u(b, 3)]);
+        cdmx_set(c, occ, AC4_G_T2B, GAIN_CODE[7]);
+    } else if (back) {
+        if (ac4_bit(b)) {               /* b_top_to_side */
+            cdmx_set(c, occ, AC4_G_T2B, GAIN_CODE[ac4_u(b, 3)]);
+        } else {
+            cdmx_set(c, occ, AC4_G_T2C, GAIN_CODE[ac4_u(b, 3)]);
+            cdmx_set(c, occ, AC4_G_T2B, GAIN_CODE[7]);
+        }
+    } else {
+        cdmx_set(c, occ, AC4_G_T2B, GAIN_CODE[ac4_u(b, 3)]);
+    }
+}
+
+/* cdmx_parameters (6.2.9.3) */
+static void cdmx_params(ac4_bits *b, ac4_cdmx *c, int bs, int occ)
+{
+    if (bs == 0 || bs == 3) {           /* tool_scr_to_c_l */
+        if (ac4_bit(b))
+            cdmx_set(c, occ, AC4_G_F1, GAIN_F1[ac4_u(b, 3)]);
+        else
+            cdmx_set(c, occ, AC4_G_F2, GAIN_CODE[ac4_u(b, 3)]);
+    }
+    if (bs < 2) {
+        if (occ == 0)
+            cdmx_t4(b, c, occ, 0);
+        else if (occ == 1 || occ == 4)
+            cdmx_set(c, occ, AC4_G_T1, GAIN_CODE[ac4_u(b, 3)]);
+        else if (occ == 3)
+            cdmx_t4(b, c, occ, 1);
+        if (occ <= 2)                   /* tool_b4_to_b2 */
+            cdmx_set(c, occ, AC4_G_B, GAIN_CODE[ac4_u(b, 3)]);
+    }
+    if (bs == 2) {
+        if (occ == 0)
+            cdmx_t4(b, c, occ, 0);
+        else if (occ == 1)
+            cdmx_set(c, occ, AC4_G_T1, GAIN_CODE[ac4_u(b, 3)]);
+    }
+    if (bs >= 3 && bs <= 4) {
+        if (occ == 0)
+            cdmx_t2(b, c, occ, 0);
+        else if (occ == 3)
+            cdmx_t2(b, c, occ, 1);
+        if (occ <= 2)
+            cdmx_set(c, occ, AC4_G_B, GAIN_CODE[ac4_u(b, 3)]);
+    }
+    if (bs == 5 && occ == 0)
+        cdmx_t2(b, c, occ, 0);
+}
+
+/* custom_dmx_data (6.2.9.2); pm: pres_ch_mode, pres_ch_mode_core,
+   b_pres_4_back_channels_present, pres_top_channel_pairs,
+   b_pres_has_lfe (metadata.pres_modes_of) */
+static void custom_dmx_data(ac4_bits *b, const int *pm, ac4_cdmx *c)
+{
+    int cm = pm[0], back = pm[2], pairs = pm[3], bs = -1, i;
+    memset(c, 0, sizeof(*c));
+    c->lfe_mixgain = -1;
+    if (cm >= 11 && cm <= 14) {
+        if (pairs == 2) {
+            if (cm >= 13 && back)
+                bs = 0;
+            if (cm <= 12)
+                bs = back ? 1 : 2;
+        }
+        if (pairs == 1) {
+            if (cm >= 13 && back)
+                bs = 3;
+            if (cm <= 12)
+                bs = back ? 4 : 5;
+        }
+    }
+    c->bs_ch_config = bs;
+    if (bs >= 0 && ac4_bit(b)) {        /* b_cdmx_data_present */
+        int n = (int)ac4_u(b, 2) + 1;
+        for (i = 0; i < n; i++) {
+            int occ = (int)ac4_u(b, (bs == 2 || bs == 5) ? 1 : 3);
+            /* a configuration sent twice: the last one counts */
+            memset(c->g[occ], 0, sizeof(c->g[occ]));
+            memset(c->has_g[occ], 0, sizeof(c->has_g[occ]));
+            c->has_cfg[occ] = 1;
+            cdmx_params(b, c, bs, occ);
+        }
+    }
+    if (cm >= 3 || pm[1] >= 3) {
+        if (ac4_bit(b)) {               /* b_stereo_dmx_coeff */
+            c->has_stereo = 1;
+            c->loro_c = GAIN_F1[ac4_u(b, 3)];
+            c->loro_s = GAIN_F1[ac4_u(b, 3)];
+            if (ac4_bit(b)) {           /* b_ltrt_mixinfo */
+                ac4_u(b, 3);
+                ac4_u(b, 3);
+            }
+            if (pm[4] && ac4_bit(b))    /* b_lfe_mixinfo */
+                c->lfe_mixgain = (int)ac4_u(b, 5);
+            ac4_u(b, 2);                /* preferred_dmx_method */
+        }
+    }
+    c->present = 1;
+}
+
+static void mix_metadata(ac4_bits *b, long n_groups, const int *pm,
+                         ac4_meta *m)
 {
     int k;
     if (n_groups > 1 && ac4_bit(b)) {   /* b_substream_group_gains_present */
@@ -111,6 +254,12 @@ static void mix_metadata(ac4_bits *b, long n_groups, ac4_meta *m)
         memcpy(m->sc, v, sizeof(v));
         memcpy(m->has_sc, has, sizeof(has));
         m->has_assoc = 1;
+    }
+    if (pm) {
+        /* kept only when it parses to its end (metadata.py) */
+        ac4_cdmx c;
+        custom_dmx_data(b, pm, &c);
+        m->cdmx = c;
     }
 }
 
@@ -342,7 +491,8 @@ static int drc_frame(ac4_bits *b, const ac4_huff *hcb, int iframe,
 int ac4_pres_metadata(const uint8_t *sub, size_t len, int b_alternative,
                       int b_pres_ndot, long n_substreams,
                       ac4_drc_config *state, const ac4_huff *hcb,
-                      int ch_mode, int fl, long n_groups, ac4_meta *out)
+                      int ch_mode, int fl, long n_groups, const int *pm,
+                      ac4_meta *out)
 {
     jmp_buf jb;
     ac4_bits b;
@@ -365,7 +515,7 @@ int ac4_pres_metadata(const uint8_t *sub, size_t len, int b_alternative,
             m.has_drc = 0;
             stage = 2;
             b.p = start + size;
-            mix_metadata(&b, n_groups, &m);
+            mix_metadata(&b, n_groups, pm, &m);
         }
         *out = m;
         return 0;
@@ -413,7 +563,7 @@ int ac4_pres_metadata(const uint8_t *sub, size_t len, int b_alternative,
     m.has_drc = drc_frame(&b, hcb, b_pres_ndot, state, ch_mode, fl, &m);
     stage = 2;
     b.p = start + size;
-    mix_metadata(&b, n_groups, &m);
+    mix_metadata(&b, n_groups, pm, &m);
     *out = m;
     return 0;
 }

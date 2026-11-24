@@ -261,7 +261,8 @@ def drc_frame(b, iframe, state, ch_mode, frame_len):
 
 # ---------------------------------------------------------------- presentation substream
 def presentation_substream(sub, b_alternative, b_pres_ndot, n_substreams,
-                           drc, ch_mode, frame_len, n_groups=1):
+                           drc, ch_mode, frame_len, n_groups=1,
+                           pres_modes=None):
     """ac4_presentation_substream (6.2.2.3) up to the associated audio
     mixing metadata -> dict: dialnorm (dBFS), loudness
     (further_loudness_info), drc (drc_frame or None), name (alternative
@@ -328,9 +329,170 @@ def presentation_substream(sub, b_alternative, b_pres_ndot, n_substreams,
             a["scale_main_front"] = scale_db(b.u(8)) if b.u(1) else None
             a["pan_associated"] = pan_deg(b.u(8)) if b.u(1) else None
             out["assoc"] = a
+        if pres_modes is not None:
+            out["cdmx"] = custom_dmx_data(b, *pres_modes)
     except (ValueError, EOFError, KeyError) as e:
         out["mix_error"] = str(e)[:60]
     return out
+
+
+# Table 128 (gain_f1) and Table 129 (the other gains), dB
+GAIN_F1 = (3.0, 1.5, 0.0, -1.5, -3.0, -4.5, -6.0, -math.inf)
+GAIN_CODE = (0.0, -1.5, -3.0, -4.5, -6.0, -9.0, -12.0, -math.inf)
+# TS 103 190-1 4.3.12.2.8 / .9: loro / ltrt centre and surround mix gains
+MIXGAIN = (3.0, 1.5, 0.0, -1.5, -3.0, -4.5, -6.0, -math.inf)
+
+
+def pres_modes_of(sub_infos):
+    """(pres_ch_mode, pres_ch_mode_core, b_pres_4_back_channels_present,
+    pres_top_channel_pairs, b_pres_has_lfe) of a presentation whose
+    channel-coded substreams have these ac4_substream_info_chan dicts
+    (TS 103 190-2 6.3.3.1.27 - .30, Table 72), for custom_dmx_data. The
+    superset of the channel modes is their largest (the modes the
+    decoder meets are nested); pres_ch_mode_core is taken equal to it
+    (it enters custom_dmx_data only through ">= 3")."""
+    cms = [s.get("channel_mode") for s in sub_infos
+           if s.get("channel_mode") is not None]
+    if not cms:
+        return None
+    cm = max(cms)
+    back = any(s.get("b_4_back_channels_present", 0) for s in sub_infos)
+    tops = [s.get("top_channels_present", 0) for s in sub_infos
+            if "top_channels_present" in s]
+    pairs = 0
+    if any(t == 3 for t in tops):
+        pairs = 2
+    elif any(t in (1, 2) for t in tops):
+        pairs = 1
+    lfe = cm in (4, 6, 8, 10, 12, 14)
+    return (cm, cm, int(back), pairs, int(lfe))
+
+
+def custom_dmx_data(b, pres_ch_mode, pres_ch_mode_core, back4, top_pairs,
+                    has_lfe):
+    """TS 103 190-2 6.2.9.2 - 6.2.9.10 -> dict: bs_ch_config, configs
+    {out_ch_config: {parameter: value}} (gains in dB, flags 0 / 1; only
+    what was sent) and, when b_stereo_dmx_coeff, stereo (loro / ltrt
+    centre and surround gains in dB, lfe_mixgain code or None,
+    preferred_dmx_method)."""
+    bs = -1
+    if pres_ch_mode in (11, 12, 13, 14):
+        if top_pairs == 2:
+            if pres_ch_mode >= 13 and back4:
+                bs = 0
+            if pres_ch_mode <= 12:
+                bs = 1 if back4 else 2
+        if top_pairs == 1:
+            if pres_ch_mode >= 13 and back4:
+                bs = 3
+            if pres_ch_mode <= 12:
+                bs = 4 if back4 else 5
+    out = dict(bs_ch_config=bs, configs={})
+    if bs >= 0 and b.u(1):                       # b_cdmx_data_present
+        for _ in range(b.u(2) + 1):
+            occ = b.u(1) if bs in (2, 5) else b.u(3)
+            out["configs"][occ] = cdmx_parameters(b, bs, occ)
+    if pres_ch_mode >= 3 or pres_ch_mode_core >= 3:
+        if b.u(1):                               # b_stereo_dmx_coeff
+            st = dict(loro_centre=MIXGAIN[b.u(3)],
+                      loro_surround=MIXGAIN[b.u(3)])
+            if b.u(1):                           # b_ltrt_mixinfo
+                st["ltrt_centre"] = MIXGAIN[b.u(3)]
+                st["ltrt_surround"] = MIXGAIN[b.u(3)]
+            st["lfe_mixgain"] = None
+            if has_lfe and b.u(1):               # b_lfe_mixinfo
+                st["lfe_mixgain"] = b.u(5)
+            st["preferred_dmx_method"] = b.u(2)
+            out["stereo"] = st
+    return out
+
+
+def cdmx_parameters(b, bs, occ):
+    """6.2.9.3 and the tools 6.2.9.4 - 6.2.9.10 -> {parameter: value}."""
+    p = {}
+
+    def scr_to_c_l():
+        p["b_put_screen_to_c"] = b.u(1)
+        if p["b_put_screen_to_c"]:
+            p["gain_f1"] = GAIN_F1[b.u(3)]
+        else:
+            p["gain_f2"] = GAIN_CODE[b.u(3)]
+
+    def b4_to_b2():
+        p["gain_b"] = GAIN_CODE[b.u(3)]
+
+    def t4_to_t2():
+        p["gain_t1"] = GAIN_CODE[b.u(3)]
+
+    def t4_f_s(with_back):
+        # tool_t4_to_f_s_b (with_back) / tool_t4_to_f_s
+        for front, a, s_, c in (("front", "t2a", "t2b", "t2c"),
+                                ("back", "t2d", "t2e", "t2f")):
+            to_front = b.u(1)
+            p[f"b_top_{front}_to_front"] = to_front
+            if to_front:
+                p["gain_" + a] = GAIN_CODE[b.u(3)]
+                p["gain_" + s_] = GAIN_CODE[7]
+            elif with_back:
+                to_side = b.u(1)
+                p[f"b_top_{front}_to_side"] = to_side
+                if to_side:
+                    p["gain_" + s_] = GAIN_CODE[b.u(3)]
+                else:
+                    p["gain_" + c] = GAIN_CODE[b.u(3)]
+                    p["gain_" + s_] = GAIN_CODE[7]
+            else:
+                p["gain_" + s_] = GAIN_CODE[b.u(3)]
+
+    def t2_f_s(with_back):
+        # tool_t2_to_f_s_b (with_back) / tool_t2_to_f_s
+        to_front = b.u(1)
+        p["b_top_to_front"] = to_front
+        if to_front:
+            p["gain_t2a"] = GAIN_CODE[b.u(3)]
+            p["gain_t2b"] = GAIN_CODE[7]
+        elif with_back:
+            to_side = b.u(1)
+            p["b_top_to_side"] = to_side
+            if to_side:
+                p["gain_t2b"] = GAIN_CODE[b.u(3)]
+            else:
+                p["gain_t2c"] = GAIN_CODE[b.u(3)]
+                p["gain_t2b"] = GAIN_CODE[7]
+        else:
+            p["gain_t2b"] = GAIN_CODE[b.u(3)]
+
+    if bs in (0, 3):
+        scr_to_c_l()
+    if bs < 2:
+        if occ == 0:
+            t4_f_s(False)
+            b4_to_b2()
+        elif occ == 1:
+            t4_to_t2()
+            b4_to_b2()
+        elif occ == 2:
+            b4_to_b2()
+        elif occ == 3:
+            t4_f_s(True)
+        elif occ == 4:
+            t4_to_t2()
+    if bs == 2:
+        if occ == 0:
+            t4_f_s(False)
+        elif occ == 1:
+            t4_to_t2()
+    if 3 <= bs <= 4:
+        if occ == 0:
+            t2_f_s(False)
+            b4_to_b2()
+        elif occ in (1, 2):
+            b4_to_b2()
+        elif occ == 3:
+            t2_f_s(True)
+    if bs == 5 and occ == 0:
+        t2_f_s(False)
+    return p
 
 
 def sg_gain_db(v):

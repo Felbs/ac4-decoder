@@ -180,6 +180,12 @@ struct ac4dec {
                                    top_channels_present */
     int ice_known;              /* ... read from the stream's TOC */
     int out_ch[NOUT];           /* output channel c is slot out_ch[c] */
+    /* an output layout (cfg.layout, render.c): n_lay channels from the
+       n_ch decoded ones through rmat (n_lay x n_ch), with the custom
+       downmix data held from the frames */
+    int n_lay;
+    double rmat[NOUT * NOUT];
+    ac4_cdmx cdmx_held;
     int el_mask;                /* the element's slots */
     int pair_ch[NPAIR][2];
     /* the stream's rate (rates.py): (fs_index, frame_rate_index) of its
@@ -515,7 +521,50 @@ int ac4dec_probe_present(const ac4dec_config *cfg, const uint8_t *data,
 
 int ac4dec_channels(const ac4dec *d)
 {
-    return d->element ? d->n_ch : 0;
+    return d->element ? d->n_lay : 0;
+}
+
+/* the render ids (render.c RN_*) of the decoded output channels */
+static void render_ids(const ac4dec *d, int *ids)
+{
+    int k;
+    for (k = 0; k < d->n_ch; k++) {
+        int sl = d->out_ch[k];
+        switch (sl) {
+        case CH_L: ids[k] = RN_L; break;
+        case CH_R: ids[k] = RN_R; break;
+        case CH_C: ids[k] = RN_C; break;
+        case CH_LFE: ids[k] = RN_LFE; break;
+        case CH_LS: ids[k] = RN_LS; break;
+        case CH_RS: ids[k] = RN_RS; break;
+        case CH_LB: ids[k] = RN_LB; break;
+        case CH_RB: ids[k] = RN_RB; break;
+        case CH_TBL: ids[k] = RN_TBL; break;
+        case CH_TBR: ids[k] = RN_TBR; break;
+        case CH_X1: case CH_X2: {
+            int r = sl == CH_X2;
+            if (d->element == AC4DEC_ELEMENT_ICE
+                || (d->element == AC4DEC_ELEMENT_7X && d->ch_mode >= 9))
+                ids[k] = r ? RN_TFR : RN_TFL;
+            else if (d->element == AC4DEC_ELEMENT_7X && d->ch_mode >= 7)
+                ids[k] = r ? RN_RW : RN_LW;
+            else
+                ids[k] = r ? RN_RB : RN_LB;
+            break;
+        }
+        default: ids[k] = -1; break;
+        }
+    }
+}
+
+static void render_update(ac4dec *d)
+{
+    int ids[NOUT];
+    if (!d->cfg.layout)
+        return;
+    render_ids(d, ids);
+    ac4_render_matrix(ids, d->n_ch, d->cfg.layout,
+                      d->cdmx_held.present ? &d->cdmx_held : NULL, d->rmat);
 }
 
 int ac4dec_probe_rate(const uint8_t *data, size_t len, int *fs_index,
@@ -716,6 +765,8 @@ static void set_element(ac4dec *d, int element)
     d->n_ch = n;
     for (i = 0; i < NOUT; i++)
         d->out_ch[i] = i < n ? slot[i] : i;
+    d->n_lay = d->cfg.layout ? ac4_layout_channels(d->cfg.layout) : n;
+    render_update(d);
     /* A-SPX block groups -> channel pairs (Table 213) */
     d->pair_ch[0][0] = CH_L;
     d->pair_ch[0][1] = CH_R;
@@ -834,6 +885,7 @@ static void stream_reset(ac4dec *d)
     free_pending(d);
     d->rate_known = 0;
     d->rs_fixed = 0;
+    memset(&d->cdmx_held, 0, sizeof(d->cdmx_held));
     d->fs = d->fri = -1;
     d->fl = AC4_DEFAULT_FRAME;
     d->books.fl = AC4_DEFAULT_FRAME;
@@ -899,6 +951,8 @@ ac4dec *ac4dec_open(const ac4dec_config *cfg)
         || (int)c.element > AC4DEC_ELEMENT_ICE)
         return NULL;
     if (c.ch_mode != 0 && (c.ch_mode < 5 || c.ch_mode > 14))
+        return NULL;
+    if (c.layout < 0 || c.layout > AC4DEC_LAYOUT_7_1_4)
         return NULL;
     if (c.element != AC4DEC_ELEMENT_AUTO && c.channels) {
         int slot[NOUT], n;
@@ -971,6 +1025,8 @@ ac4dec *ac4dec_open(const ac4dec_config *cfg)
         set_element(d, c.element);
     else
         d->n_ch = c.channels ? c.channels : 2;
+    if (!d->element)
+        d->n_lay = c.layout ? ac4_layout_channels(c.layout) : d->n_ch;
     stream_reset(d);
     return d;
 }
@@ -1639,11 +1695,46 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
             pl = (size_t)t.sizes[pp->pres_substream];
             if (pl > len - po)
                 pl = len - po;
+            int pm[5], have_pm = 0;
+            {
+                /* metadata.pres_modes_of: the presentation's channel
+                   modes for custom_dmx_data */
+                const ac4_toc_sub *ss[8];
+                int ns = ac4_toc_audio_substreams(&t, pi, ss, NULL, 8), j;
+                pm[0] = -1;
+                pm[2] = pm[3] = 0;
+                for (j = 0; j < ns; j++) {
+                    const ac4_toc_sub *q = ss[j];
+                    if (q->kind != 0)
+                        continue;
+                    if (q->channel_mode > pm[0])
+                        pm[0] = (int)q->channel_mode;
+                    if (q->channel_mode >= 11 && q->channel_mode <= 14) {
+                        if (q->back4)
+                            pm[2] = 1;
+                        if (q->top == 3)
+                            pm[3] = 2;
+                        else if ((q->top == 1 || q->top == 2) && pm[3] < 1)
+                            pm[3] = 1;
+                    }
+                }
+                if (ns == 0 && s->kind == 0) {
+                    pm[0] = (int)s->channel_mode;
+                    if (pm[0] >= 11 && pm[0] <= 14) {
+                        pm[2] = s->back4;
+                        pm[3] = s->top == 3 ? 2 : (s->top ? 1 : 0);
+                    }
+                }
+                pm[1] = pm[0];
+                pm[4] = pm[0] == 4 || pm[0] == 6 || pm[0] == 8
+                        || pm[0] == 10 || pm[0] == 12 || pm[0] == 14;
+                have_pm = pm[0] >= 0;
+            }
             if (ac4_pres_metadata(data + po, pl, pp->b_alternative,
                                   pp->b_pres_ndot, t.n_substreams,
                                   &d->drc_state, &d->drc_hcb,
                                   (int)s->channel_mode, d->fl, pp->n_sg,
-                                  &r->meta) != 0)
+                                  have_pm ? pm : NULL, &r->meta) != 0)
                 r->meta.valid = 0;
         }
     }
@@ -2304,7 +2395,6 @@ static void emit(ac4dec *d, ac4dec_frame *out)
         out->status = AC4DEC_OK;
         d->n_ok++;
     }
-    out->n_channels = d->n_ch;
     if (d->n_kid)
         mix_frame(d, o, out);
     if (!d->rs_fixed) {
@@ -2340,24 +2430,45 @@ static void emit(ac4dec *d, ac4dec_frame *out)
             ac4_leveler_frame(d->lev, o->meta.valid ? &o->meta : NULL, pp,
                               o->n);
     }
+    if (d->cfg.layout) {
+        /* render.Renderer: the frame's custom downmix data held, then
+           the matrix */
+        double (*tmp)[FRAME] = d->reorder;
+        int c, j, i;
+        if (o->meta.cdmx.present) {
+            ac4_cdmx_hold(&d->cdmx_held, &o->meta.cdmx);
+            render_update(d);
+        }
+        for (c = 0; c < d->n_lay; c++) {
+            memset(tmp[c], 0, sizeof(tmp[c]));
+            for (j = 0; j < d->n_ch; j++) {
+                double g = d->rmat[c * d->n_ch + j];
+                for (i = 0; i < o->n; i++)
+                    tmp[c][i] = tmp[c][i] + o->pcm[j][i] * g;
+            }
+        }
+        for (c = 0; c < d->n_lay; c++)
+            memcpy(o->pcm[c], tmp[c], sizeof(tmp[c]));
+    }
+    out->n_channels = d->n_lay;
     if (d->cfg.internal_rate) {
-        for (k = 0; k < d->n_ch; k++)
+        for (k = 0; k < d->n_lay; k++)
             out->pcm[k] = o->pcm[k];
         out->n_samples = o->n;
         out->sample_rate = (int)floor((double)d->out_rate * d->rs_down
                                       / d->rs_up + 0.5);
     } else if (!d->rsf) {               /* out of memory: silence */
-        for (k = 0; k < d->n_ch; k++) {
+        for (k = 0; k < d->n_lay; k++) {
             memset(d->pcm_out[k], 0, sizeof(d->pcm_out[k]));
             out->pcm[k] = d->pcm_out[k];
         }
         out->n_samples = 0;
     } else {
         out->sample_rate = d->out_rate;
-        for (k = 0; k < d->n_ch; k++)
+        for (k = 0; k < d->n_lay; k++)
             nout = ac4_rs_push(d->rsf, &d->rs[k], o->pcm[k], o->n,
                                d->pcm_out[k]);
-        for (k = 0; k < d->n_ch; k++)
+        for (k = 0; k < d->n_lay; k++)
             out->pcm[k] = d->pcm_out[k];
         out->n_samples = nout;
     }
@@ -2437,6 +2548,8 @@ static ac4dec_element element_of_cm(long cm, int version)
     }
     if (cm >= 5 && cm <= 10)
         return version == 2 ? AC4DEC_ELEMENT_PAIR : AC4DEC_ELEMENT_7X;
+    if (cm >= 11 && cm <= 14)
+        return AC4DEC_ELEMENT_ICE;
     return AC4DEC_ELEMENT_AUTO;
 }
 
@@ -2481,7 +2594,12 @@ static void mix_decide(ac4dec *d, const uint8_t *data, size_t len)
             c.element = element_of_cm(s[k]->channel_mode,
                                       t.pres[pi].version);
             c.ch_mode = c.element == AC4DEC_ELEMENT_7X
+                        || c.element == AC4DEC_ELEMENT_ICE
                         ? (int)s[k]->channel_mode : 0;
+            c.present = c.element == AC4DEC_ELEMENT_ICE
+                        ? 16 | (s[k]->back4 ? 1 : 0) | (s[k]->centre ? 2 : 0)
+                          | (s[k]->top << 2) : 0;
+            c.layout = 0;
             c.channels = 0;
             c.internal_rate = 1;
             c.loudness = 0;

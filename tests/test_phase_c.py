@@ -323,3 +323,127 @@ def test_c_ice(tmp_path, grouping, sap, top):
     n = len(EL.ice_channels(12, top))
     _c_vs_python_ice(tmp_path, frames, n, top)
     _c_vs_python_ice(tmp_path, frames, 2, top)
+
+
+# ------------------------------------------------ rendering (render.py)
+def test_render_tables():
+    """Entries of TS 103 190-2 Tables 39, 41, 43 with Table 130's
+    defaults and with sent gains, and TS 103 190-1 Tables 217, 218 and
+    6.2.17.6."""
+    from ac4 import render as RD
+    m3 = 10 ** (-3 / 20)
+    c514 = ("L", "R", "C", "lfe", "Ls", "Rs", "Tfl", "Tfr", "Tbl", "Tbr")
+    R = RD.matrix(c514, "5.1")
+    # 5.X.4 -> 5.X.0: Ls = Ls + gain_t2b Tfl + gain_t2e Tbl (-3 dB each)
+    assert np.allclose(R[4], [0, 0, 0, 0, 1, 0, m3, 0, m3, 0])
+    assert np.allclose(R[0], [1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    c714 = EL.ICE_FULL
+    cd = dict(bs_ch_config=1, configs={0: dict(gain_b=-6.0, gain_t2a=0.0,
+                                               gain_t2b=math_inf())})
+    R = RD.matrix(c714, "5.1", cd)
+    i = {k: n for n, k in enumerate(c714)}
+    g6 = 10 ** (-6 / 20)
+    assert np.isclose(R[4, i["Ls"]], g6) and np.isclose(R[4, i["Lb"]], g6)
+    assert np.isclose(R[0, i["Tfl"]], 1.0) and R[4, i["Tfl"]] == 0
+    assert np.isclose(R[4, i["Tbl"]], m3)          # gain_t2e default
+    # 7.X.4 -> 7.X.2: Tsl = gain_t1 (Tfl + Tbl)
+    R = RD.matrix(c714, "7.1.2", dict(bs_ch_config=1,
+                                      configs={4: dict(gain_t1=-1.5)}))
+    assert np.isclose(R[8, i["Tfl"]], 10 ** (-1.5 / 20))
+    assert np.isclose(R[8, i["Tbl"]], 10 ** (-1.5 / 20))
+    # 5.1 -> 2.0, LoRo with the stream's LFE gain (5.5 - 13 dB)
+    c51 = ("L", "R", "C", "lfe", "Ls", "Rs")
+    R = RD.matrix(c51, "2.0", dict(bs_ch_config=-1, configs={},
+                                   stereo=dict(loro_centre=-3.0,
+                                               loro_surround=-1.5,
+                                               lfe_mixgain=13)))
+    assert np.allclose(R[0], [1, 0, m3, 10 ** (-7.5 / 20),
+                              10 ** (-1.5 / 20), 0])
+    assert np.allclose(RD.matrix(("C",), "2.0"), [[m3], [m3]])
+    assert np.allclose(RD.matrix(("L", "R", "C"), "2.0"),
+                       [[1, 0, m3], [0, 1, m3]])
+    # 5.1 into 7.1.4: routed, nothing invented
+    R = RD.matrix(c51, "7.1.4")
+    assert R.shape == (12, 6) and np.array_equal(R[:6], np.eye(6))
+    assert not R[6:].any()
+
+
+def math_inf():
+    import math
+    return -math.inf
+
+
+def test_custom_dmx_data_bits():
+    """custom_dmx_data (TS 103 190-2 6.2.9.2) written bit by bit: a 7.1.4
+    presentation (bs_ch_config 1) sending out_ch_config 0 (tool_t4_to_f_s
+    and tool_b4_to_b2) and the stereo coefficients."""
+    from ac4 import metadata as MD
+    from ac4.toc import Bits
+    w = BW()
+    w.u(1, 1).u(2, 0)                   # b_cdmx_data_present, one config
+    w.u(3, 0)                           # out_ch_config 0 (5.X.0)
+    w.u(1, 1).u(3, 2)                   # top front to front, t2a -3 dB
+    w.u(1, 0).u(3, 4)                   # top back: t2e -6 dB
+    w.u(3, 1)                           # gain_b -1.5 dB
+    w.u(1, 1).u(3, 3).u(3, 5)           # stereo: loro c -1.5, s -4.5
+    w.u(1, 0)                           # no ltrt
+    w.u(1, 1).u(5, 9)                   # lfe_mixgain 9
+    w.u(2, 1)                           # preferred: loro
+    b = Bits(w.align().bytes())
+    c = MD.custom_dmx_data(b, 12, 12, 1, 2, 1)
+    assert c["bs_ch_config"] == 1
+    p = c["configs"][0]
+    assert p["gain_t2a"] == -3.0 and p["gain_t2b"] == float("-inf")
+    assert p["gain_t2e"] == -6.0 and p["gain_b"] == -1.5
+    assert c["stereo"]["loro_centre"] == -1.5
+    assert c["stereo"]["loro_surround"] == -4.5
+    assert c["stereo"]["lfe_mixgain"] == 9
+    assert MD.pres_modes_of([dict(channel_mode=12,
+                                  b_4_back_channels_present=0,
+                                  top_channels_present=3)]) == (12, 12, 0,
+                                                                2, 1)
+
+
+def test_decoder_layout():
+    """Decoder(layout=): the decoded channels through render.matrix."""
+    from ac4.decoder import Decoder
+    from ac4 import render as RD
+    rng = np.random.default_rng(13)
+    frames, _ = _ice_frames(rng, n=5, top=(0, 1, 3))
+    d0 = Decoder("ice", guard=False, ch_mode=12, present=(0, 1, 3))
+    d0.hf_ratio = None
+    y = d0.decode_pass(frames)
+    for lay in ("2.0", "5.1", "7.1.4"):
+        d = Decoder("ice", guard=False, ch_mode=12, present=(0, 1, 3),
+                    layout=lay)
+        d.hf_ratio = None
+        z = d.decode_pass(frames)
+        assert d.chans == RD.LAYOUTS[lay]
+        assert np.allclose(z, y @ RD.matrix(d0.chans, lay).T, atol=1e-6)
+
+
+@pytest.mark.parametrize("layout", ["2.0", "5.1", "7.1.2"])
+def test_c_layout(tmp_path, layout):
+    """The C renderer (--layout) against the Python on a synthetic 5.1.4
+    stream."""
+    import os
+    import subprocess
+    from ac4.decoder import Decoder
+    from test_inputs import syncframe
+    if not os.path.exists(C_CLI):
+        pytest.skip("c/ac4dec-c not built")
+    rng = np.random.default_rng(14)
+    frames, _ = _ice_frames(rng, n=6, top=(0, 1, 3))
+    src = tmp_path / "e.ac4"
+    src.write_bytes(b"".join(syncframe(f) for f in frames))
+    raw = tmp_path / "e.f64"
+    subprocess.run([C_CLI, str(src), str(tmp_path / "e.wav"),
+                    "--legacy-level", "--f64", str(raw), "--internal",
+                    "--no-guard", "-q", "--layout", layout], check=True)
+    dec = Decoder("ice", guard=False, ch_mode=12, present=(0, 1, 3),
+                  layout=layout)
+    dec.hf_ratio = None
+    ref = dec.decode_pass(frames)
+    got = np.fromfile(raw, "<f8").reshape(-1, len(dec.chans))
+    assert got.shape == ref.shape
+    assert np.abs(got - ref).max() <= 1e-9 * np.abs(ref).max()

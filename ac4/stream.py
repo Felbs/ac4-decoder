@@ -682,14 +682,22 @@ class Ac4Stream:
             if idx is None or idx >= len(st["substream_sizes"]):
                 return None
             psub = M.substream_bytes(f, st, idx)
+            subs = []
+            for k in range(8):
+                s_ = M.audio_substream(st, pi, k)
+                if s_ is None:
+                    break
+                subs.append(s_)
             md = MDm.presentation_substream(
                 psub, p.get("b_alternative", 0), p.get("b_pres_ndot", 0),
                 st.get("n_substreams", 0), self.drc_state,
                 sel.get("channel_mode", 1), self.frame_len or 1536,
-                n_groups=p.get("n_substream_groups", 1))
+                n_groups=p.get("n_substream_groups", 1),
+                pres_modes=MDm.pres_modes_of(subs or [sel]))
             return dict(dialnorm=md.get("dialnorm"), drc=md.get("drc"),
                         truepk=(md.get("loudness") or {}).get("truepk"),
-                        sg_gain=md.get("sg_gain"), assoc=md.get("assoc"))
+                        sg_gain=md.get("sg_gain"), assoc=md.get("assoc"),
+                        cdmx=md.get("cdmx"))
         except Exception:                                      # noqa: BLE001
             return None
 

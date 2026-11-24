@@ -51,7 +51,8 @@ static void usage(void)
     fprintf(stderr,
             "usage: ac4dec-c IN OUT.wav "
             "[--element auto|5_X|pair|mono|3_0|5_0|7_X|ice]\n"
-            "                [--channels N]\n"
+            "                [--channels N] "
+            "[--layout native|2.0|5.1|5.1.2|5.1.4|7.1|7.1.2|7.1.4]\n"
             "                [--presentation N|id:N] [--language xx]\n"
             "                [--seconds S] [--max-pass N] [--target-level L]\n"
             "                [--drc auto|off|N] [--de-level dB] [--legacy-level]"
@@ -326,6 +327,7 @@ int main(int argc, char **argv)
     const char *src = NULL, *dst = NULL, *f64 = NULL, *status = NULL;
     const char *el_arg = "auto", *pres = NULL, *lang = NULL;
     int channels = 0, quiet = 0, internal = 0, no_guard = 0, i, c, list = 0;
+    int layout = 0;
     long max_pass = 1800, lookahead = 0;
     double seconds = -1.0, ref_peak = 0.0, t0, dt, target = -24.0, de_level = 0.0;
     double assoc_gain = 0.0;
@@ -351,6 +353,20 @@ int main(int argc, char **argv)
         const char *a = argv[i];
         if (!strcmp(a, "--element") && i + 1 < argc)
             el_arg = argv[++i];
+        else if (!strcmp(a, "--layout") && i + 1 < argc) {
+            static const char *const LN[8] = { "native", "2.0", "5.1",
+                "5.1.2", "5.1.4", "7.1", "7.1.2", "7.1.4" };
+            int q;
+            const char *v = argv[++i];
+            layout = -1;
+            for (q = 0; q < 8; q++)
+                if (!strcmp(v, LN[q]))
+                    layout = q;
+            if (layout < 0) {
+                usage();
+                return 2;
+            }
+        }
         else if (!strcmp(a, "--channels") && i + 1 < argc)
             channels = atoi(argv[++i]);
         else if (!strcmp(a, "--seconds") && i + 1 < argc)
@@ -524,6 +540,7 @@ int main(int argc, char **argv)
                 cfg.present = ac4dec_probe_present(&cfg, smp[f].p,
                                                    smp[f].len);
     cfg.channels = channels;
+    cfg.layout = layout;
     cfg.internal_rate = 1;          /* the level rule runs before resampling */
     cfg.lookahead = (int)lookahead;
     cfg.no_guard = no_guard;

@@ -18,7 +18,7 @@ LDLIBS  += -lm
 
 SRC = src/ac4_tables.c src/toc.c src/asf.c src/spectra.c src/filterbank.c \
       src/resample.c src/rates.c src/loudness.c src/aspx.c src/aspx_render.c src/acpl.c src/decoder.c src/mp4.c src/input.c \
-      src/de.c
+      src/de.c src/render.c
 OBJ = $(SRC:.c=.o)
 HDR = include/ac4dec.h include/ac4dec_mp4.h include/ac4dec_input.h src/ac4_internal.h src/ac4_tables.h
 

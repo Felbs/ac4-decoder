@@ -847,6 +847,22 @@ typedef struct {
 
 #define AC4_MAX_SG 8            /* substream group gains kept */
 
+/* custom_dmx_data (TS 103 190-2 6.2.9.2; metadata.custom_dmx_data): the
+   gains (dB) of each out_ch_config sent, in the order gain_f1, f2, b, t1,
+   t2a .. t2f, and the stereo coefficients */
+enum { AC4_G_F1, AC4_G_F2, AC4_G_B, AC4_G_T1, AC4_G_T2A, AC4_G_T2B,
+       AC4_G_T2C, AC4_G_T2D, AC4_G_T2E, AC4_G_T2F, AC4_CDMX_NG };
+typedef struct {
+    int present;                /* custom_dmx_data was read */
+    int bs_ch_config;           /* -1: none */
+    int has_cfg[8];             /* out_ch_config sent this frame */
+    double g[8][AC4_CDMX_NG];
+    unsigned char has_g[8][AC4_CDMX_NG];
+    int has_stereo;             /* b_stereo_dmx_coeff */
+    double loro_c, loro_s;      /* dB */
+    int lfe_mixgain;            /* -1: not sent */
+} ac4_cdmx;
+
 typedef struct {
     int valid;                  /* dialnorm parsed */
     double dialnorm;            /* dBFS */
@@ -860,18 +876,35 @@ typedef struct {
     double sg[AC4_MAX_SG];
     int has_assoc, has_sc[4];
     double sc[4];               /* scale_main, _centre, _front, pan */
+    ac4_cdmx cdmx;              /* custom_dmx_data (cdmx.present) */
     int has_drc;
     ac4_drc_config cfg;         /* in force for this frame */
     int reset;                  /* drc_reset_flag, -1 when not sent */
     ac4_drc_gains gains[8];     /* by mode id */
 } ac4_meta;
 
+/* ------------------------------------------------------------ render.c
+ * Rendering to an output layout (ac4/render.py). Channel ids: */
+enum { RN_L, RN_R, RN_C, RN_LFE, RN_LS, RN_RS, RN_LB, RN_RB, RN_TFL,
+       RN_TFR, RN_TBL, RN_TBR, RN_TSL, RN_TSR, RN_LW, RN_RW, RN_N };
+/* layout 1 .. 7 (ac4dec_layout): its channel count and ids, 0 / NULL
+   for others */
+int ac4_layout_channels(int layout);
+const int *ac4_layout_ids(int layout);
+/* R (layout channels x n_in, row-major): the rendering of the decoded
+   channels ids[0 .. n_in) to layout with the custom downmix data c (held,
+   or NULL) */
+void ac4_render_matrix(const int *ids, int n_in, int layout,
+                       const ac4_cdmx *c, double *R);
+void ac4_cdmx_hold(ac4_cdmx *held, const ac4_cdmx *c);
+
 /* -> 0 (out->valid tells whether dialnorm parsed), -1 when nothing did.
    state: the DRC configuration, updated on an I-frame. hcb: DRC_HCB. */
 int ac4_pres_metadata(const uint8_t *sub, size_t len, int b_alternative,
                       int b_pres_ndot, long n_substreams,
                       ac4_drc_config *state, const ac4_huff *hcb,
-                      int ch_mode, int fl, long n_groups, ac4_meta *out);
+                      int ch_mode, int fl, long n_groups, const int *pm,
+                      ac4_meta *out);
 /* bitstream_version 0 / 1: dialnorm and truepk of the audio substream's
    sus_ver 0 basic_metadata at bit `bit` (metadata.v0_loudness) -> 0, or
    -1 when it does not parse */

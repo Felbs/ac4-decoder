@@ -30,6 +30,8 @@ for a 5.1 element, 2 for stereo, 1 for mono, L R C for 3.0, L R C Ls Rs for 5.0,
 and L R C LFE Ls Rs plus the layout's pair (Lb Rb, Lw Rw or Tfl Tfr) for 7.x;
 for 7.1.4 (the immersive_channel_element, TS 103 190-2) L R C LFE Ls Rs Lb Rb
 Tfl Tfr Tbl Tbr, without Lb Rb when the stream signals them absent (5.1.4).
+--layout renders to 2.0, 5.1, 5.1.2, 5.1.4, 7.1, 7.1.2 or 7.1.4 (in that
+order: L R C LFE, surrounds, back pair, top channels; Tsl Tsr for .2).
 
 OUTPUT LEVEL. Loudness normalisation (TS 103 190-1 5.7.9): the stream's
 reference level (dialnorm) is brought to --target-level (default -24 dB,
@@ -133,7 +135,8 @@ def list_presentations(src, out=print):
 def decode_file(src, dst, element="auto", channels=None, seconds=None,
                 max_pass=1800, ref_peak=0.0, quiet=False, guard=True,
                 presentation=None, language=None, target_level=-24.0,
-                drc="auto", de_level=0.0, mix=True, assoc_gain=0.0):
+                drc="auto", de_level=0.0, mix=True, assoc_gain=0.0,
+                layout=None):
     from . import container
     from . import rates as RT
     from .decoder import Decoder, probe_element, probe_rate
@@ -187,7 +190,7 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
                     subs, channels, guard=guard, presentation=presentation,
                     language=language,
                     target_level=None if legacy else target_level, drc=drc,
-                    de_level=de_level, assoc_gain=assoc_gain)
+                    de_level=de_level, assoc_gain=assoc_gain, layout=layout)
                 say(f"  mixing {len(subs)} substreams: "
                     + ", ".join(f"{d['type']} ({d['element']})"
                                 for d in subs))
@@ -196,7 +199,7 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
                           presentation=presentation, language=language,
                           target_level=None if legacy else target_level,
                           drc=drc, ch_mode=ch_mode, de_level=de_level,
-                          present=present)
+                          present=present, layout=layout)
     except ValueError as e:
         say(str(e))
         return 1
@@ -268,6 +271,12 @@ def main(argv=None):
     ap.add_argument("--channels", type=int, default=None,
                     help="default: all of the element's channels (6 for "
                     "5.1, 8 for 7.1, ...); 2: L, R only")
+    ap.add_argument("--layout", default=None,
+                    choices=("2.0", "5.1", "5.1.2", "5.1.4", "7.1", "7.1.2",
+                             "7.1.4"),
+                    help="render to this loudspeaker layout (TS 103 190-2 "
+                    "5.10.2 with the stream's custom downmix coefficients; "
+                    "2.0: LoRo). Default: the decoded channels")
     ap.add_argument("--seconds", type=float, default=None,
                     help="decode only the first S seconds")
     ap.add_argument("--max-pass", type=int, default=1800,
@@ -310,7 +319,8 @@ def main(argv=None):
                        language=a.language, target_level=a.target_level,
                        drc=a.drc if a.drc in ("auto", "off") else
                        int(a.drc), de_level=a.de_level,
-                       mix=not a.no_mix, assoc_gain=a.assoc_gain)
+                       mix=not a.no_mix, assoc_gain=a.assoc_gain,
+                       layout=a.layout)
 
 
 if __name__ == "__main__":

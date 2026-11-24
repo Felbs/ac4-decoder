@@ -97,6 +97,20 @@ typedef enum {
                                   7.1.4), immersive_codec_mode ASPX_ACPL_2 */
 } ac4dec_element;
 
+/* Output layouts (ac4dec_config.layout), channel order L R C LFE, the
+   surrounds, the back pair, the top channels (Tsl Tsr for .2; Tfl Tfr Tbl
+   Tbr for .4) */
+typedef enum {
+    AC4DEC_LAYOUT_NATIVE = 0,
+    AC4DEC_LAYOUT_2_0 = 1,
+    AC4DEC_LAYOUT_5_1 = 2,
+    AC4DEC_LAYOUT_5_1_2 = 3,
+    AC4DEC_LAYOUT_5_1_4 = 4,
+    AC4DEC_LAYOUT_7_1 = 5,
+    AC4DEC_LAYOUT_7_1_2 = 6,
+    AC4DEC_LAYOUT_7_1_4 = 7
+} ac4dec_layout;
+
 typedef enum {
     AC4DEC_OK = 0,         /* decoded */
     AC4DEC_CONCEALED = 1,  /* broke a bitstream rule (spectrum zeroed, the
@@ -150,6 +164,12 @@ typedef struct {
                               decodes only that one, unmixed */
     int no_mix;            /* 1 = the main substream only (see MIXING) */
     double assoc_gain;     /* associated audio gain g_assoc, dB <= 0 */
+    int layout;            /* output layout (ac4dec_layout): 0 = the
+                              decoded channels; else the channel renderer
+                              of TS 103 190-2 5.10.2 (custom downmix
+                              coefficients of the stream, or Table 130's
+                              defaults; stereo LoRo, TS 103 190-1
+                              6.2.17.4), after loudness and mixing */
     int present;           /* ICE: the channels the substream signals
                               present, as ac4dec_probe_present() gives
                               them (bit 4 set: valid; bit 0

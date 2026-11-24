@@ -62,6 +62,9 @@ typedef struct {
    a row can agree on a rate other than 29.97 fps: the sample count per
    frame then follows that rate */
 static int g_any_rate;
+/* the stream's frame length and resampling ratio (capture mode: from
+   its first frame; 29.97 fps otherwise) */
+static long g_fl = 1536, g_up = 1001, g_down = 960;
 
 static void take(acc_t *a, const ac4dec_frame *o)
 {
@@ -75,10 +78,10 @@ static void take(acc_t *a, const ac4dec_frame *o)
     if (o->status != AC4DEC_OK)
         a->n_conc++;
     if (a->internal) {
-        want = 1536;
+        want = g_fl;
     } else {
-        long long tot = (long long)(a->next + 1) * 1536;
-        want = (long)((tot * 1001 + 959) / 960) - a->total;
+        long long tot = (long long)(a->next + 1) * g_fl;
+        want = (long)((tot * g_up + g_down - 1) / g_down) - a->total;
     }
     if (g_any_rate)                     /* garbage may set any rate */
         want = o->n_samples > 0 && o->n_samples <= AC4DEC_MAX_OUT
@@ -257,6 +260,23 @@ static void capture(const char *path, int seeds)
     el = AC4DEC_ELEMENT_AUTO;
     for (i = 0; i < n && el == AC4DEC_ELEMENT_AUTO; i++)
         el = ac4dec_probe(fr[i].p, fr[i].n);
+    {
+        int fs, fri, fl, up, dn, orate;
+        double fps;
+        g_fl = 1536;
+        g_up = 1001;
+        g_down = 960;
+        for (i = 0; i < n; i++)
+            if (ac4dec_probe_rate(fr[i].p, fr[i].n, &fs, &fri) == 0) {
+                if (ac4dec_rate_info(fs, fri, &fl, &up, &dn, &orate,
+                                     &fps) == 0) {
+                    g_fl = fl;
+                    g_up = up;
+                    g_down = dn;
+                }
+                break;
+            }
+    }
     clean_pk = run(fr, n, el, 0, &n_conc, NULL, NULL);
     CHECK(n_conc == 0, "%s: %ld clean frames concealed", path, n_conc);
     {

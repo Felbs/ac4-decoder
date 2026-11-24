@@ -140,7 +140,7 @@ class Decoder:
     def __init__(self, element="5_X", channels=None, burst_limit=None,
                  guard=True, presentation=None, language=None,
                  target_level=None, drc="auto", ch_mode=None, de_level=0.0,
-                 substream=0, present=None):
+                 substream=0, present=None, layout=None):
         """The frame length follows the stream (TS 103 190-1 Table 83):
         `frame` is FRAME (1536) until the first frame whose rate the
         decoder takes (see Ac4Stream), then that frame_len_base; out_rate
@@ -181,6 +181,14 @@ class Decoder:
             self.ichans = self.chans
         self._out_idx = (None if self.ichans == self.chans else
                          [self.ichans.index(k) for k in self.chans])
+        # the decoded channels (dchans), and the output layout's (chans)
+        # when one is asked for (render.py: TS 103 190-2 5.10.2)
+        self.dchans = self.chans
+        self.renderer = None
+        if layout is not None:
+            from .render import Renderer
+            self.renderer = Renderer(self.dchans, layout)
+            self.chans = self.renderer.out
         self.burst_limit = (BURST_LIMIT if burst_limit is None
                             else float(burst_limit))
         self.fb_state = {k: None for k in self.ichans}
@@ -300,7 +308,7 @@ class Decoder:
             return False
         ka = dict((g, p) for p, g in self.pairs)[gkey][0]
         if self.element == "ice":
-            return len(self.chans) > 2
+            return len(self.dchans) > 2
         return ka in self.ichans and len(self.ichans) > 2
 
     def decode_pass(self, frames):
@@ -333,16 +341,16 @@ class Decoder:
             self.log.append(f"decode pass failed ({type(e).__name__}: "
                             f"{str(e)[:90]}) -- {len(frames)} frames muted")
             n_out = len(frames) * self.frame
-            y = np.zeros((n_out, len(self.chans)))
+            y = np.zeros((n_out, len(self.dchans)))
             status = ["decoder.internal"] * len(frames)
             self.stream.n_bad = n_bad0 + len(frames)
             self.stream.damage.reasons["decoder.internal"] += len(frames)
-        if y.shape != (n_out, len(self.chans)):
+        if y.shape != (n_out, len(self.dchans)):
             self.log.append(f"pass gave {y.shape[0]} samples for "
                             f"{len(frames)} frames -- fixed to {n_out}")
-            z = np.zeros((n_out, len(self.chans)))
+            z = np.zeros((n_out, len(self.dchans)))
             m = min(n_out, y.shape[0])
-            z[:m, :y.shape[1]] = y[:m, :len(self.chans)]
+            z[:m, :y.shape[1]] = y[:m, :len(self.dchans)]
             y = z
         if not np.isfinite(y).all():
             y = np.where(np.isfinite(y), y, np.inf)  # the guard mutes them
@@ -375,12 +383,16 @@ class Decoder:
             if self.leveler is None:
                 from .loudness import Leveler
                 up, down = self.ratio
-                self.leveler = Leveler(self.chans, self.target_level,
+                self.leveler = Leveler(self.dchans, self.target_level,
                                        self.drc_mode,
                                        rate=self.out_rate * down / up)
             meta = list(self.stream.meta)
             meta = (meta + [None] * len(frames))[:len(frames)]
             y = self.leveler.process(y, meta, self.frame)
+        if self.renderer is not None:
+            meta = (list(self.stream.meta) + [None] * len(frames))[
+                :len(frames)]
+            y = self.renderer.process(y, meta, self.frame)
         self.last_status = status            # per frame of this pass
         self.last_concealed = bad | fired
         return y
@@ -691,7 +703,7 @@ def probe_element(frames, limit=64, presentation=None, language=None,
 
 def decode(frames, element=None, channels=None, max_pass=1800,
            presentation=None, language=None, target_level=None, drc="auto",
-           de_level=0.0, mix=True):
+           de_level=0.0, mix=True, layout=None):
     """Batch convenience: -> (pcm float64 (n, ch) at the external rate,
     Decoder.out_rate (48 kHz, or 44,1 kHz for fs_index 0), decoder scale,
     Decoder). The resampler ratio is the stream's (Table 83: 1001/960,
@@ -722,11 +734,12 @@ def decode(frames, element=None, channels=None, max_pass=1800,
         if len(subs) > 1:
             dec = MX.MixDecoder(subs, channels, presentation=presentation,
                                 language=language, target_level=target_level,
-                                drc=drc, de_level=de_level)
+                                drc=drc, de_level=de_level, layout=layout)
     if dec is None:
         dec = Decoder(element, channels, presentation=presentation,
                       language=language, target_level=target_level, drc=drc,
-                      ch_mode=ch_mode, de_level=de_level, present=present)
+                      ch_mode=ch_mode, de_level=de_level, present=present,
+                      layout=layout)
     rs = StreamResampler(up, down)
     out = []
     for i in range(0, len(frames), max(1, max_pass)):

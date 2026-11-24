@@ -153,7 +153,7 @@ class MixDecoder:
 
     def __init__(self, subs, channels=None, guard=True, presentation=None,
                  language=None, target_level=None, drc="auto", de_level=0.0,
-                 assoc_gain=0.0, dialog_gain=0.0):
+                 assoc_gain=0.0, dialog_gain=0.0, layout=None):
         from . import robust as RB
         self.subs = list(subs)
         self.decs = []
@@ -165,7 +165,7 @@ class MixDecoder:
             self.decs.append(Decoder(
                 el, guard=guard, presentation=presentation,
                 language=language, de_level=de_level, substream=d["k"],
-                ch_mode=d["ch_mode"] if el == "7_X" else None))
+                ch_mode=d["ch_mode"] if el in ("7_X", "ice") else None))
         mains = [i for i, d in enumerate(self.subs) if d["type"] == "main"]
         self.main = mains[0] if mains else 0
         full = self.decs[self.main].chans
@@ -173,6 +173,13 @@ class MixDecoder:
             raise ValueError(f"channels must be {len(full)} or 2")
         self.full = full
         self.chans = full if channels in (None, len(full)) else ("L", "R")
+        # an output layout (render.py), after the mix and the leveler
+        self.dchans = self.chans
+        self.renderer = None
+        if layout is not None:
+            from .render import Renderer
+            self.renderer = Renderer(self.dchans, layout)
+            self.chans = self.renderer.out
         self.element = self.decs[self.main].element
         self.target_level = target_level
         self.drc_mode = drc
@@ -271,15 +278,17 @@ class MixDecoder:
                 self.concealed.reasons[key] += v
         self.n_concealed += int(conc.sum())
         self.last_concealed = conc
-        if self.chans != self.full:
-            idx = [self.full.index(c) for c in self.chans]
+        if self.dchans != self.full:
+            idx = [self.full.index(c) for c in self.dchans]
             y = y[:, idx]
         if self.target_level is not None:
             if self.leveler is None:
                 from .loudness import Leveler
                 up, down = self.ratio
-                self.leveler = Leveler(self.chans, self.target_level,
+                self.leveler = Leveler(self.dchans, self.target_level,
                                        self.drc_mode,
                                        rate=self.out_rate * down / up)
             y = self.leveler.process(y, meta, F)
+        if self.renderer is not None:
+            y = self.renderer.process(y, meta, F)
         return y
