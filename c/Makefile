@@ -18,7 +18,7 @@ LDLIBS  += -lm
 
 SRC = src/ac4_tables.c src/toc.c src/asf.c src/spectra.c src/filterbank.c \
       src/resample.c src/rates.c src/loudness.c src/aspx.c src/aspx_render.c src/acpl.c src/decoder.c src/mp4.c src/input.c \
-      src/de.c src/render.c src/oamd.c src/ac4_tables_p2.c
+      src/de.c src/render.c src/oamd.c src/ac4_tables_p2.c src/ajoc.c
 OBJ = $(SRC:.c=.o)
 HDR = include/ac4dec.h include/ac4dec_mp4.h include/ac4dec_input.h src/ac4_internal.h src/ac4_tables.h
 
@@ -41,9 +41,13 @@ tests/unit_test: tests/unit_test.c libac4dec.a $(HDR)
 tests/fuzz_test: tests/fuzz_test.c libac4dec.a $(HDR)
 	$(CC) $(CFLAGS) -o $@ tests/fuzz_test.c libac4dec.a $(LDLIBS)
 
+# tests/data: synthetic streams of elements no capture has (written by
+# tests/gen_fuzz_streams.py), damaged by the gate like captures
+FUZZ_DATA = $(wildcard tests/data/*.syn)
+
 test: tests/unit_test tests/fuzz_test
 	./tests/unit_test
-	./tests/fuzz_test
+	./tests/fuzz_test $(FUZZ_DATA)
 
 # the damaged-input gate under AddressSanitizer + UBSan (slow)
 SAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
@@ -51,7 +55,7 @@ tests/fuzz_test_asan: tests/fuzz_test.c $(SRC) $(HDR)
 	$(CC) $(filter-out -O2,$(CFLAGS)) $(SAN) -o $@ tests/fuzz_test.c $(SRC) $(LDLIBS)
 
 asan: tests/fuzz_test_asan
-	./tests/fuzz_test_asan
+	./tests/fuzz_test_asan $(FUZZ_DATA)
 
 # regenerate the tables from ac4/tables/*.json (needs python3)
 tables:

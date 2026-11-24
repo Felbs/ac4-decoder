@@ -40,7 +40,8 @@ def test_frame_gains_channel_config_and_gmax():
     m = DE.frame_gains(_entry(0b001, par, max_gain=3), 4.0)
     assert np.isclose(m["C"][0], 1 + g4 * T209[3])
     assert DE.frame_gains(_entry(0b001, par), 0.0) == {}
-    assert DE.frame_gains(_entry(0b001, par, method=1), 6.0) == {}
+    # method 1 (cross-channel, phase D): test_phase_d
+    assert "xc" in DE.frame_gains(_entry(0b001, par, method=1), 6.0)
     assert DE.frame_gains(None, 6.0) == {}
 
 

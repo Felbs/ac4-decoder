@@ -63,6 +63,8 @@ LOUDNESS = os.environ.get("AC4_LOUDNESS") == "1"
 DE_LEVEL = float(os.environ.get("AC4_DE_LEVEL", "0"))
 # AC4_LAYOUT=2.0|5.1|...|7.1.4: both decoders render to that layout
 LAYOUT = os.environ.get("AC4_LAYOUT") or None
+# AC4_STEREO_DMX=loro|ltrt|pl2|auto: the 2.0 downmix of both decoders
+STEREO_DMX = os.environ.get("AC4_STEREO_DMX") or "loro"
 FRAME = 1536
 
 def python_reference(path, max_pass=MAX_PASS):
@@ -76,7 +78,8 @@ def python_reference(path, max_pass=MAX_PASS):
                   ch_mode=(probe_ch_mode(frames)
                            if element in ("7_X", "ice") else None),
                   present=(probe_present(frames) if element == "ice"
-                           else None), layout=LAYOUT)
+                           else None), layout=LAYOUT,
+                  stereo_dmx=STEREO_DMX)
     rate = probe_rate(frames)
     rs = StreamResampler(*(RT.ratio(*rate) if rate and RT.ratio(*rate)
                            else RT.ratio(1, 3)))
@@ -126,7 +129,7 @@ def compare(path, tag):
     lvl = [] if LOUDNESS else ["--legacy-level"]
     lvl += ["--de-level", str(DE_LEVEL)]
     if LAYOUT:
-        lvl += ["--layout", LAYOUT]
+        lvl += ["--layout", LAYOUT, "--stereo-dmx", STEREO_DMX]
     r = subprocess.run([C_CLI, path, c_wav] + lvl + ["--f64", c_raw,
                         "--status", c_st, "-q"], capture_output=True,
                        text=True)
@@ -142,6 +145,7 @@ def compare(path, tag):
     py_wav = os.path.join(OUT, tag + ".py.wav")
     PYCLI.decode_file(path, py_wav, quiet=True, max_pass=MAX_PASS,
                       de_level=DE_LEVEL, layout=LAYOUT,
+                      stereo_dmx=STEREO_DMX,
                       ref_peak=0.0 if LOUDNESS else REF_PEAK[element])
     w_py, w_c = read_wav16(py_wav), read_wav16(c_wav)
     print(f"\n{tag}  ({os.path.basename(path)}, element {element}"

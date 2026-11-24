@@ -265,7 +265,8 @@ def decorrelate(v, s, rows=None):
     else:
         BC, AC = B_COEF[list(rows)], A_COEF[list(rows)]
     X = np.concatenate([s["xh"], v], axis=1)            # (3, HIST + n, 64)
-    Y = np.concatenate([s["yh"], np.zeros((3, n, NSB), complex)], axis=1)
+    Y = np.concatenate([s["yh"], np.zeros((v.shape[0], n, NSB), complex)],
+                       axis=1)
     for ts in range(n):
         p = HIST + ts                                   # ts in X
         q = MAXL + ts                                   # ts in Y
@@ -288,7 +289,7 @@ def duck(u, s):
     e2 = np.abs(u) ** 2
     energy = np.stack([e2[:, :, lo:hi].sum(axis=2) for lo, hi in PB15_RUNS],
                       axis=2)                           # (3, n, 15)
-    gain = np.ones((3, n, 15))
+    gain = np.ones((u.shape[0], n, 15))
     peak, smooth, spd = s["peak"], s["smooth"], s["spd"]
     for ts in range(n):
         e = energy[:, ts, :]

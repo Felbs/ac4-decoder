@@ -20,6 +20,15 @@ front pair of a 5.X.4 input with silent top back channels; a decoder
 choosing LtRt (preferred_dmx_method 2, 3) is not built: stereo is LoRo.
 Gains change at frame boundaries, unsmoothed.
 
+Phase D: the other rows of Table 218 (`dmx`: "loro", the default;
+"ltrt", preferred_dmx_method 2; "pl2", method 3 with its +1.8 / -3.2 dB
+surround weights; "auto", the stream's preferred_dmx_method, LoRo when
+it indicates none), the LtRt gains defaulting to the LoRo ones without
+b_ltrt_mixinfo (4.3.12.2.12); the downmix loudness correction of TS 103
+190-2 4.8.5.3 (loud_corr, metadata.loud_corr): when the layout drops
+channels the decoder gives out, its gain for that output configuration
+(loro / ltrt for 2.0), held from the last sent, 0 dB before.
+
 Layouts: "2.0", "5.1", "5.1.2", "5.1.4", "7.1", "7.1.2", "7.1.4", in WAV
 order (L R C LFE, the surrounds, the back pair, then the top channels).
 """
@@ -138,10 +147,22 @@ def _family_matrix(cfg_in, fam, g):
     return m
 
 
-def matrix(chans, layout, cdmx=None):
+DMX_MODES = ("loro", "ltrt", "pl2", "auto")
+
+
+def stereo_method(dmx, cdmx):
+    """The Table 218 row used: dmx (DMX_MODES) with the stream's
+    preferred_dmx_method for "auto" -> "loro", "ltrt" or "pl2"."""
+    if dmx != "auto":
+        return dmx
+    pm = ((cdmx or {}).get("stereo") or {}).get("preferred_dmx_method")
+    return {2: "ltrt", 3: "pl2"}.get(pm, "loro")
+
+
+def matrix(chans, layout, cdmx=None, dmx="loro"):
     """-> (n_out, n_in) array rendering the decoded channels `chans` to
     `layout`, with the custom downmix data cdmx (metadata.custom_dmx_data,
-    or None) of the frame."""
+    or None) of the frame; dmx: the stereo downmix (DMX_MODES)."""
     out = LAYOUTS[layout]
     cfg_in = input_config(chans)
     m = {}
@@ -170,15 +191,28 @@ def matrix(chans, layout, cdmx=None):
         m = _family_matrix(cfg_in, fam, g)
     if layout == "2.0":
         st = (cdmx or {}).get("stereo") or {}
+        meth = stereo_method(dmx, cdmx)
         cmg = db(st.get("loro_centre", -3.0))
         smg = db(st.get("loro_surround", -3.0))
+        if meth != "loro":
+            cmg = db(st.get("ltrt_centre", st.get("loro_centre", -3.0)))
+            smg = db(st.get("ltrt_surround", st.get("loro_surround", -3.0)))
         lfe = st.get("lfe_mixgain")
         lmg = db(5.5 - lfe) if lfe is not None else 0.0
         if cfg_in == "1.0":
             m2 = {"L": {"C": M3DB}, "R": {"C": M3DB}}       # 6.2.17.6
-        else:
+        elif meth == "loro":
             m2 = {"L": {"L": 1.0, "C": cmg, "Ls": smg, "lfe": lmg},
                   "R": {"R": 1.0, "C": cmg, "Rs": smg, "lfe": lmg}}
+        else:
+            # Table 218, preferred_dmx_method 2 / 3
+            a, b_ = smg, smg
+            if meth == "pl2":
+                a, b_ = smg * db(1.8), smg * db(-3.2)
+            m2 = {"L": {"L": 1.0, "C": cmg, "Ls": -a, "Rs": -b_,
+                        "lfe": lmg},
+                  "R": {"R": 1.0, "C": cmg, "Rs": a, "Ls": b_,
+                        "lfe": lmg}}
         mm = {}
         for o, row in m2.items():
             mm[o] = {}
@@ -197,25 +231,56 @@ def matrix(chans, layout, cdmx=None):
     return R
 
 
+# loud_corr's output configuration of each layout (4.8.5.3)
+LOUD_CORR_OF = {"5.1": "5_X", "5.1.2": "5_X_2", "5.1.4": "5_X_4",
+                "7.1": "7_X", "7.1.2": "7_X_2", "7.1.4": "7_X_4"}
+
+
+def is_downmix(chans, layout):
+    """Does rendering chans to layout drop a channel?"""
+    out = set(LAYOUTS[layout])
+    return any(k not in out for k in chans if k != "lfe")
+
+
 class Renderer:
     """Renders decode passes (n, len(chans)) to a layout, frame by frame
-    with the custom downmix data in force (the last sent, held)."""
+    with the custom downmix data in force (the last sent, held), and the
+    downmix loudness correction (held)."""
 
-    def __init__(self, chans, layout):
+    def __init__(self, chans, layout, dmx="loro"):
         if layout not in LAYOUTS:
             raise ValueError(f"layout {layout!r}: one of {tuple(LAYOUTS)}")
+        if dmx not in DMX_MODES:
+            raise ValueError(f"dmx {dmx!r}: one of {DMX_MODES}")
         self.chans = tuple(chans)
         self.layout = layout
+        self.dmx = dmx
         self.out = LAYOUTS[layout]
         self.cdmx = None
+        self.lc = {}
         self._key = None
-        self._R = matrix(self.chans, layout)
+        self._R = matrix(self.chans, layout, dmx=dmx)
+        self._down = is_downmix(self.chans, layout)
+
+    def _gain(self):
+        """The loudness correction (linear) in force."""
+        if not self._down:
+            return 1.0
+        if self.layout == "2.0":
+            k = "loro" if stereo_method(self.dmx, self.cdmx) == "loro" \
+                else "ltrt"
+        else:
+            k = LOUD_CORR_OF[self.layout]
+        return db(self.lc.get(k, 0.0))
 
     def _update(self, md):
         """Hold what each frame sends: the configurations sent and the
-        stereo coefficients when sent."""
+        stereo coefficients when sent; the loudness corrections sent."""
         if not md:
             return
+        if md.get("loud_corr"):
+            self.lc = dict(self.lc)
+            self.lc.update(md["loud_corr"])
         c = md.get("cdmx")
         if not c:
             return
@@ -230,7 +295,7 @@ class Renderer:
         key = repr(cur)
         if key != self._key:
             self._key = key
-            self._R = matrix(self.chans, self.layout, cur)
+            self._R = matrix(self.chans, self.layout, cur, self.dmx)
 
     def process(self, y, meta, frame):
         out = np.zeros((len(y), len(self.out)))
@@ -238,5 +303,7 @@ class Renderer:
         for f in range(n_f):
             self._update(meta[f] if f < len(meta) else None)
             s = slice(f * frame, (f + 1) * frame)
-            out[s] = y[s] @ self._R.T
+            g = self._gain()
+            R = self._R if g == 1.0 else self._R * g
+            out[s] = y[s] @ R.T
         return out

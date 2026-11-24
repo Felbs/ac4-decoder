@@ -147,11 +147,17 @@ static void de_data(ac4_bits *b, int iframe, ac4_de_state *st,
     if ((method == 1 || method == 3) && n_ch > 1) {
         int keep_pos = iframe ? 0 : (int)ac4_bit(b);
         if (!keep_pos) {
-            ac4_u(b, 5);                  /* de_mix_coef1_idx */
-            if (n_ch == 3)
-                ac4_u(b, 5);
+            st->mix[0] = (int)ac4_u(b, 5);    /* de_mix_coef1_idx */
+            st->n_mix = 1;
+            if (n_ch == 3) {
+                st->mix[1] = (int)ac4_u(b, 5);
+                st->n_mix = 2;
+            }
         }
     }
+    out->n_mix = st->n_mix;
+    out->mix[0] = st->mix[0];
+    out->mix[1] = st->mix[1];
     if (st->has_prev)
         memcpy(prev, st->prev, sizeof(prev));
     else
@@ -253,19 +259,71 @@ void ac4_de_metadata(const uint8_t *sub, size_t len, size_t pos,
     }
 }
 
+/* Table 172 */
+static const double MIX_COEF[32] = {
+    0.0, 6.32e-3, 1e-2, 1.79e-2, 3.16e-2, 5.65e-2, 7.87e-2, 0.111, 0.156,
+    0.218, 0.303, 0.37, 0.448, 0.533, 0.577, 0.622, 0.7071, 0.783, 0.846,
+    0.894, 0.929, 0.953, 0.976, 0.9877, 0.9938, 0.9969, 0.9984, 0.9995,
+    0.99984, 0.99995, 0.99998, 1.0 };
+
+/* de._cross: cross-channel enhancement (5.7.8.8) */
+static void cross(const ac4_de_entry *e, const int *chans, int n, double g,
+                  ac4_de_mat *m)
+{
+    double r[3], p[3][64], rest = 1.0;
+    int a, b, sb, k;
+    if (n == 0)
+        return;
+    if (n == 1) {
+        r[0] = 1.0;
+    } else {
+        if (e->n_mix < n - 1)
+            return;
+        for (k = 0; k < n - 1; k++) {
+            int v = e->mix[k] < 0 ? 0 : e->mix[k] > 31 ? 31 : e->mix[k];
+            r[k] = MIX_COEF[v];
+            rest = rest - r[k] * r[k];
+        }
+        r[n - 1] = sqrt(rest > 0.0 ? rest : 0.0);
+    }
+    for (k = 0; k < n; k++) {
+        int band = 0;
+        for (sb = 0; sb < 64; sb++) {
+            int idx;
+            while (band < 7 && sb >= BAND_FIRST[band + 1])
+                band++;
+            idx = e->par[k][band];
+            idx = idx < -30 ? -30 : idx > 30 ? 30 : idx;
+            p[k][sb] = idx * 0.1;
+        }
+    }
+    for (a = 0; a < n; a++)
+        for (b = 0; b < n; b++)
+            for (sb = 0; sb < 64; sb++)
+                m->h[a][b][sb] = (a == b ? 1.0 : 0.0) + g * r[a] * p[b][sb];
+    m->nx = n;
+    for (k = 0; k < n; k++)
+        m->xch[k] = chans[k];
+    m->on = 1;
+}
+
 void ac4_de_frame(const ac4_de_entry *e, double level, ac4_de_mat *m)
 {
     static const int BITS[3] = { 4, 2, 1 };    /* L, R, C (Table 171) */
     int chans[3], n = 0, i, sb;
     double gmax, g;
     memset(m, 0, sizeof(*m));
-    if (!e || e->kind != AC4_DE_DATA || level == 0.0 || e->method != 0)
+    if (!e || e->kind != AC4_DE_DATA || level == 0.0)
         return;
     gmax = (e->max_gain + 1) * 3.0;
     g = pow(10.0, (level < gmax ? level : gmax) / 20.0) - 1.0;
     for (i = 0; i < 3; i++)
         if (e->channel_config & BITS[i])
             chans[n++] = i;
+    if (e->method == 1 || e->method == 3) {
+        cross(e, chans, n, g, m);
+        return;
+    }
     for (i = 0; i < n; i++) {
         const int *row = e->par[(e->ms && n == 2) ? 0 : i];
         double *dst = (e->ms && n == 2) ? m->msg : m->g[chans[i]];
@@ -311,6 +369,43 @@ static void full(const ac4_de_mat *m, int k, int sb, double *own,
    QMF slots re[i][s], im[i][s] for s < ns, slot s at frame position
    s + off) from prev to cur; partner[i]: the index in ch of channel i's
    M/S partner, or -1 */
+/* de._mat: the matrix element (k, j) of channels ch[] at sb; a
+   cross-channel matrix on channels not all in ch[] is the identity */
+static double mat_el(const ac4_de_mat *m, const int *ch, int n, int i,
+                     int j, int sb)
+{
+    int k = ch[i], l = ch[j], a, b, x, ok = 1;
+    if (m->nx) {
+        for (x = 0; x < m->nx; x++) {
+            int hit = 0, y;
+            for (y = 0; y < n; y++)
+                hit |= ch[y] == m->xch[x];
+            ok &= hit;
+        }
+        if (!ok)
+            return i == j ? 1.0 : 0.0;
+        for (a = 0; a < m->nx && m->xch[a] != k; a++)
+            ;
+        for (b = 0; b < m->nx && m->xch[b] != l; b++)
+            ;
+        if (a < m->nx && b < m->nx)
+            return m->h[a][b][sb];
+        return i == j ? 1.0 : 0.0;
+    }
+    if (i == j) {
+        double own, cr;
+        full(m, k, sb, &own, &cr);
+        return own;
+    }
+    if (m->ms && ((k == m->msa && l == m->msb) || (k == m->msb
+                                                    && l == m->msa))) {
+        double own, cr;
+        full(m, k, sb, &own, &cr);
+        return cr;
+    }
+    return 0.0;
+}
+
 void ac4_de_apply(const ac4_de_mat *prev, const ac4_de_mat *cur, int n,
                   const int *ch, double (*const re[3])[64],
                   double (*const im[3])[64], int ns, int off, int nts)
@@ -320,6 +415,34 @@ void ac4_de_apply(const ac4_de_mat *prev, const ac4_de_mat *cur, int n,
     double tr[3][64], ti[3][64];
     if (!cur->on && !prev->on)
         return;
+    if (cur->nx || prev->nx) {
+        /* a cross-channel matrix: de.apply's general form */
+        for (s = 0; s < ns; s++) {
+            double w = ((double)(s + off) + 0.5) / nts;
+            for (i = 0; i < n; i++) {
+                memcpy(tr[i], re[i][s], sizeof(tr[i]));
+                memcpy(ti[i], im[i][s], sizeof(ti[i]));
+            }
+            for (i = 0; i < n; i++)
+                for (sb = 0; sb < 64; sb++) {
+                    double h = (1.0 - w) * mat_el(prev, ch, n, i, i, sb)
+                               + w * mat_el(cur, ch, n, i, i, sb);
+                    double yr = h * tr[i][sb], yi = h * ti[i][sb];
+                    int j;
+                    for (j = 0; j < n; j++) {
+                        if (j == i)
+                            continue;
+                        h = (1.0 - w) * mat_el(prev, ch, n, i, j, sb)
+                            + w * mat_el(cur, ch, n, i, j, sb);
+                        yr = yr + h * tr[j][sb];
+                        yi = yi + h * ti[j][sb];
+                    }
+                    re[i][s][sb] = yr;
+                    im[i][s][sb] = yi;
+                }
+        }
+        return;
+    }
     for (i = 0; i < n; i++) {
         int j, other = -1;
         partner[i] = -1;

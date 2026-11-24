@@ -707,7 +707,7 @@ class Ac4Stream:
         if md.get("error") or not d or d["data"].get("par") is None:
             return None
         return dict(config=d["config"], par=d["data"]["par"],
-                    ms=d["data"].get("ms", 0))
+                    ms=d["data"].get("ms", 0), mix=d["data"].get("mix"))
 
     def _pres_metadata(self, f, st, pi, sel):
         """dialnorm and the DRC frame of the presentation substream of
@@ -735,7 +735,7 @@ class Ac4Stream:
             return dict(dialnorm=md.get("dialnorm"), drc=md.get("drc"),
                         truepk=(md.get("loudness") or {}).get("truepk"),
                         sg_gain=md.get("sg_gain"), assoc=md.get("assoc"),
-                        cdmx=md.get("cdmx"))
+                        cdmx=md.get("cdmx"), loud_corr=md.get("loud_corr"))
         except Exception:                                      # noqa: BLE001
             return None
 
@@ -816,7 +816,7 @@ class Ac4Stream:
                 wins[k][p0:p0 + c] = [np.zeros(fl)]
                 lengths[k][p0:p0 + c] = [fl]
                 counts[k][fi] = 1
-            for key in ("lr", "sr", "c", "xr", "acpl"):
+            for key in ("lr", "sr", "c", "xr", "acpl", "obj"):
                 if key in groups:
                     groups[key][fi] = CONCEALED
             if "de" in groups:

@@ -227,6 +227,8 @@ static void capture(const char *path, int seeds)
     double clean_pk, worst = 0.0;
     long conc_total = 0, dmg_total = 0;
     ac4dec_element el;
+    ac4in_info ain;
+    memset(&ain, 0, sizeof(ain));
     if (!f) {
         fprintf(stderr, "cannot read %s\n", path);
         fails++;
@@ -243,6 +245,25 @@ static void capture(const char *path, int seeds)
     }
     fclose(f);
     n = ac4mp4_samples(data, (size_t)sz, &smp);
+    if (n <= 0) {
+        /* not MP4: AC-4 sync frames or MPEG-TS (the synthetic streams of
+           tests/data) */
+        ac4in_frame *af = NULL;
+        free(smp);
+        smp = NULL;
+        n = ac4in_read(data, (size_t)sz, &af, &ain);
+        if (n > 0) {
+            smp = (ac4mp4_sample *)calloc((size_t)n, sizeof(*smp));
+            for (i = 0; i < n; i++) {
+                smp[i].off = af[i].p && af[i].p >= data
+                             && af[i].p < data + sz
+                             ? (size_t)(af[i].p - data) : 0;
+                smp[i].len = af[i].p && af[i].p >= data
+                             && af[i].p < data + sz ? af[i].len : 0;
+            }
+        }
+        free(af);
+    }
     if (n > 600)
         n = 600;                       /* 20 s per capture is plenty */
     if (n <= 0) {
@@ -426,6 +447,7 @@ static void capture(const char *path, int seeds)
     free(fr);
     free(dm);
     free(smp);
+    ac4in_free(&ain);
     free(data);
 }
 

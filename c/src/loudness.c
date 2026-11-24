@@ -205,15 +205,72 @@ static void custom_dmx_data(ac4_bits *b, const int *pm, ac4_cdmx *c)
             c->loro_c = GAIN_F1[ac4_u(b, 3)];
             c->loro_s = GAIN_F1[ac4_u(b, 3)];
             if (ac4_bit(b)) {           /* b_ltrt_mixinfo */
-                ac4_u(b, 3);
-                ac4_u(b, 3);
+                c->has_ltrt = 1;
+                c->ltrt_c = GAIN_F1[ac4_u(b, 3)];
+                c->ltrt_s = GAIN_F1[ac4_u(b, 3)];
             }
             if (pm[4] && ac4_bit(b))    /* b_lfe_mixinfo */
                 c->lfe_mixgain = (int)ac4_u(b, 5);
-            ac4_u(b, 2);                /* preferred_dmx_method */
+            c->pref = (int)ac4_u(b, 2); /* preferred_dmx_method */
         }
     }
     c->present = 1;
+}
+
+/* loud_corr (6.2.9.1; metadata.loud_corr, channel presentations) */
+static void lc_val(ac4_bits *b, unsigned char *has, double *v, int k)
+{
+    uint32_t x = ac4_u(b, 5);
+    has[k] = 1;
+    v[k] = x == 31 ? 0.0 : (15.0 - (double)x) / 2.0;
+}
+
+static void loud_corr(ac4_bits *b, int cm, int core, ac4_meta *m)
+{
+    unsigned char has[AC4_LC_N];
+    double v[AC4_LC_N];
+    int imm = 0;
+    memset(has, 0, sizeof(has));
+    memset(v, 0, sizeof(v));
+    if (cm > 4)
+        imm = (int)ac4_bit(b);          /* b_corr_for_immersive_out */
+    if (cm > 1) {
+        if (ac4_bit(b))
+            lc_val(b, has, v, AC4_LC_LORO);
+        if (ac4_bit(b))
+            lc_val(b, has, v, AC4_LC_LTRT);
+    }
+    if (cm > 4) {
+        if (ac4_bit(b))
+            lc_val(b, has, v, AC4_LC_5X);
+        if (imm) {
+            if (ac4_bit(b))
+                lc_val(b, has, v, AC4_LC_5X2);
+            if (ac4_bit(b))
+                lc_val(b, has, v, AC4_LC_7X);
+        }
+    }
+    if (cm > 10 && imm) {
+        if (ac4_bit(b))
+            lc_val(b, has, v, AC4_LC_7X4);
+        if (ac4_bit(b))
+            lc_val(b, has, v, AC4_LC_7X2);
+        if (ac4_bit(b))
+            lc_val(b, has, v, AC4_LC_5X4);
+    }
+    if (core >= 5 && ac4_bit(b))
+        lc_val(b, has, v, AC4_LC_C5X2);
+    if (core >= 3) {
+        if (ac4_bit(b))
+            lc_val(b, has, v, AC4_LC_C5X);
+        if (ac4_bit(b)) {
+            lc_val(b, has, v, AC4_LC_CLORO);
+            lc_val(b, has, v, AC4_LC_CLTRT);
+        }
+    }
+    m->has_lc = 1;
+    memcpy(m->lc_has, has, sizeof(has));
+    memcpy(m->lc, v, sizeof(v));
 }
 
 static void mix_metadata(ac4_bits *b, long n_groups, const int *pm,
@@ -260,6 +317,7 @@ static void mix_metadata(ac4_bits *b, long n_groups, const int *pm,
         ac4_cdmx c;
         custom_dmx_data(b, pm, &c);
         m->cdmx = c;
+        loud_corr(b, pm[0], pm[1], m);
     }
 }
 

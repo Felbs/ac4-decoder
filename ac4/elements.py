@@ -491,8 +491,15 @@ def ajoc_element(sub, T, info, b_iframe=False):
 def ajoc_tail(b, info, ifr, st):
     """The rest of audio_data_ajoc after the downmix's A-SPX blocks ->
     dict(dmx=[ObjState] (the downmix objects' metadata, core decoding),
-    side=ajoc(), de=ajoc_dmx_de_data, umx=[ObjState]). st holds the
-    objects' states and the A-JOC state between frames (Ac4Stream)."""
+    side=ajoc(), q=its quantised matrices (ajoc.quantised, Pseudocode
+    16), de=ajoc_dmx_de_data, umx=[ObjState]; dmx_blocks / umx_blocks the
+    states after each block update and dmx_upd / umx_upd their (update
+    sample, ramp) (oamd.block_updates)). st holds the objects' states and
+    the A-JOC state between frames (Ac4Stream).
+
+    Timing: a frame without oamd_timing_data keeps the last one sent for
+    that portion (and its num_obj_info_blocks; before any: one block at
+    sample 0); b_derive_timing_from_dmx takes the downmix's."""
     from . import ajoc as AJ
     from . import oamd as O
     lfe = bool(info["b_lfe"])
@@ -509,12 +516,16 @@ def ajoc_tail(b, info, ifr, st):
     dmx_s = st.setdefault("dmx", [O.ObjState() for _ in range(n_dmx)])
     umx_s = st.setdefault("umx", [O.ObjState() for _ in range(n_umx)])
     nb = st.get("blocks", 1)
+    dmx_tm = st.get("dmx_timing")
     if not info["static"]:
         if b.u(1):                                  # b_dmx_timing
-            out["dmx_timing"] = O.oamd_timing_data(b)
-            nb = len(out["dmx_timing"]["blocks"])
+            out["dmx_timing"] = dmx_tm = O.oamd_timing_data(b)
+            nb = len(dmx_tm["blocks"])
         ot, lf = types(dmx_t)
-        O.oamd_dyndata_single(b, dmx_s, nb, ifr, 0, ot, lf)
+        blk = []
+        O.oamd_dyndata_single(b, dmx_s, nb, ifr, 0, ot, lf, blk)
+        out["dmx_blocks"] = blk
+        out["dmx_upd"] = O.block_updates(dmx_tm, nb)
         if b.u(1):                                  # b_oamd_extension
             bits = (b.vb(3) + 1) * 8
             p0 = b.p
@@ -525,16 +536,23 @@ def ajoc_tail(b, info, ifr, st):
                 raise Damaged("element.parse", "oamd extension overrun")
             b.p += rest
     out["side"] = AJ.ajoc(b, info["n_dmx"], info["n_upmix"])
+    out["q"] = AJ.quantised(out["side"], st.setdefault("qprev", {}))
     out["de"] = AJ.dmx_de_data(b, info["n_dmx"], info["n_upmix"],
                                st.setdefault("de", {}))
+    umx_tm = st.get("umx_timing")
     if b.u(1):                                      # b_umx_timing
-        out["umx_timing"] = O.oamd_timing_data(b)
-        nb = len(out["umx_timing"]["blocks"])
-    else:
-        b.u(1)                                      # b_derive_timing_from_dmx
+        out["umx_timing"] = umx_tm = O.oamd_timing_data(b)
+        nb = len(umx_tm["blocks"])
+    elif b.u(1):                                    # b_derive_timing_from_dmx
+        umx_tm = dmx_tm
     ot, lf = types(umx_t)
-    O.oamd_dyndata_single(b, umx_s, nb, ifr, 0, ot, lf)
+    blk = []
+    O.oamd_dyndata_single(b, umx_s, nb, ifr, 0, ot, lf, blk)
+    out["umx_blocks"] = blk
+    out["umx_upd"] = O.block_updates(umx_tm, nb)
     st["blocks"] = nb
+    st["dmx_timing"] = dmx_tm
+    st["umx_timing"] = umx_tm
     out["dmx"] = [s.copy() for s in dmx_s]
     out["umx"] = [s.copy() for s in umx_s]
     return out

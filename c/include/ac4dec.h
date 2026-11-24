@@ -181,6 +181,13 @@ typedef struct {
                               b_centre_present, bits 2 - 3
                               top_channels_present); 0 = from the stream
                               (AUTO) or all (7.X.4) */
+    int ajoc_core;         /* AJOC: 1 = core decoding (the downmix
+                              objects rendered); 0 = full decoding (the
+                              A-JOC upmix objects, TS 103 190-2 5.7) */
+    int stereo_dmx;        /* layout 2.0: the downmix of TS 103 190-1
+                              Table 218: 0 LoRo, 1 LtRt, 2 LtRt with the
+                              Pro Logic II weights (preferred_dmx_method
+                              3), 3 the stream's preferred_dmx_method */
 } ac4dec_config;
 
 /* MIXING (TS 103 190-2 4.8.3.17, 4.8.3.18, 4.8.4; ac4/mix.py). When the

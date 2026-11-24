@@ -65,7 +65,8 @@ class Cfg(ctypes.Structure):
                 ("de_level", ctypes.c_double),
                 ("substream", ctypes.c_int), ("no_mix", ctypes.c_int),
                 ("assoc_gain", ctypes.c_double), ("layout", ctypes.c_int),
-                ("present", ctypes.c_int)]
+                ("present", ctypes.c_int), ("ajoc_core", ctypes.c_int),
+                ("stereo_dmx", ctypes.c_int)]
 
 
 class Frame(ctypes.Structure):

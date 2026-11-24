@@ -56,7 +56,8 @@ static void usage(void)
             "                [--presentation N|id:N] [--language xx]\n"
             "                [--seconds S] [--max-pass N] [--target-level L]\n"
             "                [--drc auto|off|N] [--de-level dB] [--legacy-level]"
-            "\n                [--no-mix] [--assoc-gain dB]"
+            "\n                [--no-mix] [--assoc-gain dB] [--core-decoding]"
+            "\n                [--stereo-dmx loro|ltrt|pl2|auto]"
             "\n                [--ref-peak X] "
             "[--no-guard]\n"
             "                [--lookahead N] [--f64 RAW] [--internal] "
@@ -332,7 +333,7 @@ int main(int argc, char **argv)
     long max_pass = 1800, lookahead = 0;
     double seconds = -1.0, ref_peak = 0.0, t0, dt, target = -24.0, de_level = 0.0;
     double assoc_gain = 0.0;
-    int no_mix = 0;
+    int no_mix = 0, ajoc_core = 0, stereo_dmx = 0;
     int legacy = 0, drc = 0;
     unsigned char *data;
     size_t len;
@@ -408,6 +409,17 @@ int main(int argc, char **argv)
             internal = 1;
         else if (!strcmp(a, "--no-guard"))
             no_guard = 1;
+        else if (!strcmp(a, "--core-decoding"))
+            ajoc_core = 1;
+        else if (!strcmp(a, "--stereo-dmx") && i + 1 < argc) {
+            const char *v = argv[++i];
+            stereo_dmx = !strcmp(v, "ltrt") ? 1 : !strcmp(v, "pl2") ? 2
+                         : !strcmp(v, "auto") ? 3 : 0;
+            if (strcmp(v, "loro") && !stereo_dmx) {
+                usage();
+                return 2;
+            }
+        }
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet"))
             quiet = 1;
         else if (a[0] == '-' && a[1]) {
@@ -550,6 +562,8 @@ int main(int argc, char **argv)
     cfg.drc = drc;
     cfg.de_level = de_level;
     cfg.no_mix = no_mix;
+    cfg.ajoc_core = ajoc_core;
+    cfg.stereo_dmx = stereo_dmx;
     cfg.assoc_gain = assoc_gain;
     dec = ac4dec_open(&cfg);
     if (!dec) {

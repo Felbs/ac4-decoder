@@ -331,6 +331,8 @@ def presentation_substream(sub, b_alternative, b_pres_ndot, n_substreams,
             out["assoc"] = a
         if pres_modes is not None:
             out["cdmx"] = custom_dmx_data(b, *pres_modes)
+            out["loud_corr"] = loud_corr(b, pres_modes[0], pres_modes[1],
+                                         False)
     except (ValueError, EOFError, KeyError) as e:
         out["mix_error"] = str(e)[:60]
     return out
@@ -365,7 +367,58 @@ def pres_modes_of(sub_infos):
     elif any(t in (1, 2) for t in tops):
         pairs = 1
     lfe = cm in (4, 6, 8, 10, 12, 14)
-    return (cm, cm, int(back), pairs, int(lfe))
+    # Table 71, Pseudocode 26: the core mode of the immersive channel
+    # modes (5.0.2 / 5.1.2), -1 otherwise or when equal to pres_ch_mode
+    core = 5 if cm in (11, 13) else 6 if cm in (12, 14) else -1
+    return (cm, core, int(back), pairs, int(lfe))
+
+
+def loud_corr(b, pres_ch_mode, pres_ch_mode_core, b_objects):
+    """TS 103 190-2 6.2.9.1 -> {output configuration: gain dB} for the
+    corrections sent ((15 - v) / 2 dB, 31: 0 dB; 6.3.10.1.6): loro,
+    ltrt, 5_X, 5_X_2, 7_X, 7_X_4, 7_X_2, 5_X_4, core_5_X_2, core_5_X,
+    core_loro, core_ltrt, 9_X_4."""
+    out = {}
+
+    def val(k):
+        v = b.u(5)
+        out[k] = 0.0 if v == 31 else (15 - v) / 2.0
+
+    obj = b.u(1) if b_objects else 0
+    imm = 0
+    if pres_ch_mode > 4 or obj:
+        imm = b.u(1)                     # b_corr_for_immersive_out
+    if pres_ch_mode > 1 or obj:
+        if b.u(1):
+            val("loro")
+        if b.u(1):
+            val("ltrt")
+    if pres_ch_mode > 4 or obj:
+        if b.u(1):
+            val("5_X")
+        if imm:
+            if b.u(1):
+                val("5_X_2")
+            if b.u(1):
+                val("7_X")
+    if pres_ch_mode > 10 or obj:
+        if imm:
+            for k in ("7_X_4", "7_X_2", "5_X_4"):
+                if b.u(1):
+                    val(k)
+    if pres_ch_mode_core >= 5:
+        if b.u(1):
+            val("core_5_X_2")
+    if pres_ch_mode_core >= 3:
+        if b.u(1):
+            val("core_5_X")
+        if b.u(1):
+            val("core_loro")
+            val("core_ltrt")
+    if obj:
+        if b.u(1):
+            val("9_X_4")
+    return out
 
 
 def custom_dmx_data(b, pres_ch_mode, pres_ch_mode_core, back4, top_pairs,

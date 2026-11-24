@@ -194,6 +194,12 @@ static void qmf_synth_slot(const ac4_qmf_tables *q, double *filt,
 }
 
 /* ------------------------------------------------------------ state */
+void ac4_qmf_synth(const ac4_qmf_tables *q, double *filt, const double *re,
+                   const double *im, double *out)
+{
+    qmf_synth_slot(q, filt, re, im, out);
+}
+
 void ac4_aspx_pair_reset(ac4_aspx_pair *p)
 {
     ac4_aspx_pair_init(p, AC4_DEFAULT_FRAME);

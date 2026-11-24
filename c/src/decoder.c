@@ -131,8 +131,8 @@ typedef struct {
     ac4_aspx_frame af[NPAIR];   /* L/R, Ls/Rs, C (as C/C) */
     ac4_meta meta;              /* presentation substream (valid 0: none) */
     ac4_de_entry de;            /* dialogue enhancement data */
-    int has_obj;                /* AJOC: the downmix objects parsed */
-    ac4_obj obj[17];
+    int has_obj;                /* AJOC: the frame's data parsed (in the
+                                   decoder's ajf ring) */
 } rec_t;
 
 /* a frame from before the first aspx_config (audio_size.late) */
@@ -156,8 +156,10 @@ typedef struct {
     int ok;
     int n;                      /* samples (the frame length) */
     ac4_meta meta;
-    int has_obj;                /* AJOC: the frame's downmix objects */
-    ac4_obj obj[17];
+    int has_obj;                /* AJOC: the frame's downmix objects' block
+                                   updates (core decoding) */
+    int n_dev, dev[AC4_OAMD_NB][2];
+    ac4_obj dblk[AC4_OAMD_NB][17];
     double pcm[NOUT][FRAME];
 } outf_t;
 
@@ -188,10 +190,25 @@ struct ac4dec {
        held for rendering */
     ac4_toc_sub ajoc_info;
     int ajoc_known;
-    ac4_obj_state obj;
+    ac4_obj_state obj, obj_bak;
     ac4_huff ajoc_huff[AC4T_N_AJOC_BOOKS];
-    ac4_obj obj_held[17];
-    int obj_have;
+    /* the frames' A-JOC data (a ring indexed by frame), full decoding
+       (ajoc.c) and its output frame; core decoding's rendering ramp
+       (objrender.SampleRamp) */
+    ac4_ajoc_frame *ajf;
+    int ajf_cap;
+    int ajoc_full;
+    ac4_ajoc_full *ajx;
+    double ajout[NOUT][FRAME];
+    double ajin_r[AC4_AJOC_ND][AC4_MAX_NTS][64];
+    double ajin_i[AC4_AJOC_ND][AC4_MAX_NTS][64];
+    int or_init, or_n, or_k;
+    /* the downmix loudness correction held (render.Renderer.lc) and
+       whether the layout is a downmix */
+    unsigned char lc_has[AC4_LC_N];
+    double lc[AC4_LC_N];
+    int is_dmx;
+    double or_cur[NOUT * NOUT], or_start[NOUT * NOUT], or_tgt[NOUT * NOUT];
     int out_ch[NOUT];           /* output channel c is slot out_ch[c] */
     /* an output layout (cfg.layout, render.c): n_lay channels from the
        n_ch decoded ones through rmat (n_lay x n_ch), with the custom
@@ -575,72 +592,158 @@ static void render_ids(const ac4dec *d, int *ids)
 static int ajoc_layout(const ac4dec *d);
 
 /* decoder.ObjectRenderer._matrix: the downmix objects of an AJOC
-   substream (held) to its layout */
-static void obj_render_update(ac4dec *d)
+   substream (states st, or NULL: unknown) to its layout -> M (n_lay x
+   n_ch). The decoded slot j holds A-JOC input (object) slot_obj[j]
+   (Pseudocode 14a; the LFE first). */
+static void obj_matrix(const ac4dec *d, const ac4_obj *st, double *M)
 {
     const ac4_toc_sub *ai = &d->ajoc_info;
-    int lay = ajoc_layout(d), no = ac4_layout_channels(lay), j, c;
-    const int *out = ac4_layout_ids(lay);
-    int ids[NOUT];
+    int lay = ajoc_layout(d), j, lfe = ai->lfe;
+    int ids[NOUT], pos[AC4_AJOC_ND], slot_obj[NOUT];
+    signed char ty[NOUT];
+    ac4_obj ss[NOUT];
     render_ids(d, ids);
     if (!d->ajoc_known || ai->static_dmx) {
-        ac4_render_matrix(ids, d->n_ch, lay, NULL, d->rmat);
+        ac4_render_matrix(ids, d->n_ch, lay, NULL, M);
         return;
     }
-    for (c = 0; c < no * d->n_ch; c++)
-        d->rmat[c] = 0.0;
+    for (j = 0; j < d->n_ch; j++)
+        slot_obj[j] = j;
+    ac4_ajoc_input_order(d->n_ch - lfe, pos);
+    for (j = 0; j < d->n_ch - lfe; j++)
+        slot_obj[pos[j] + lfe] = j + lfe;
     for (j = 0; j < d->n_ch; j++) {
-        int t = ai->lfe ? (j == 0 ? RN_LFE : ai->dmx_type[j - 1])
-                        : ai->dmx_type[j];
-        const ac4_obj *st = d->obj_have ? &d->obj_held[j] : NULL;
-        double gdb = st ? st->gain : 0.0, g, gg[NOUT];
-        if (st && !st->active)
-            gdb = -INFINITY;
-        g = gdb == -INFINITY ? 0.0 : pow(10.0, gdb / 20.0);
-        if (t == RN_LFE) {
-            for (c = 0; c < no; c++)
-                if (out[c] == RN_LFE)
-                    d->rmat[c * d->n_ch + j] = g;
-        } else if (t == AC4_OBJ_DYN || t == AC4_OBJ_ISF) {
-            double x = 0.5, y = 0.0, z = 0.0;
-            if (st) {
-                x = st->x;
-                y = st->y;
-                z = st->z;
+        int k = slot_obj[j];
+        ty[j] = lfe ? (k == 0 ? RN_LFE : ai->dmx_type[k - 1])
+                    : ai->dmx_type[k];
+        if (st)
+            ss[j] = st[k];
+    }
+    ac4_obj_matrix(ty, st ? ss : NULL, d->n_ch, lay, M);
+}
+
+/* objrender.SampleRamp.event */
+static void or_event(ac4dec *d, const ac4_obj *st, int n)
+{
+    int nm = d->n_lay * d->n_ch, i;
+    obj_matrix(d, st, d->or_tgt);
+    if (!d->or_init || n <= 0) {
+        memcpy(d->or_cur, d->or_tgt, sizeof(double) * (size_t)nm);
+        d->or_n = d->or_k = 0;
+        d->or_init = 1;
+        return;
+    }
+    for (i = 0; i < nm; i++)
+        d->or_start[i] = d->or_cur[i];
+    d->or_n = n;
+    d->or_k = 0;
+}
+
+/* objrender.SampleRamp.apply on samples [i0, i1) of o into tmp */
+static void or_apply(ac4dec *d, const outf_t *o, int i0, int i1,
+                     double (*tmp)[FRAME])
+{
+    int no = d->n_lay, nc = d->n_ch, nm = no * nc, i = i0, c, j, m;
+    double M[NOUT * NOUT];
+    while (i < i1) {
+        if (d->or_k < d->or_n) {
+            int mm = i1 - i < d->or_n - d->or_k ? i1 - i : d->or_n - d->or_k;
+            for (j = 0; j < mm; j++) {
+                double t = (double)d->or_k / d->or_n;
+                for (m = 0; m < nm; m++)
+                    M[m] = d->or_start[m] + (d->or_tgt[m] - d->or_start[m])
+                                            * t;
+                for (c = 0; c < no; c++) {
+                    double acc = 0.0;
+                    int k;
+                    for (k = 0; k < nc; k++)
+                        acc = acc + M[c * nc + k] * o->pcm[k][i + j];
+                    tmp[c][i + j] = acc;
+                }
+                d->or_k++;
             }
-            ac4_obj_gains(x, y, z, out, no, gg);
-            for (c = 0; c < no; c++)
-                d->rmat[c * d->n_ch + j] = g * gg[c];
-        } else {
-            int hit = -1;
-            for (c = 0; c < no; c++)
-                if (out[c] == t)
-                    hit = c;
-            if (hit >= 0) {
-                d->rmat[hit * d->n_ch + j] = g;
+            if (d->or_k >= d->or_n) {
+                memcpy(d->or_cur, d->or_tgt, sizeof(double) * (size_t)nm);
             } else {
-                double x, y, z;
-                ac4_bed_position(t, &x, &y, &z);
-                ac4_obj_gains(x, y, z, out, no, gg);
-                for (c = 0; c < no; c++)
-                    d->rmat[c * d->n_ch + j] = g * gg[c];
+                double t = (double)d->or_k / d->or_n;
+                for (m = 0; m < nm; m++)
+                    d->or_cur[m] = d->or_start[m]
+                                   + (d->or_tgt[m] - d->or_start[m]) * t;
             }
+            i += mm;
+        } else {
+            for (c = 0; c < no; c++)
+                for (j = i; j < i1; j++) {
+                    double acc = 0.0;
+                    int k;
+                    for (k = 0; k < nc; k++)
+                        acc = acc + o->pcm[k][j] * d->or_cur[c * nc + k];
+                    tmp[c][j] = acc;
+                }
+            break;
         }
     }
+}
+
+/* decoder.ObjectRenderer.process for one frame (core decoding) */
+static void obj_render_frame(ac4dec *d, const outf_t *o,
+                             double (*tmp)[FRAME])
+{
+    int n = o->n, pos = 0, k, i, ord[AC4_OAMD_NB], ne = 0;
+    if (!d->or_init)
+        or_event(d, NULL, 0);
+    if (o->has_obj && d->ajoc_known && !d->ajoc_info.static_dmx) {
+        /* the block updates in order of their (clamped) samples, stable */
+        int sm[AC4_OAMD_NB];
+        ne = o->n_dev;
+        for (k = 0; k < ne; k++) {
+            int s_ = o->dev[k][0] < 0 ? 0 : o->dev[k][0];
+            sm[k] = s_ > n ? n : s_;
+            ord[k] = k;
+        }
+        for (k = 1; k < ne; k++)
+            for (i = k; i > 0 && sm[ord[i - 1]] > sm[ord[i]]; i--) {
+                int t = ord[i];
+                ord[i] = ord[i - 1];
+                ord[i - 1] = t;
+            }
+        for (k = 0; k < ne; k++) {
+            int at = sm[ord[k]];
+            if (at > pos) {
+                or_apply(d, o, pos, at, tmp);
+                pos = at;
+            }
+            or_event(d, o->dblk[ord[k]], o->dev[ord[k]][1]);
+        }
+    }
+    if (n > pos)
+        or_apply(d, o, pos, n, tmp);
 }
 
 static void render_update(ac4dec *d)
 {
     int ids[NOUT];
-    if (d->element == AC4DEC_ELEMENT_AJOC) {
-        obj_render_update(d);
-        return;
-    }
+    if (d->element == AC4DEC_ELEMENT_AJOC)
+        return;                 /* obj_render_frame / ajoc.c */
     if (!d->cfg.layout)
         return;
     render_ids(d, ids);
-    ac4_render_matrix(ids, d->n_ch, d->cfg.layout,
-                      d->cdmx_held.present ? &d->cdmx_held : NULL, d->rmat);
+    ac4_render_matrix_dmx(ids, d->n_ch, d->cfg.layout,
+                          d->cdmx_held.present ? &d->cdmx_held : NULL,
+                          d->cfg.stereo_dmx, d->rmat);
+    {
+        /* render.is_downmix: a decoded channel the layout lacks */
+        const int *lo = ac4_layout_ids(d->cfg.layout);
+        int nl = ac4_layout_channels(d->cfg.layout), k, j;
+        d->is_dmx = 0;
+        for (k = 0; k < d->n_ch; k++) {
+            int hit = ids[k] == RN_LFE;
+            for (j = 0; j < nl && !hit; j++)
+                hit = lo[j] == ids[k];
+            if (!hit)
+                d->is_dmx = 1;
+        }
+    }
 }
 
 int ac4dec_probe_rate(const uint8_t *data, size_t len, int *fs_index,
@@ -882,6 +985,42 @@ static void set_element(ac4dec *d, int element)
     d->n_lay = d->cfg.layout ? ac4_layout_channels(d->cfg.layout) : n;
     if (element == AC4DEC_ELEMENT_AJOC)
         d->n_lay = ac4_layout_channels(ajoc_layout(d));
+    d->ajoc_full = 0;
+    if (element == AC4DEC_ELEMENT_AJOC && d->ajoc_known && !d->cfg.ajoc_core) {
+        /* full decoding (decoder.AjocFull): the decoded channels are the
+           layout's, rendered from the upmix objects in the QMF domain;
+           their slots (for the leveler's weights) by name */
+        const int *ids = ac4_layout_ids(ajoc_layout(d));
+        d->ajoc_full = 1;
+        if (!d->ajx)
+            d->ajx = ac4_ajoc_full_new(&d->ajoc_info, ajoc_layout(d));
+        d->n_ch = d->n_lay;
+        for (i = 0; i < d->n_lay; i++) {
+            int sl = CH_X1;
+            switch (ids[i]) {
+            case RN_L: sl = CH_L; break;
+            case RN_R: sl = CH_R; break;
+            case RN_C: sl = CH_C; break;
+            case RN_LFE: sl = CH_LFE; break;
+            case RN_LS: sl = CH_LS; break;
+            case RN_RS: sl = CH_RS; break;
+            case RN_LB: sl = CH_LB; break;
+            case RN_RB: sl = CH_RB; break;
+            case RN_TBL: sl = CH_TBL; break;
+            case RN_TBR: sl = CH_TBR; break;
+            case RN_TFR: case RN_TSR: case RN_RW: sl = CH_X2; break;
+            default: break;
+            }
+            d->out_ch[i] = sl;
+        }
+    }
+    if (element == AC4DEC_ELEMENT_AJOC && !d->ajf) {
+        d->ajf_cap = d->rec_cap + 2;
+        d->ajf = (ac4_ajoc_frame *)calloc((size_t)d->ajf_cap,
+                                          sizeof(ac4_ajoc_frame));
+        if (!d->ajf)
+            d->ajf_cap = 0;
+    }
     render_update(d);
     /* A-SPX block groups -> channel pairs (Table 213) */
     d->pair_ch[0][0] = CH_L;
@@ -923,6 +1062,8 @@ static void set_rate(ac4dec *d, int fs, int fri)
             ac4_aspx_pair_init(&d->pair[k], fl);
             d->pair_active[k] = 0;
         }
+        if (d->ajx)
+            ac4_ajoc_full_reset(d->ajx);
         /* frames concealed before the rate was known and not synthesised
            yet take the stream's frame length (one zero window) */
         for (j = d->rec_first; j < d->rec_first + d->rec_n; j++) {
@@ -1005,7 +1146,7 @@ static void stream_reset(ac4dec *d)
     d->rs_fixed = 0;
     memset(&d->cdmx_held, 0, sizeof(d->cdmx_held));
     memset(&d->obj, 0, sizeof(d->obj));
-    d->obj_have = 0;
+    d->or_init = 0;
     d->fs = d->fri = -1;
     d->fl = AC4_DEFAULT_FRAME;
     d->books.fl = AC4_DEFAULT_FRAME;
@@ -1072,7 +1213,8 @@ ac4dec *ac4dec_open(const ac4dec_config *cfg)
         return NULL;
     if (c.ch_mode != 0 && (c.ch_mode < 5 || c.ch_mode > 14))
         return NULL;
-    if (c.layout < 0 || c.layout > AC4DEC_LAYOUT_7_1_4)
+    if (c.layout < 0 || c.layout > AC4DEC_LAYOUT_7_1_4 || c.stereo_dmx < 0
+        || c.stereo_dmx > 3)
         return NULL;
     if (c.element != AC4DEC_ELEMENT_AUTO && c.element != AC4DEC_ELEMENT_AJOC
         && c.channels) {
@@ -1172,6 +1314,8 @@ void ac4dec_close(ac4dec *d)
     for (i = 0; i < AC4T_N_AJOC_BOOKS; i++)
         ac4_huff_free(&d->ajoc_huff[i]);
     free(d->lev);
+    free(d->ajf);
+    ac4_ajoc_full_free(d->ajx);
     ac4_aspx_books_free(&d->abk);
     ac4_fb_tables_free(d->fbt);
     ac4_rs_filter_free(d->rsf);
@@ -1430,7 +1574,6 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     volatile int changed = AC4E_NONE, resume = -1, seq = -1, brk = 0;
     volatile int first_cfg = 0;
     ac4_aspx_state fstate0 = d->fstate;
-    ac4_obj_state obj0 = d->obj;
     ac4_acpl_qstate aq0 = d->aq;
     int aq10[4][2][AC4_ACPL_NB], aq1n0[4][2];
     int code = AC4E_NONE, k, ifr = 0, has_aspx, acpl3, acpl1, complete;
@@ -1442,6 +1585,8 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     ac4_aspx_tab tab_new, gtab[NPAIR];
     const ac4_aspx_cfg *volatile cfg = NULL;
     size_t end;
+    if (d->element == AC4DEC_ELEMENT_AJOC)
+        d->obj_bak = d->obj;
 
     memset(&sh, 0, sizeof(sh));
     memcpy(aq10, d->aq1, sizeof(aq10));
@@ -1648,10 +1793,12 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         /* the rest of audio_data_ajoc (elements.ajoc_tail) */
         b.p = end;
         b.eof_code = AC4E_ELEMENT_PARSE;
-        ac4_ajoc_tail(&b, d->ajoc_huff, &d->ajoc_info, ifr, &d->obj);
+        if (!d->ajf_cap)
+            ac4_fail(&b, AC4E_INTERNAL);
+        ac4_ajoc_tail(&b, d->ajoc_huff, &d->ajoc_info, ifr, &d->obj,
+                      &d->ajf[(int)(r->index % d->ajf_cap)]);
         end = b.p;
         r->has_obj = 1;
-        memcpy(r->obj, d->obj.dmx, sizeof(r->obj));
     } else if (e->tail) {
         complete = 0;
     }
@@ -1887,7 +2034,9 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
                         pm[3] = s->top == 3 ? 2 : (s->top ? 1 : 0);
                     }
                 }
-                pm[1] = pm[0];
+                /* Table 71, Pseudocode 26: 5.0.2 / 5.1.2 cores */
+                pm[1] = pm[0] == 11 || pm[0] == 13 ? 5
+                        : pm[0] == 12 || pm[0] == 14 ? 6 : -1;
                 pm[4] = pm[0] == 4 || pm[0] == 6 || pm[0] == 8
                         || pm[0] == 10 || pm[0] == 12 || pm[0] == 14;
                 have_pm = pm[0] >= 0;
@@ -1931,7 +2080,8 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
 
 fail:
     d->fstate = fstate0;
-    d->obj = obj0;
+    if (d->element == AC4DEC_ELEMENT_AJOC)
+        d->obj = d->obj_bak;
     d->aq = aq0;
     memcpy(d->aq1, aq10, sizeof(aq10));
     memcpy(d->aq1n, aq1n0, sizeof(aq1n0));
@@ -2097,7 +2247,7 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
 {
     outf_t *o;
     const rec_t *ri = &d->prev_info;
-    int k, p, bad;
+    int k, p, bad, bad_any = 0;
     o = &d->ring[(int)((d->ring_first + d->ring_n) % d->ring_cap)];
     if (d->ring_n == 0)
         d->ring_first = ri->index;
@@ -2109,9 +2259,13 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
     o->iframe = ri->iframe;
     o->seq_jump = ri->seq_jump;
     o->meta = ri->meta;
-    o->has_obj = ri->has_obj;
-    if (ri->has_obj)
-        memcpy(o->obj, ri->obj, sizeof(o->obj));
+    o->has_obj = ri->has_obj && d->ajf_cap;
+    if (o->has_obj) {
+        const ac4_ajoc_frame *fr = &d->ajf[(int)(ri->index % d->ajf_cap)];
+        o->n_dev = fr->n_dev;
+        memcpy(o->dev, fr->dev, sizeof(o->dev));
+        memcpy(o->dblk, fr->dblk, sizeof(o->dblk));
+    }
     o->forced = ri->code != AC4E_NONE;
     o->aspx_flag = 0;
     /* every channel 577 samples late: the delay line, unless its pair
@@ -2141,6 +2295,8 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
         dc[1] = dcore[p][1];
         if (bursts(d, p, y, dc, &bad))
             o->aspx_flag = 1;
+        if (bad)
+            bad_any = 1;
         if (d->pair[p].de_on == 1 && !bad) {
             /* dialogue enhancement: the frames the checks kept */
             y[0] = d->pair[p].deout[0];
@@ -2191,6 +2347,59 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
             }
         }
     }
+    if (d->ajoc_full && d->ajx) {
+        /* A-JOC full decoding (decoder.AjocFull): the downmix tracks'
+           A-SPX output of this frame's slots, in A-JOC input order, to
+           the layout; a frame the checks gave its core plays silence */
+        static const int SL[8][7] = {
+            { 0 }, { CH_C }, { CH_L, CH_R }, { CH_L, CH_R, CH_C },
+            { CH_L, CH_R, CH_LS, CH_RS }, { CH_L, CH_R, CH_LS, CH_RS, CH_C },
+            { CH_L, CH_R, CH_LS, CH_RS, CH_X1, CH_X2 },
+            { CH_L, CH_R, CH_LS, CH_RS, CH_X1, CH_X2, CH_C } };
+        static const int S5[5] = { CH_L, CH_R, CH_C, CH_LS, CH_RS };
+        const double (*xr[AC4_AJOC_ND])[64], (*xi[AC4_AJOC_ND])[64];
+        const int *pos = ac4_ajoc_full_in_pos(d->ajx);
+        int n_in = ac4_ajoc_full_n_in(d->ajx), nts = d->pair[0].nts, i, c;
+        int nd = d->ajoc_info.n_dmx < 8 ? d->ajoc_info.n_dmx : 7;
+        const ac4_ajoc_frame *fr = NULL;
+        double lfe[FRAME];
+        for (i = 0; i < n_in; i++) {
+            int sl = d->ajoc_info.static_dmx ? S5[pos[i]] : SL[nd][pos[i]];
+            xr[i] = xi[i] = NULL;
+            for (p = 0; p < NPAIR; p++) {
+                int h = d->pair_ch[p][1] == sl ? 1
+                        : d->pair_ch[p][0] == sl ? 0 : -1, t;
+                long long ts0;
+                if (h < 0 || !d->path_on[p] || !have[p])
+                    continue;
+                /* the slots the pair synthesised last (push: frame
+                   n_in - 2; finish: n_in - 1) */
+                ts0 = (d->pair[p].n_in - (d->finished ? 1 : 2))
+                      * (long long)nts;
+                for (t = 0; t < nts; t++) {
+                    int q = (int)((ts0 + t) % AC4_QRING);
+                    memcpy(d->ajin_r[i][t], d->pair[p].qre[h][q],
+                           sizeof(d->ajin_r[i][t]));
+                    memcpy(d->ajin_i[i][t], d->pair[p].qim[h][q],
+                           sizeof(d->ajin_i[i][t]));
+                }
+                xr[i] = (const double (*)[64])d->ajin_r[i];
+                xi[i] = (const double (*)[64])d->ajin_i[i];
+            }
+        }
+        if (o->has_obj)
+            fr = &d->ajf[(int)(ri->index % d->ajf_cap)];
+        memcpy(lfe, o->pcm[CH_LFE], sizeof(lfe));
+        ac4_ajoc_full_frame(d->ajx, d->qmf, xr, xi, nts, d->pair[0].tso, fr,
+                            d->ajoc_info.lfe ? lfe : NULL, d->ajout);
+        for (c = 0; c < d->n_lay; c++) {
+            if (bad_any)
+                memset(o->pcm[c], 0, sizeof(o->pcm[c]));
+            else
+                memcpy(o->pcm[c], d->ajout[c], sizeof(o->pcm[c]));
+        }
+        goto ordered;
+    }
     if (d->element == AC4DEC_ELEMENT_ICE) {
         /* Pseudocode 2: z0, z2, z4 = 2 x (L, R, C); the core decoding
            mode's gain 2 on the others where there is no upmix */
@@ -2223,6 +2432,7 @@ static void assemble(ac4dec *d, double hf[NPAIR][2][FRAME],
                            sizeof(o->pcm[k]));
         }
     }
+ordered:
     /* channels a frame does not have are silent */
     for (k = d->n_ch; k < NOUT; k++)
         memset(o->pcm[k], 0, sizeof(o->pcm[k]));
@@ -2606,25 +2816,50 @@ static void emit(ac4dec *d, ac4dec_frame *out)
             ac4_leveler_frame(d->lev, o->meta.valid ? &o->meta : NULL, pp,
                               o->n);
     }
-    if (d->cfg.layout || d->element == AC4DEC_ELEMENT_AJOC) {
+    if (d->element == AC4DEC_ELEMENT_AJOC && !d->ajoc_full) {
+        /* ObjectRenderer (core decoding): the frame's downmix objects'
+           block updates */
+        double (*tmp)[FRAME] = d->reorder;
+        int c;
+        obj_render_frame(d, o, tmp);
+        for (c = 0; c < d->n_lay; c++)
+            memcpy(o->pcm[c], tmp[c], sizeof(tmp[c]));
+    } else if (d->cfg.layout && d->element != AC4DEC_ELEMENT_AJOC) {
         /* render.Renderer: the frame's custom downmix data held, then
-           the matrix; ObjectRenderer (AJOC): the frame's downmix objects */
+           the matrix */
         double (*tmp)[FRAME] = d->reorder;
         int c, j, i;
-        if (d->element == AC4DEC_ELEMENT_AJOC) {
-            if (o->has_obj) {
-                memcpy(d->obj_held, o->obj, sizeof(d->obj_held));
-                d->obj_have = 1;
-                render_update(d);
-            }
-        } else if (o->meta.cdmx.present) {
+        double lg = 1.0;
+        if (o->meta.has_lc)
+            for (c = 0; c < AC4_LC_N; c++)
+                if (o->meta.lc_has[c]) {
+                    d->lc_has[c] = 1;
+                    d->lc[c] = o->meta.lc[c];
+                }
+        if (o->meta.cdmx.present) {
             ac4_cdmx_hold(&d->cdmx_held, &o->meta.cdmx);
             render_update(d);
+        }
+        if (d->is_dmx) {
+            /* render.Renderer._gain: the downmix loudness correction of
+               the layout (4.8.5.3), held */
+            static const int LC[8] = { 0, 0, AC4_LC_5X, AC4_LC_5X2,
+                                       AC4_LC_5X4, AC4_LC_7X, AC4_LC_7X2,
+                                       AC4_LC_7X4 };
+            int lk = d->cfg.layout == AC4DEC_LAYOUT_2_0
+                     ? (ac4_stereo_method(d->cfg.stereo_dmx,
+                                          d->cdmx_held.present
+                                          ? &d->cdmx_held : NULL) == 0
+                        ? AC4_LC_LORO : AC4_LC_LTRT)
+                     : LC[d->cfg.layout];
+            if (d->lc_has[lk])
+                lg = pow(10.0, d->lc[lk] / 20.0);
         }
         for (c = 0; c < d->n_lay; c++) {
             memset(tmp[c], 0, sizeof(tmp[c]));
             for (j = 0; j < d->n_ch; j++) {
-                double g = d->rmat[c * d->n_ch + j];
+                double g = lg == 1.0 ? d->rmat[c * d->n_ch + j]
+                                     : d->rmat[c * d->n_ch + j] * lg;
                 for (i = 0; i < o->n; i++)
                     tmp[c][i] = tmp[c][i] + o->pcm[j][i] * g;
             }

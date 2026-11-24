@@ -396,16 +396,17 @@ void ac4_acpl_run(ac4_acpl_state *s, ac4_acpl_work *w,
 /* Pseudocode 111 then 112-114 for decorrelator d on n slots of w->vr/vi[d]
    (after the HIST slots of history taken from s), into w->ur/ui[d]
    (after MAXL slots), the state carried on: the loops of ac4_acpl_run */
-static void decorr_duck(ac4_acpl_state *s, ac4_acpl_work *w, int d, int cd,
-                        int n)
+static void dd_core(double (*sxr)[NSB], double (*sxi)[NSB],
+                    double (*syr)[NSB], double (*syi)[NSB], double *peak,
+                    double *smooth, double *spd, int cd, int n,
+                    double (*vr)[NSB], double (*vi)[NSB], double (*ur)[NSB],
+                    double (*ui)[NSB])
 {
-    double (*vr)[NSB] = w->vr[d], (*vi)[NSB] = w->vi[d];
-    double (*ur)[NSB] = w->ur[d], (*ui)[NSB] = w->ui[d];
     int r, i, t, sb, k, pb15[NSB];
-    memcpy(vr, s->xr[d], sizeof(s->xr[d]));
-    memcpy(vi, s->xi[d], sizeof(s->xi[d]));
-    memcpy(ur, s->yr[d], sizeof(s->yr[d]));
-    memcpy(ui, s->yi[d], sizeof(s->yi[d]));
+    memcpy(vr, sxr, sizeof(double) * HIST * NSB);
+    memcpy(vi, sxi, sizeof(double) * HIST * NSB);
+    memcpy(ur, syr, sizeof(double) * MAXL * NSB);
+    memcpy(ui, syi, sizeof(double) * MAXL * NSB);
     for (r = 0; r < 3; r++) {
         int lo = REG[r][0], hi = REG[r][1], dl = REG[r][2], L = REG[r][3];
         double a[MAXL + 1], b[MAXL + 1];
@@ -430,10 +431,10 @@ static void decorr_duck(ac4_acpl_state *s, ac4_acpl_work *w, int d, int cd,
             }
         }
     }
-    memcpy(s->xr[d], vr[n], sizeof(s->xr[d]));
-    memcpy(s->xi[d], vi[n], sizeof(s->xi[d]));
-    memcpy(s->yr[d], ur[n], sizeof(s->yr[d]));
-    memcpy(s->yi[d], ui[n], sizeof(s->yi[d]));
+    memcpy(sxr, vr[n], sizeof(double) * HIST * NSB);
+    memcpy(sxi, vi[n], sizeof(double) * HIST * NSB);
+    memcpy(syr, ur[n], sizeof(double) * MAXL * NSB);
+    memcpy(syi, ui[n], sizeof(double) * MAXL * NSB);
     sb_to_pb(15, pb15);
     for (t = 0; t < n; t++) {
         double g[AC4_ACPL_NB];
@@ -444,16 +445,14 @@ static void decorr_duck(ac4_acpl_state *s, ac4_acpl_work *w, int d, int cd,
             for (i = 0; i < wd; i++)
                 e2[i] = abs2(ur[q][lo + i], ui[q][lo + i]);
             e = ac4_np_sum(e2, wd);
-            pk = DUCK_ALPHA * s->peak[d][k];
-            s->peak[d][k] = pk < e ? e : pk;
-            s->smooth[d][k] = (1.0 - DUCK_ALPHA_SMOOTH) * s->smooth[d][k];
-            s->smooth[d][k] = s->smooth[d][k] + DUCK_ALPHA_SMOOTH * e;
-            s->spd[d][k] = (1.0 - DUCK_ALPHA_SMOOTH) * s->spd[d][k];
-            s->spd[d][k] = s->spd[d][k]
-                           + DUCK_ALPHA_SMOOTH * (s->peak[d][k] - e);
-            if (DUCK_GAMMA * s->spd[d][k] > s->smooth[d][k])
-                g[k] = s->smooth[d][k]
-                       / (DUCK_GAMMA * (s->spd[d][k] + DUCK_EPSILON));
+            pk = DUCK_ALPHA * peak[k];
+            peak[k] = pk < e ? e : pk;
+            smooth[k] = (1.0 - DUCK_ALPHA_SMOOTH) * smooth[k];
+            smooth[k] = smooth[k] + DUCK_ALPHA_SMOOTH * e;
+            spd[k] = (1.0 - DUCK_ALPHA_SMOOTH) * spd[k];
+            spd[k] = spd[k] + DUCK_ALPHA_SMOOTH * (peak[k] - e);
+            if (DUCK_GAMMA * spd[k] > smooth[k])
+                g[k] = smooth[k] / (DUCK_GAMMA * (spd[k] + DUCK_EPSILON));
             else
                 g[k] = 1.0;
         }
@@ -462,6 +461,21 @@ static void decorr_duck(ac4_acpl_state *s, ac4_acpl_work *w, int d, int cd,
             ui[q][sb] = ui[q][sb] * g[pb15[sb]];
         }
     }
+}
+
+static void decorr_duck(ac4_acpl_state *s, ac4_acpl_work *w, int d, int cd,
+                        int n)
+{
+    dd_core(s->xr[d], s->xi[d], s->yr[d], s->yi[d], s->peak[d],
+            s->smooth[d], s->spd[d], cd, n, w->vr[d], w->vi[d], w->ur[d],
+            w->ui[d]);
+}
+
+void ac4_decorr_run(ac4_decorr *s, int cd, int n, double (*vr)[64],
+                    double (*vi)[64], double (*ur)[64], double (*ui)[64])
+{
+    dd_core(s->xr, s->xi, s->yr, s->yi, s->peak, s->smooth, s->spd, cd, n,
+            vr, vi, ur, ui);
 }
 
 /* acpl.dequantise_1ch for one parameter set: -> a[band], b[band] */

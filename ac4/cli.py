@@ -136,7 +136,7 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
                 max_pass=1800, ref_peak=0.0, quiet=False, guard=True,
                 presentation=None, language=None, target_level=-24.0,
                 drc="auto", de_level=0.0, mix=True, assoc_gain=0.0,
-                layout=None):
+                layout=None, ajoc_core=False, stereo_dmx="loro"):
     from . import container
     from . import rates as RT
     from .decoder import Decoder, probe_element, probe_rate
@@ -194,7 +194,8 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
                     subs, channels, guard=guard, presentation=presentation,
                     language=language,
                     target_level=None if legacy else target_level, drc=drc,
-                    de_level=de_level, assoc_gain=assoc_gain, layout=layout)
+                    de_level=de_level, assoc_gain=assoc_gain, layout=layout,
+                    stereo_dmx=stereo_dmx)
                 say(f"  mixing {len(subs)} substreams: "
                     + ", ".join(f"{d['type']} ({d['element']})"
                                 for d in subs))
@@ -204,7 +205,8 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
                           target_level=None if legacy else target_level,
                           drc=drc, ch_mode=ch_mode, de_level=de_level,
                           present=present, layout=layout,
-                          ajoc_info=ajoc_info)
+                          ajoc_info=ajoc_info, ajoc_core=ajoc_core,
+                          stereo_dmx=stereo_dmx)
     except ValueError as e:
         say(str(e))
         return 1
@@ -282,6 +284,15 @@ def main(argv=None):
                     help="render to this loudspeaker layout (TS 103 190-2 "
                     "5.10.2 with the stream's custom downmix coefficients; "
                     "2.0: LoRo). Default: the decoded channels")
+    ap.add_argument("--stereo-dmx", default="loro",
+                    choices=("loro", "ltrt", "pl2", "auto"),
+                    help="--layout 2.0: the downmix of TS 103 190-1 Table "
+                    "218 (default loro; auto: the stream's "
+                    "preferred_dmx_method)")
+    ap.add_argument("--core-decoding", action="store_true",
+                    help="A-JOC object substreams: render the downmix "
+                    "objects (core decoding mode) instead of the "
+                    "reconstructed upmix objects (full decoding, default)")
     ap.add_argument("--seconds", type=float, default=None,
                     help="decode only the first S seconds")
     ap.add_argument("--max-pass", type=int, default=1800,
@@ -325,7 +336,8 @@ def main(argv=None):
                        drc=a.drc if a.drc in ("auto", "off") else
                        int(a.drc), de_level=a.de_level,
                        mix=not a.no_mix, assoc_gain=a.assoc_gain,
-                       layout=a.layout)
+                       layout=a.layout, ajoc_core=a.core_decoding,
+                       stereo_dmx=a.stereo_dmx)
 
 
 if __name__ == "__main__":

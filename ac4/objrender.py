@@ -24,8 +24,12 @@ for listening to object content at all.
   ring, renders to the ear ring alone.
 * An LFE object goes to the LFE channel (dropped when the layout has
   none). A bed object goes to its channel when the layout has it, else
-  it is panned from its channel's position (bed_position). Gains are per object (object_gain), per frame: the last
-  metadata block of a frame holds for the whole frame (no ramps)."""
+  it is panned from its channel's position (bed_position). Gains are per object (object_gain).
+* Timing (phase D): each block update of the OAMD takes effect at its
+  update PCM sample (TS 103 190-2 5.9.2) and is reached by a linear
+  crossfade of the rendering gains over its ramp_duration (Table 94);
+  in the time domain (core decoding) per sample, in the QMF domain
+  (full decoding) per QMF slot of 64 samples."""
 from __future__ import annotations
 
 import math
@@ -120,3 +124,70 @@ def render(signals, objects, chans):
         lin = 0.0 if gdb == -math.inf else 10.0 ** (gdb / 20.0)
         M[:, j] = lin * gains(pos, chans, lfe)
     return signals @ M.T
+
+
+def matrix(types, states, out, layout):
+    """The rendering matrix (len(out), len(types)) of objects of the
+    given types ("lfe", a bed channel name, "DYN" or "ISF") with their
+    ObjState (None: unknown, rendered at gain 1 from the room's front
+    centre (0.5, 0, 0)) on the layout's channels `out`."""
+    from . import render as RD
+    M = np.zeros((len(out), len(types)))
+    for j, t in enumerate(types):
+        st = states[j] if states is not None and j < len(states) else None
+        gdb = st.gain if st is not None else 0.0
+        if st is not None and not st.active:
+            gdb = -math.inf
+        g = 0.0 if gdb == -math.inf else 10.0 ** (gdb / 20.0)
+        if t == "lfe":
+            if "lfe" in out:
+                M[out.index("lfe"), j] = g
+        elif t in ("DYN", "ISF"):
+            pos = st.position() if st is not None else (0.5, 0.0, 0.0)
+            M[:, j] = g * gains(pos, out)
+        else:
+            M[:, j] = g * RD.matrix((t,), layout)[:, 0]
+    return M
+
+
+class SampleRamp:
+    """The time-domain form of the timing above: a matrix that steps or
+    ramps linearly, per sample, from its current value to each block
+    update's matrix (event(sample, matrix, n)), carried across frames."""
+
+    def __init__(self):
+        self.cur = None
+        self.start = None
+        self.target = None
+        self.n = 0
+        self.k = 0
+
+    def event(self, M, n):
+        if self.cur is None or n <= 0:
+            self.cur, self.target, self.n, self.k = M, M, 0, 0
+            return
+        self.start, self.target, self.n, self.k = self.cur, M, int(n), 0
+
+    def apply(self, x):
+        """x (m, n_in) of consecutive samples -> (m, n_out). Sample k of
+        a ramp of n (k = 0 .. n - 1) takes start + (target - start) k /
+        n; the ramp's first sample keeps the old value, sample n the new
+        one."""
+        out = np.zeros((len(x), self.cur.shape[0]))
+        i = 0
+        while i < len(x):
+            if self.k < self.n:
+                m = min(len(x) - i, self.n - self.k)
+                for j in range(m):
+                    M = (self.start + (self.target - self.start)
+                         * (self.k / self.n))
+                    out[i + j] = M @ x[i + j]
+                    self.k += 1
+                self.cur = (self.target if self.k >= self.n else
+                            self.start + (self.target - self.start)
+                            * (self.k / self.n))
+                i += m
+            else:
+                out[i:] = x[i:] @ self.cur.T
+                break
+        return out

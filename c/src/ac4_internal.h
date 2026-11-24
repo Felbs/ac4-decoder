@@ -621,11 +621,14 @@ typedef struct {
     int kind;                   /* AC4_DE_*: none = the identity */
     int method, max_gain, channel_config, ms;
     int par[3][8];
+    int n_mix, mix[2];          /* de_mix_coef indices held (n_mix 0:
+                                   none sent yet) */
 } ac4_de_entry;
 
 typedef struct {                /* metadata.SubMetaState */
     int has_cfg, method, max_gain, channel_config;
     int has_prev, prev[3][8];
+    int n_mix, mix[2];          /* metadata.SubMetaState.de_mix */
 } ac4_de_state;
 
 /* the DE matrix of a frame (de.frame_gains / _full): per front channel
@@ -636,6 +639,10 @@ typedef struct {
     double g[3][64];
     int ms, msa, msb;           /* de_ms_proc_flag on channels msa / msb */
     double msg[64];
+    /* cross-channel enhancement (de._cross): H over the processed
+       channels xch[0 .. nx) */
+    int nx, xch[3];
+    double h[3][3][64];
 } ac4_de_mat;
 
 /* The audio substream's metadata() up to its dialogue enhancement data
@@ -878,8 +885,15 @@ typedef struct {
     unsigned char has_g[8][AC4_CDMX_NG];
     int has_stereo;             /* b_stereo_dmx_coeff */
     double loro_c, loro_s;      /* dB */
+    int has_ltrt;               /* b_ltrt_mixinfo */
+    double ltrt_c, ltrt_s;      /* dB */
     int lfe_mixgain;            /* -1: not sent */
+    int pref;                   /* preferred_dmx_method */
 } ac4_cdmx;
+/* loud_corr (6.2.9.1; metadata.loud_corr): the output configurations */
+enum { AC4_LC_LORO, AC4_LC_LTRT, AC4_LC_5X, AC4_LC_5X2, AC4_LC_7X,
+       AC4_LC_7X4, AC4_LC_7X2, AC4_LC_5X4, AC4_LC_C5X2, AC4_LC_C5X,
+       AC4_LC_CLORO, AC4_LC_CLTRT, AC4_LC_9X4, AC4_LC_N };
 
 typedef struct {
     int valid;                  /* dialnorm parsed */
@@ -895,6 +909,9 @@ typedef struct {
     int has_assoc, has_sc[4];
     double sc[4];               /* scale_main, _centre, _front, pan */
     ac4_cdmx cdmx;              /* custom_dmx_data (cdmx.present) */
+    int has_lc;                 /* loud_corr parsed */
+    unsigned char lc_has[AC4_LC_N];
+    double lc[AC4_LC_N];        /* dB, those sent */
     int has_drc;
     ac4_drc_config cfg;         /* in force for this frame */
     int reset;                  /* drc_reset_flag, -1 when not sent */
@@ -911,19 +928,88 @@ typedef struct {
     double x, y, z;             /* room position (6.3.9.8.4) */
     int zone_mask;
 } ac4_obj;
+#define AC4_AJOC_NU 64          /* full-band upmix objects */
+#define AC4_AJOC_ND 7           /* downmix signals; decorrelators */
+#define AC4_OAMD_NB 7           /* block updates per frame */
+/* oamd_timing_data as held (elements.ajoc_tail): sample_offset, the
+   blocks' block_offset_factor and ramp_duration (samples) */
+typedef struct {
+    int has, sample_offset, n;
+    int off[AC4_OAMD_NB], ramp[AC4_OAMD_NB];
+} ac4_oamd_timing;
 /* the A-JOC substream's objects between frames (elements.ajoc_tail):
    downmix (LFE first) and upmix objects, num_obj_info_blocks, the
-   dialogue objects of ajoc_dmx_de_data */
+   dialogue objects of ajoc_dmx_de_data, the held timing, and the
+   quantised A-JOC matrices of the last data point (Pseudocode 16) per
+   object and downmix signal / decorrelator (n: band count, 0 none) */
 typedef struct {
     int init, blocks, n_dlg;
     ac4_obj dmx[17], umx[65];
+    ac4_oamd_timing dt, ut;
+    unsigned char qd[AC4_AJOC_NU][AC4_AJOC_ND][23];
+    unsigned char qw[AC4_AJOC_NU][AC4_AJOC_ND][23];
+    unsigned char nd_[AC4_AJOC_NU][AC4_AJOC_ND], nw_[AC4_AJOC_NU][AC4_AJOC_ND];
 } ac4_obj_state;
+/* one frame's A-JOC data and OAMD block updates (elements.ajoc_tail;
+   the C keeps them in a ring of their own, decoder.c) */
+typedef struct {
+    int nd, en[AC4_AJOC_ND], ndp, start[3], ramp[3];
+    unsigned char present[AC4_AJOC_NU], nb[AC4_AJOC_NU], qs[AC4_AJOC_NU];
+    /* quantised values [data point][object][dry 0..6, wet 7..13][band] */
+    unsigned char q[3][AC4_AJOC_NU][2 * AC4_AJOC_ND][23];
+    /* the block updates: (update sample, ramp samples) and the objects'
+       states after each; one (0, 0) event with the states when a frame
+       has no blocks */
+    int n_dev, n_uev;
+    int dev[AC4_OAMD_NB][2], uev[AC4_OAMD_NB][2];
+    ac4_obj dblk[AC4_OAMD_NB][17], ublk[AC4_OAMD_NB][65];
+} ac4_ajoc_frame;
 void ac4_obj_init(ac4_obj *o);
 void ac4_oamd_common_data(ac4_bits *b);
 /* the rest of audio_data_ajoc after the downmix's A-SPX blocks; bk: the
-   twelve AC4T_AJOC_BOOKS. Raises through b->jb. */
+   twelve AC4T_AJOC_BOOKS; fr: this frame's data out. Raises through
+   b->jb. */
 void ac4_ajoc_tail(ac4_bits *b, const ac4_huff *bk, const ac4_toc_sub *info,
-                   int ifr, ac4_obj_state *st);
+                   int ifr, ac4_obj_state *st, ac4_ajoc_frame *fr);
+/* ajoc.input_order (Pseudocode 14a) -> pos[0 .. n_fb) */
+void ac4_ajoc_input_order(int n_fb, int *pos);
+
+/* one decorrelator instance of TS 103 190-1 5.7.7.4 with its ducker
+   (acpl.c; the A-JOC tool's seven) */
+typedef struct {
+    double xr[14][64], xi[14][64], yr[7][64], yi[7][64];
+    double peak[15], smooth[15], spd[15];
+} ac4_decorr;
+/* Pseudocodes 111 - 114 with the coefficients of decorrelator cd on n
+   slots: the input in vr/vi[14 .. 14 + n), the output in ur/ui[7 ..
+   7 + n) (both scratch arrays with room for the history) */
+void ac4_decorr_run(ac4_decorr *s, int cd, int n, double (*vr)[64],
+                    double (*vi)[64], double (*ur)[64], double (*ui)[64]);
+
+/* objrender.matrix: objects of types[0 .. n) (RN_* of a bed channel,
+   RN_LFE, AC4_OBJ_DYN / _ISF) with states st (NULL: unknown) on layout
+   lay -> M (layout channels x n, row-major) */
+void ac4_obj_matrix(const signed char *types, const ac4_obj *st, int n,
+                    int lay, double *M);
+
+/* A-JOC full decoding (ajoc.c; decoder.AjocFull) */
+typedef struct ac4_ajoc_full ac4_ajoc_full;
+ac4_ajoc_full *ac4_ajoc_full_new(const ac4_toc_sub *info, int lay);
+void ac4_ajoc_full_free(ac4_ajoc_full *a);
+void ac4_ajoc_full_reset(ac4_ajoc_full *a);
+/* one output frame of nts slots: x re / im [input][slot] (NULL rows: a
+   silent input) in A-JOC input order; fr: the frame's data (NULL: none
+   or concealed); lfe: the LFE track (577 late) or NULL; -> out[layout
+   channel][nts * 64] */
+void ac4_ajoc_full_frame(ac4_ajoc_full *a, const ac4_qmf_tables *q,
+                         const double (*const xr[AC4_AJOC_ND])[64],
+                         const double (*const xi[AC4_AJOC_ND])[64],
+                         int nts, int tso, const ac4_ajoc_frame *fr,
+                         const double *lfe, double (*out)[2048]);
+int ac4_ajoc_full_n_in(const ac4_ajoc_full *a);
+const int *ac4_ajoc_full_in_pos(const ac4_ajoc_full *a);
+void ac4_qmf_synth(const ac4_qmf_tables *q, double *filt, const double *re,
+                   const double *im, double *out);
 
 /* ------------------------------------------------------------ render.c
  * Rendering to an output layout (ac4/render.py). Channel ids: */
@@ -938,6 +1024,12 @@ const int *ac4_layout_ids(int layout);
    or NULL) */
 void ac4_render_matrix(const int *ids, int n_in, int layout,
                        const ac4_cdmx *c, double *R);
+/* the same with the stereo downmix dmx (0 LoRo, 1 LtRt, 2 PLII, 3 the
+   stream's preferred_dmx_method; render.matrix's dmx) */
+void ac4_render_matrix_dmx(const int *ids, int n_in, int layout,
+                           const ac4_cdmx *c, int dmx, double *R);
+/* render.stereo_method: -> 0 LoRo, 1 LtRt, 2 PLII */
+int ac4_stereo_method(int dmx, const ac4_cdmx *c);
 void ac4_cdmx_hold(ac4_cdmx *held, const ac4_cdmx *c);
 /* objrender.gains: one object at room position (x, y, z) on the layout
    channels ids[0 .. n) (RN_*; LFE and negative ids get 0) -> g[0 .. n) */

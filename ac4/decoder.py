@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import aspx_bands as A
 from . import aspx_render as R37
 from . import filterbank as FB
 from . import rates as RT
@@ -140,7 +141,8 @@ class Decoder:
     def __init__(self, element="5_X", channels=None, burst_limit=None,
                  guard=True, presentation=None, language=None,
                  target_level=None, drc="auto", ch_mode=None, de_level=0.0,
-                 substream=0, present=None, layout=None, ajoc_info=None):
+                 substream=0, present=None, layout=None, ajoc_info=None,
+                 ajoc_core=False, stereo_dmx="loro"):
         """The frame length follows the stream (TS 103 190-1 Table 83):
         `frame` is FRAME (1536) until the first frame whose rate the
         decoder takes (see Ac4Stream), then that frame_len_base; out_rate
@@ -195,12 +197,18 @@ class Decoder:
         self.dchans = self.chans
         self.renderer = None
         self.obj_renderer = None
-        if element == "ajoc":
+        self.ajoc_full = None
+        if element == "ajoc" and not ajoc_core:
+            # full decoding (TS 103 190-2 5.7): the upmix objects
+            # reconstructed and rendered in the QMF domain (AjocFull)
+            self.ajoc_full = AjocFull(self.ichans, ajoc_info, layout)
+            self.dchans = self.chans = self.ajoc_full.out
+        elif element == "ajoc":
             self.obj_renderer = ObjectRenderer(self.dchans, ajoc_info, layout)
             self.chans = self.obj_renderer.out
         elif layout is not None:
             from .render import Renderer
-            self.renderer = Renderer(self.dchans, layout)
+            self.renderer = Renderer(self.dchans, layout, stereo_dmx)
             self.chans = self.renderer.out
         self.burst_limit = (BURST_LIMIT if burst_limit is None
                             else float(burst_limit))
@@ -286,6 +294,8 @@ class Decoder:
         self.t_hold = {k: None for k in self.t_hold}
         self.acpl_state = [None]
         self.ice_acpl_state = {"sr": [None], "xr": [None]}
+        if self.ajoc_full is not None:
+            self.ajoc_full.reset()
         if self.guard is not None:
             self.guard.frame = fl
 
@@ -500,6 +510,9 @@ class Decoder:
                 return None
             return dict(frames=de_frames, level=self.de_level, pair=pair)
         lead_acpl0 = list(self.lead_acpl)
+        qmf_out = {} if self.ajoc_full is not None else None
+        qmf = {}
+        bad_all = np.zeros(len(frames) + 1, dtype=bool)
         for (ka, kb), gkey in self.pairs:
             # the centre (aspx_data_1ch) goes through the pair renderer as
             # the same channel twice: with balance 0 each half is decoded
@@ -544,8 +557,16 @@ class Decoder:
                                      if up else None),
                         acpl_log=alog if up else None,
                         frame_len=FRAME, t_start=self.t_hold[gkey],
-                        acpl_1ch=a1ch, de=de_arg(gkey, up))
+                        acpl_1ch=a1ch, de=de_arg(gkey, up),
+                        qmf_out=qmf_out)
+                    if qmf_out is not None:
+                        # the pair's A-SPX output in the QMF domain, this
+                        # pass's slots (A-JOC full decoding)
+                        ns_ = len(pcm[ka]) // 64
+                        qmf[ka] = qmf_out.pop("L")[:, -ns_:]
+                        qmf[kb] = qmf_out.pop("R")[:, -ns_:]
                     bad = np.zeros(len(gl) + 1, dtype=bool)
+                    n_bad_or = bad
                     pcm[ka], pcm[kb], nb_, self.hf_hot[gkey] = \
                         core_for_bursts(hf["L"][lead:], hf["R"][lead:],
                                         pa, pb, lead, self.burst_limit,
@@ -564,6 +585,8 @@ class Decoder:
                             pcm[k_] = np.where(keep, hf[h_][lead:lead + n],
                                                pcm[k_])
                     via_qmf |= {ka, kb}
+                    if qmf_out is not None:
+                        bad_all[:len(n_bad_or)] |= n_bad_or
                     if up:
                         # the channels of the upmix; a frame whose
                         # A-SPX output the checks above replaced by its
@@ -630,6 +653,13 @@ class Decoder:
             # the core of the last LEAD frames (ASPX_ACPL_1 residuals)
             self.lead_core[k] = np.concatenate(
                 [self.lead_core.get(k, np.zeros(0)), core[k]])[-LEAD * FRAME:]
+        if self.ajoc_full is not None:
+            n = len(next(iter(pcm.values())))
+            y = self.ajoc_full.process(qmf, pcm.get("lfe"), n,
+                                       grp.get("obj") or [], FRAME,
+                                       A.geometry(FRAME))
+            y[np.repeat(bad_all[:len(frames)], FRAME)[:n]] = 0.0
+            return y
         if ice:
             # Pseudocode 2: z0, z2, z4 = 2 x (L, R, C); the core decoding
             # mode's gain 2 (4.8.3.14) where there is no upmix
@@ -641,10 +671,14 @@ class Decoder:
 
 class ObjectRenderer:
     """The downmix objects of an A-JOC substream (core decoding) to a
-    layout: bed objects routed as channels (render.matrix), dynamic
-    objects panned from their OAMD (objrender.py, not Dolby's renderer),
-    the LFE to the LFE; per frame with the metadata of its last block,
-    held through frames without (concealed ones)."""
+    layout: bed objects routed as channels, dynamic objects panned from
+    their OAMD (objrender.matrix, not Dolby's renderer), the LFE to the
+    LFE; each block update of the OAMD at its update sample with its
+    ramp (objrender.SampleRamp), held through frames without
+    (concealed ones).
+
+    The downmix objects are in A-JOC input order (Pseudocode 14a; the
+    LFE first): slot j of the decoded tracks is object slot_obj[j]."""
 
     def __init__(self, slots, info, layout):
         from .render import LAYOUTS
@@ -652,50 +686,176 @@ class ObjectRenderer:
         self.info = info
         self.layout = layout
         self.out = LAYOUTS[layout]
-        self.objs = None
+        self.ramp = None
+        lfe = bool(info["b_lfe"])
+        self.types = (["lfe"] if lfe else []) + list(info["dmx_types"])
+        self.slot_obj = list(range(len(self.slots)))
+        if not info["static"]:
+            from . import ajoc as AJ
+            order = AJ.input_order(info["n_dmx"])
+            for i, pos in enumerate(order):
+                self.slot_obj[pos + lfe] = i + lfe
 
-    def _matrix(self):
-        import math
+    def _matrix(self, objs):
         from . import objrender as OR
         from . import render as RD
-        info = self.info
-        M = np.zeros((len(self.out), len(self.slots)))
-        lfe = bool(info["b_lfe"])
-        if info["static"]:
+        if self.info["static"]:
             # 5.0 / 5.1 bed: channels
             return RD.matrix(self.slots, self.layout)
-        types = (["lfe"] if lfe else []) + list(info["dmx_types"])
-        for j, k in enumerate(self.slots):
-            t = types[j] if j < len(types) else "DYN"
-            st = self.objs[j] if self.objs and j < len(self.objs) else None
-            gdb = st.gain if st is not None else 0.0
-            if st is not None and not st.active:
-                gdb = -math.inf
-            g = 0.0 if gdb == -math.inf else 10.0 ** (gdb / 20.0)
-            if t == "lfe":
-                if "lfe" in self.out:
-                    M[self.out.index("lfe"), j] = g
-            elif t in ("DYN", "ISF"):
-                pos = st.position() if st is not None else (0.5, 0.0, 0.0)
-                M[:, j] = g * OR.gains(pos, self.out)
-            else:
-                M[:, j] = g * RD.matrix((t,), self.layout)[:, 0]
-        return M
+        types = [self.types[k] if k < len(self.types) else "DYN"
+                 for k in self.slot_obj]
+        states = (None if objs is None else
+                  [objs[k] if k < len(objs) else None
+                   for k in self.slot_obj])
+        return OR.matrix(types, states, self.out, self.layout)
 
     def process(self, y, objs, frame):
+        from . import objrender as OR
         out = np.zeros((len(y), len(self.out)))
         n_f = (len(y) + frame - 1) // frame
-        R = None
+        if self.ramp is None:
+            self.ramp = OR.SampleRamp()
+            self.ramp.event(self._matrix(None), 0)
         for f in range(n_f):
             o = objs[f] if f < len(objs) else None
-            if isinstance(o, dict):
-                self.objs = o.get("dmx")
-                R = None
-            if R is None:
-                R = self._matrix()
-            s = slice(f * frame, (f + 1) * frame)
-            out[s] = y[s] @ R.T
+            ev = []
+            if isinstance(o, dict) and not self.info["static"]:
+                blks = o.get("dmx_blocks")
+                upd = o.get("dmx_upd") or []
+                if blks:
+                    for (smp, rmp), st in zip(upd, blks):
+                        ev.append((min(max(smp, 0), frame), rmp, st))
+                else:
+                    ev.append((0, 0, o.get("dmx")))
+            ev.sort(key=lambda e: e[0])
+            p0 = f * frame
+            p1 = min(len(y), p0 + frame)
+            pos = p0
+            for smp, rmp, st in ev:
+                at = min(p0 + smp, p1)
+                if at > pos:
+                    out[pos:at] = self.ramp.apply(y[pos:at])
+                    pos = at
+                self.ramp.event(self._matrix(st), rmp)
+            if p1 > pos:
+                out[pos:p1] = self.ramp.apply(y[pos:p1])
         return out
+
+
+class AjocFull:
+    """A-JOC full decoding (TS 103 190-2 5.7, ajoc.Engine) and the
+    rendering of the upmix objects in the QMF domain, then QMF synthesis
+    of the layout's channels.
+
+    process(qmf, lfe, n, objs, frame, geo): qmf {slot name: (64, n_slots)}
+    the A-SPX output of this pass's downmix tracks; lfe the LFE track
+    (time domain, through the decoder's delay line) or None; objs the
+    frames' ajoc_tail dicts (None: no A-JOC data, CONCEALED: hold).
+    Frame f's A-JOC data points and OAMD block updates act from slot
+    nts f + ts_offset (the A-CPL frame start); an OAMD block update at
+    sample s from slot + s // 64, its ramp_duration in slots rounded up
+    (objrender's timing in the QMF domain). The upmix objects' OAMD
+    (the second portion, 4.8.3.4.2) renders them (objrender.matrix); the
+    LFE object takes the upmix LFE object's gain per slot."""
+
+    def __init__(self, slots, info, layout):
+        from . import ajoc as AJ
+        from .render import LAYOUTS
+        self.info = info
+        self.layout = layout or "5.1"
+        self.out = LAYOUTS[self.layout]
+        self.lfe = bool(info["b_lfe"])
+        n_fb = info["n_dmx"]
+        if info["static"]:
+            self.in_slots = ("L", "R", "C", "Ls", "Rs")
+        else:
+            from . import elements as EL
+            vs = EL.VAR_SLOTS[n_fb]
+            self.in_slots = tuple(vs[p] for p in AJ.input_order(n_fb))
+        self.types = (["lfe"] if self.lfe else []) + list(info["umx_types"])
+        self.n_umx = info["n_upmix"]
+        self.reset()
+
+    def reset(self):
+        from . import ajoc as AJ
+        self.eng = AJ.Engine(len(self.in_slots), self.n_umx)
+        self.gain = AJ.Ramp((len(self.out), len(self.types)))
+        self.gain.event(self._matrix(None), 0)
+        self.gpend = []
+        self.syn_tail = np.zeros((len(self.out), 64, 10), complex)
+
+    def _matrix(self, states):
+        from . import objrender as OR
+        return OR.matrix(self.types, states, self.out, self.layout)
+
+    def process(self, qmf, lfe, n, objs, frame, geo):
+        from . import qmf as Q
+        from .robust import CONCEALED
+        nts, tso = geo["nts"], geo["ts_offset"]
+        ns = n // 64
+        X = np.zeros((len(self.in_slots), ns, 64), complex)
+        for i, k in enumerate(self.in_slots):
+            if k in qmf and qmf[k].shape[1] >= ns:
+                X[i] = qmf[k][:, :ns].T
+        base = self.eng.slot
+        Z = np.zeros((self.n_umx, ns, 64), complex)
+        cur = 0
+        starts = []
+        for f in range(len(objs)):
+            a = f * nts + tso
+            if a >= ns:
+                break
+            starts.append((a, objs[f]))
+        for a, o in starts + [(ns, None)]:
+            if a > cur:
+                Z[:, cur:a] = self.eng.run(X[:, cur:a])
+                cur = a
+            if isinstance(o, dict) and a < ns:
+                self._install(base + a, o)
+        # the rendering, slot by slot
+        lo = 1 if self.lfe else 0
+        Y = np.zeros((len(self.out), ns, 64), complex)
+        lfe_g = np.zeros((len(self.out), ns))
+        for ts in range(ns):
+            at = base + ts
+            for s_, M, r in self.gpend:
+                if s_ == at:
+                    self.gain.event(M, r)
+            G = self.gain.prev
+            for o in range(self.n_umx):
+                for c in range(len(self.out)):
+                    if G[c, lo + o] != 0.0:
+                        Y[c, ts] = Y[c, ts] + G[c, lo + o] * Z[o, ts]
+            if self.lfe:
+                lfe_g[:, ts] = G[:, 0]
+            self.gain.step()
+        self.gpend = [e for e in self.gpend if e[0] >= base + ns]
+        y = np.zeros((n, len(self.out)))
+        w = Q.qwin()
+        N = Q.synthesis_matrix(255)
+        for c in range(len(self.out)):
+            q = np.concatenate([self.syn_tail[c], Y[c].T], axis=1)
+            y[:ns * 64, c] = Q.synthesise(q, w, N)[640:]
+            self.syn_tail[c] = q[:, -10:]
+            if self.lfe and lfe is not None:
+                y[:ns * 64, c] += np.repeat(lfe_g[c], 64) * lfe[:ns * 64]
+        return y
+
+    def _install(self, slot, o):
+        from . import ajoc as AJ
+        side = o["side"]
+        t = AJ.frame_targets(side, o["q"], len(self.in_slots), self.n_umx)
+        self.eng.frame(slot, t, side["num_decorr"], side["decorr_enable"])
+        blks = o.get("umx_blocks")
+        upd = o.get("umx_upd") or []
+        ev = []
+        if blks:
+            for (smp, rmp), st in zip(upd, blks):
+                ev.append((slot + max(0, smp) // 64, self._matrix(st),
+                           (rmp + 63) // 64))
+        else:
+            ev.append((slot, self._matrix(o.get("umx")), 0))
+        self.gpend.extend(ev)
 
 
 def probe_ajoc_info(frames, limit=64, presentation=None, language=None,
@@ -805,7 +965,8 @@ def probe_element(frames, limit=64, presentation=None, language=None,
 
 def decode(frames, element=None, channels=None, max_pass=1800,
            presentation=None, language=None, target_level=None, drc="auto",
-           de_level=0.0, mix=True, layout=None):
+           de_level=0.0, mix=True, layout=None, ajoc_core=False,
+           stereo_dmx="loro"):
     """Batch convenience: -> (pcm float64 (n, ch) at the external rate,
     Decoder.out_rate (48 kHz, or 44,1 kHz for fs_index 0), decoder scale,
     Decoder). The resampler ratio is the stream's (Table 83: 1001/960,
@@ -813,7 +974,8 @@ def decode(frames, element=None, channels=None, max_pass=1800,
     streaming caller would. presentation / language: see toc.choose.
     A presentation with several channel-coded substreams (M&E + dialogue,
     main + associated) is decoded and mixed by mix.MixDecoder (mix=False:
-    its main substream only)."""
+    its main substream only). ajoc_core: an A-JOC substream in core
+    decoding mode (the downmix objects) instead of full decoding."""
     from .resample import StreamResampler
     element = element or probe_element(frames, presentation=presentation,
                                        language=language)
@@ -839,12 +1001,14 @@ def decode(frames, element=None, channels=None, max_pass=1800,
         if len(subs) > 1:
             dec = MX.MixDecoder(subs, channels, presentation=presentation,
                                 language=language, target_level=target_level,
-                                drc=drc, de_level=de_level, layout=layout)
+                                drc=drc, de_level=de_level, layout=layout,
+                                stereo_dmx=stereo_dmx)
     if dec is None:
         dec = Decoder(element, channels, presentation=presentation,
                       language=language, target_level=target_level, drc=drc,
                       ch_mode=ch_mode, de_level=de_level, present=present,
-                      layout=layout, ajoc_info=ajoc_info)
+                      layout=layout, ajoc_info=ajoc_info,
+                      ajoc_core=ajoc_core, stereo_dmx=stereo_dmx)
     rs = StreamResampler(up, down)
     out = []
     for i in range(0, len(frames), max(1, max_pass)):

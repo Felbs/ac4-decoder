@@ -153,7 +153,8 @@ class MixDecoder:
 
     def __init__(self, subs, channels=None, guard=True, presentation=None,
                  language=None, target_level=None, drc="auto", de_level=0.0,
-                 assoc_gain=0.0, dialog_gain=0.0, layout=None):
+                 assoc_gain=0.0, dialog_gain=0.0, layout=None,
+                 stereo_dmx="loro"):
         from . import robust as RB
         self.subs = list(subs)
         self.decs = []
@@ -178,7 +179,7 @@ class MixDecoder:
         self.renderer = None
         if layout is not None:
             from .render import Renderer
-            self.renderer = Renderer(self.dchans, layout)
+            self.renderer = Renderer(self.dchans, layout, stereo_dmx)
             self.chans = self.renderer.out
         self.element = self.decs[self.main].element
         self.target_level = target_level

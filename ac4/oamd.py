@@ -11,8 +11,11 @@ room-anchored position (x left 0 .. right 1, y front 0 .. back 1, z floor
 -1 .. ceiling 1; 6.3.9.8.4) and whether it is active.
 
 Timing (oamd_timing_data: sample_offset, block offsets, ramp durations;
-5.9) is parsed and reported, not applied: a renderer takes the last block
-of a frame for the whole frame (render.py / objrender.py)."""
+5.9): block_updates() gives each block update's update PCM sample
+(sample_offset + 32 x block_offset_factor, 5.9.2) and its ramp duration
+in samples (Tables 94, 95); oamd_dyndata_single / _multi can record the
+objects' states after every block (blocks_out) for a renderer that
+follows them (decoder.ObjectRenderer, objrender.Ramp; phase D)."""
 from __future__ import annotations
 
 import math
@@ -182,6 +185,28 @@ def headphone(b):
             b.u(1)
 
 
+# Table 95
+RAMP_TABLE = (32, 64, 128, 256, 320, 480, 1000, 1001, 1024, 1600, 1601,
+              1602, 1920, 2000, 2002, 2048)
+
+
+def block_updates(timing, n_blocks):
+    """-> [(update_sample, ramp_samples)] for n_blocks block updates
+    (5.9.2). timing: an oamd_timing_data dict, or None (none in force:
+    every block at sample 0 without a ramp)."""
+    out = []
+    for k in range(n_blocks):
+        if timing is None or k >= len(timing["blocks"]):
+            out.append((0 if timing is None else timing["sample_offset"],
+                        0))
+            continue
+        off, ramp = timing["blocks"][k]
+        if isinstance(ramp, tuple):
+            ramp = RAMP_TABLE[ramp[1]]
+        out.append((timing["sample_offset"] + 32 * off, ramp))
+    return out
+
+
 def oamd_timing_data(b):
     """6.2.8.2 -> dict(sample_offset, blocks=[(block_offset_factor,
     ramp_duration)]) (Tables 92, 93; ramp_duration_code 0 / 1 / 2: 0, 512,
@@ -326,17 +351,26 @@ def object_info_block(b, st, b_no_delta, b_dynamic_object):
         b.p += rest
 
 
+def _blocks_out(blocks_out, n_blocks, n):
+    if blocks_out is not None:
+        blocks_out[:] = [[None] * n for _ in range(n_blocks)]
+
+
 def oamd_dyndata_single(b, states, n_blocks, b_iframe, b_alternative,
-                        obj_type, b_lfe):
+                        obj_type, b_lfe, blocks_out=None):
     """6.2.8.3: n_blocks updates of every object (states: one ObjState
     per object). The alternative metadata of b_alternative is parsed and
-    dropped."""
+    dropped. blocks_out (a list): set to [block][object] copies of the
+    states after each block."""
     n = len(states)
+    _blocks_out(blocks_out, n_blocks, n)
     for i in range(n):
         dyn = obj_type[i] == DYN and not b_lfe[i]
         for blk in range(n_blocks):
             object_info_block(b, states[i], bool(b_iframe) and blk == 0,
                               dyn)
+            if blocks_out is not None:
+                blocks_out[blk][i] = states[i].copy()
     if b_alternative:
         b.u(1)                           # b_ducking_disabled
         c = b.u(2)
@@ -380,12 +414,18 @@ def oamd_dyndata_single(b, states, n_blocks, b_iframe, b_alternative,
 
 
 def oamd_dyndata_multi(b, states, n_blocks, b_iframe, obj_type, b_lfe,
-                       b_ajoc_coded):
-    """6.2.8.4."""
+                       b_ajoc_coded, blocks_out=None):
+    """6.2.8.4 (blocks_out as oamd_dyndata_single's)."""
+    _blocks_out(blocks_out, n_blocks, len(states))
     for i in range(len(states)):
         if b_ajoc_coded[i]:
+            if blocks_out is not None:
+                for blk in range(n_blocks):
+                    blocks_out[blk][i] = states[i].copy()
             continue
         dyn = obj_type[i] == DYN and not b_lfe[i]
         for blk in range(n_blocks):
             object_info_block(b, states[i], bool(b_iframe) and blk == 0,
                               dyn)
+            if blocks_out is not None:
+                blocks_out[blk][i] = states[i].copy()

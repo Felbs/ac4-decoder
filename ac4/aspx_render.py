@@ -188,7 +188,8 @@ def t_for(cfg, xover=0):
 
 def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
                   acpl_groups=None, acpl_state0=None, acpl_log=None,
-                  frame_len=1536, t_start=None, acpl_1ch=None, de=None):
+                  frame_len=1536, t_start=None, acpl_1ch=None, de=None,
+                  qmf_out=None):
     """Steps 2-5 for the L/R pair, JOINTLY.
 
     Three things run on from one frame to the next: the noise-table index
@@ -234,6 +235,9 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
     None or de.HOLD], level=dB, pair=names of the pair's two channels to
     enhance (("L", "R"), ("C", "C") or ()), up=True to enhance the
     upmix's L, R, C instead).
+
+    qmf_out (a dict): receives "L" and "R", the pair's output in the QMF
+    domain (64, n_slots) before synthesis (A-JOC full decoding).
     """
     geo = A.geometry(frame_len)
     NT, TIA, TSO, NATS = geo["nts"], geo["tia"], geo["ts_offset"], geo["nats"]
@@ -252,6 +256,8 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
         if acpl_groups is not None:
             out["up"] = _upmix(Qa["L"], Qa["R"], acpl_groups, acpl_state0,
                                acpl_log, w, geo, acpl_1ch, de)
+        if qmf_out is not None:
+            qmf_out.update(L=Qa["L"].copy(), R=Qa["R"].copy())
         for k in ("L", "R"):
             out[k] = Q.synthesise(Qa[k], w, Q.synthesis_matrix(255))
         _de_pair(Qa, de, geo, out, w)
@@ -469,6 +475,8 @@ def apply_hf_pair(pcmL, pcmR, groups, cfg, state0=None, state_log=None,
     if acpl_groups is not None:
         out["up"] = _upmix(Qh["L"], Qh["R"], acpl_groups, acpl_state0,
                            acpl_log, w, geo, acpl_1ch, de)
+    if qmf_out is not None:
+        qmf_out.update(L=Qh["L"].copy(), R=Qh["R"].copy())
     for k in ("L", "R"):
         out[k] = Q.synthesise(Qh[k], w, Q.synthesis_matrix(255))
     _de_pair(Qh, de, geo, out, w)

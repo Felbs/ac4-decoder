@@ -158,8 +158,23 @@ static void compose(double a[RN_N][RN_N], double b[RN_N][RN_N],
                         out[o][i] = out[o][i] + a[o][k] * b[k][i];
 }
 
+int ac4_stereo_method(int dmx, const ac4_cdmx *c)
+{
+    if (dmx != 3)
+        return dmx;
+    if (c && c->present && c->has_stereo)
+        return c->pref == 2 ? 1 : c->pref == 3 ? 2 : 0;
+    return 0;
+}
+
 void ac4_render_matrix(const int *ids, int n_in, int layout,
                        const ac4_cdmx *c, double *R)
+{
+    ac4_render_matrix_dmx(ids, n_in, layout, c, 0, R);
+}
+
+void ac4_render_matrix_dmx(const int *ids, int n_in, int layout,
+                           const ac4_cdmx *c, int dmx, double *R)
 {
     static const double DEF[AC4_CDMX_NG] = {
         -INFINITY, 0.0, -3.0, -3.0, -INFINITY, -3.0, -INFINITY, -INFINITY,
@@ -196,14 +211,34 @@ void ac4_render_matrix(const int *ids, int n_in, int layout,
     }
     if (layout == 1) {                   /* 2.0: LoRo of the 5.X.0 stage */
         double m2[RN_N][RN_N];
-        double cmg = dbg(c && c->has_stereo ? c->loro_c : -3.0);
-        double smg = dbg(c && c->has_stereo ? c->loro_s : -3.0);
-        double lmg = c && c->has_stereo && c->lfe_mixgain >= 0
+        int meth = ac4_stereo_method(dmx, c), st = c && c->has_stereo;
+        double cmg = dbg(st ? c->loro_c : -3.0);
+        double smg = dbg(st ? c->loro_s : -3.0);
+        double lmg = st && c->lfe_mixgain >= 0
                      ? dbg(5.5 - (double)c->lfe_mixgain) : 0.0;
+        if (meth != 0) {
+            /* LtRt gains: the LoRo ones without b_ltrt_mixinfo */
+            cmg = dbg(st ? (c->has_ltrt ? c->ltrt_c : c->loro_c) : -3.0);
+            smg = dbg(st ? (c->has_ltrt ? c->ltrt_s : c->loro_s) : -3.0);
+        }
         memset(m2, 0, sizeof(m2));
         if (ci == CI_10) {
             m2[RN_L][RN_C] = m3;
             m2[RN_R][RN_C] = m3;
+        } else if (meth != 0) {
+            /* Table 218, preferred_dmx_method 2 / 3 */
+            double a = smg, b_ = smg;
+            if (meth == 2) {
+                a = smg * dbg(1.8);
+                b_ = smg * dbg(-3.2);
+            }
+            m2[RN_L][RN_L] = m2[RN_R][RN_R] = 1.0;
+            m2[RN_L][RN_C] = m2[RN_R][RN_C] = cmg;
+            m2[RN_L][RN_LS] = -a;
+            m2[RN_L][RN_RS] = -b_;
+            m2[RN_R][RN_RS] = a;
+            m2[RN_R][RN_LS] = b_;
+            m2[RN_L][RN_LFE] = m2[RN_R][RN_LFE] = lmg;
         } else {
             m2[RN_L][RN_L] = m2[RN_R][RN_R] = 1.0;
             m2[RN_L][RN_C] = m2[RN_R][RN_C] = cmg;
@@ -241,7 +276,11 @@ void ac4_cdmx_hold(ac4_cdmx *held, const ac4_cdmx *c)
         held->has_stereo = 1;
         held->loro_c = c->loro_c;
         held->loro_s = c->loro_s;
+        held->has_ltrt = c->has_ltrt;
+        held->ltrt_c = c->ltrt_c;
+        held->ltrt_s = c->ltrt_s;
         held->lfe_mixgain = c->lfe_mixgain;
+        held->pref = c->pref;
     }
 }
 

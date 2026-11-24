@@ -400,7 +400,7 @@ def test_custom_dmx_data_bits():
     assert c["stereo"]["lfe_mixgain"] == 9
     assert MD.pres_modes_of([dict(channel_mode=12,
                                   b_4_back_channels_present=0,
-                                  top_channels_present=3)]) == (12, 12, 0,
+                                  top_channels_present=3)]) == (12, 6, 0,
                                                                 2, 1)
 
 
@@ -638,7 +638,11 @@ def _ajoc_toc(sub_len, seq, iframe, n_dmx, n_umx, lfe, static=False):
     w.u(1, iframe)                       # b_audio_ndot
     w.u(2, 1)                            # substream_index 1
     w.u(1, 0)                            # b_content_type
-    w.u(2, 2).u(1, 0).u(10, 2).u(1, 0).u(10, sub_len)
+    w.u(2, 2).u(1, 0).u(10, 2)
+    if sub_len < 1024:
+        w.u(1, 0).u(10, sub_len)
+    else:                                # b_more_bits
+        w.u(1, 1).u(10, sub_len & 1023).vb(2, sub_len >> 10)
     return w.bytes()
 
 
@@ -805,11 +809,11 @@ def test_ajoc_core_renders_objects():
     from ac4.decoder import decode
     rng = np.random.default_rng(81)
     frames, _ = _ajoc_frames(rng, n_dmx=3, n=6)
-    pcm, dec = decode(frames, max_pass=100)
+    pcm, dec = decode(frames, max_pass=100, ajoc_core=True)
     assert dec.n_concealed == 0 and dec.chans == ("L", "R", "C", "lfe",
                                                    "Ls", "Rs")
     # each object alone: zero the others' tracks through the renderer
-    R = dec.obj_renderer._matrix()
+    R = dec.obj_renderer.ramp.cur
     i = {k: n for n, k in enumerate(dec.dchans)}
     assert np.allclose(R[:, i["L"]], [1, 0, 0, 0, 0, 0])
     assert np.allclose(R[:, i["R"]], [0, 1, 0, 0, 0, 0])
@@ -827,7 +831,8 @@ def test_ajoc_core_aspx(n_dmx):
     rng = np.random.default_rng(100 + n_dmx)
     frames, _ = _ajoc_frames(rng, n_dmx=n_dmx, n=6, aspx=True)
     info = probe_ajoc_info(frames)
-    dec = Decoder("ajoc", guard=False, ajoc_info=info, layout="7.1.4")
+    dec = Decoder("ajoc", guard=False, ajoc_info=info, layout="7.1.4",
+                  ajoc_core=True)
     dec.hf_ratio = None
     y = dec.decode_pass(frames)
     assert dec.n_concealed == 0, dict(dec.concealed.reasons)
@@ -848,7 +853,7 @@ def test_ajoc_static_dmx():
     for i, exp in enumerate(exps):
         for k, ref in exp.items():
             assert np.allclose(np.asarray(wins[k][i]), ref), (i, k)
-    dec = Decoder("ajoc", guard=False, ajoc_info=info)
+    dec = Decoder("ajoc", guard=False, ajoc_info=info, ajoc_core=True)
     dec.hf_ratio = None
     y = dec.decode_pass(frames)
     d0 = Decoder("5_X", guard=False)
@@ -868,12 +873,13 @@ def _c_vs_python_ajoc(tmp_path, frames, layout):
     src.write_bytes(b"".join(syncframe(f) for f in frames))
     raw = tmp_path / "e.f64"
     args = [cli, str(src), str(tmp_path / "e.wav"), "--legacy-level",
-            "--f64", str(raw), "--internal", "--no-guard", "-q"]
+            "--f64", str(raw), "--internal", "--no-guard", "-q",
+            "--core-decoding"]
     if layout:
         args += ["--layout", layout]
     subprocess.run(args, check=True)
     dec = Decoder("ajoc", guard=False, ajoc_info=probe_ajoc_info(frames),
-                  layout=layout)
+                  layout=layout, ajoc_core=True)
     dec.hf_ratio = None
     ref = dec.decode_pass(frames)
     assert dec.n_concealed == 0
