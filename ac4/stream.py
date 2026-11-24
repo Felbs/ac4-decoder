@@ -536,8 +536,11 @@ class Ac4Stream:
                     got_acpl = None
                 if acpl1:
                     self.acpl1 = acpl1
-                self.meta.append(self._pres_metadata(f, st, pi, sel))
-                got_de = self._sub_metadata(sub, r, ifr, sel)
+                v0 = bool(st["presentations"][pi].get("v0"))
+                self.meta.append(self._v0_metadata(sub, r, sel) if v0
+                                 else self._pres_metadata(f, st, pi, sel))
+                got_de = self._sub_metadata(sub, r, ifr, sel,
+                                            sus_ver=0 if v0 else 1)
                 self.n_ok += 1
                 self.status.append(None)
                 self.seq_break.append(brk)
@@ -624,7 +627,23 @@ class Ac4Stream:
     # its metadata closes only when read as stereo)
     META_CH_MODE = {"mono": 0, "pair": 1, "3_0": 2, "5_0": 3, "5_X": 4}
 
-    def _sub_metadata(self, sub, r, ifr, sel):
+    def _v0_metadata(self, sub, r, sel):
+        """bitstream_version 0 / 1 (TS 103 190-2 4.8.5.2, Table 16):
+        dialnorm and truepk from the audio substream's basic_metadata
+        (sus_ver 0) -> dict like _pres_metadata's (no DRC: the sus_ver 0
+        drc_frame is not read), or None."""
+        from . import metadata as MDm
+        from .toc import Bits
+        try:
+            b = Bits(sub)
+            b.p = r["audio_start"] + 8 * r["audio_size"]
+            md = MDm.v0_loudness(b)
+        except Exception:                                      # noqa: BLE001
+            return None
+        return dict(dialnorm=md["dialnorm"], drc=None, truepk=md["truepk"],
+                    sg_gain=None, assoc=None)
+
+    def _sub_metadata(self, sub, r, ifr, sel, sus_ver=1):
         """The dialogue enhancement data of the audio substream's
         metadata() (TS 103 190-2 6.2.7; metadata.py) -> dict(config, par,
         ms), or None (none, or the metadata does not parse)."""
@@ -635,7 +654,8 @@ class Ac4Stream:
         try:
             md = MDm.substream_metadata(sub, r["audio_start"],
                                         r["audio_size"], cm, ifr,
-                                        self.sub_meta, no_emdf=True)
+                                        self.sub_meta, sus_ver=sus_ver,
+                                        no_emdf=True)
         except Exception:                                      # noqa: BLE001
             self.sub_meta.de_par_prev = None
             return None

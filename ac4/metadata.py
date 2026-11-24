@@ -459,6 +459,32 @@ def basic_metadata(b, ch_mode, sus_ver):
     return out
 
 
+def v0_loudness(b):
+    """The start of basic_metadata for sus_ver 0 (TS 103 190-1 4.2.14.2):
+    dialnorm and, when further_loudness_info follows, its truepk ->
+    dict (dialnorm, truepk or None). Reads no further."""
+    out = dict(dialnorm=-b.u(7) / 4.0, truepk=None)
+    if b.u(1) and b.u(1):            # b_more_basic, b_further_loudness_info
+        v = b.u(2)
+        if v == 3:
+            b.u(4)
+        if b.u(4) != 0:                          # loud_prac_type
+            if b.u(1):
+                b.u(3)
+            b.u(1)
+        if b.u(1):                               # loudrelgat
+            b.u(11)
+        if b.u(1):                               # loudspchgat
+            b.u(11)
+            b.u(3)
+        for _ in range(2):                       # loudstrm3s, max_
+            if b.u(1):
+                b.u(11)
+        if b.u(1):
+            out["truepk"] = lkfs(b.u(11))
+    return out
+
+
 def extended_metadata(b, ch_mode, sus_ver, b_associated=0):
     out = {}
     b_dialog = 0

@@ -428,6 +428,111 @@ static void substream_group_info(ac4_bits *b, int frf, ac4_toc *t,
         content_type(b, g);
 }
 
+/* ac4_substream_info (TS 103 190-1 Table 9; toc.substream_info_v0):
+   bitstream_version 0 / 1, one substream group of its own */
+static void substream_info_v0(ac4_bits *b, int frf, ac4_toc *t,
+                              ac4_toc_group *g)
+{
+    ac4_toc_sub *s = &g->subs[0];
+    long cm = ac4_toc_channel_mode(b);
+    int i;
+    memset(g, 0, sizeof(*g));
+    g->substreams_present = 1;
+    g->channel_coded = 1;
+    g->content_classifier = -1;
+    g->n_subs = 1;
+    g->n_subs_all = 1;
+    s->kind = 0;
+    s->channel_mode = cm;
+    if (t->n_cmodes < AC4_MAX_CMODES)
+        t->cmodes[t->n_cmodes] = cm;
+    if (t->n_cmodes < 1 << 30)
+        t->n_cmodes++;
+    s->sf_multiplier = -1;
+    if (t->fs_index == 1 && ac4_bit(b))         /* b_sf_multiplier */
+        s->sf_multiplier = (int)ac4_bit(b);
+    if (ac4_bit(b)) {                   /* b_bitrate_info */
+        if (ac4_u(b, 3) == 7)
+            ac4_u(b, 2);
+    }
+    if (cm >= 7 && cm <= 10)
+        ac4_bit(b);                     /* add_ch_base */
+    if (ac4_bit(b))                     /* b_content_type */
+        content_type(b, g);
+    for (i = 0; i < frf; i++) {
+        int v = (int)ac4_bit(b);        /* b_iframe */
+        if (i == 0)
+            s->ndot = v;
+    }
+    s->index = substream_index(b);
+}
+
+/* ac4_presentation_info (TS 103 190-1 Table 5; TS 103 190-2 6.2.1.2;
+   toc.presentation_info_v0) */
+static void presentation_info_v0(ac4_bits *b, int fri, int *frf_out,
+                                 int *multi, ac4_toc *t, ac4_toc_pres *p)
+{
+    static const int NSUB[6] = { 2, 2, 2, 3, 3, 1 };
+    int single = (int)ac4_bit(b), add_emdf;
+    uint64_t cfg = 0;
+    memset(p, 0, sizeof(*p));
+    p->config = -1;
+    p->presentation_id = -1;
+    p->pres_substream = -1;
+    p->enabled = 1;
+    p->md_compat = -1;
+    p->v0 = 1;
+    if (!single) {
+        cfg = ac4_u(b, 3);
+        if (cfg == 7)
+            cfg += ac4_vb(b, 2);
+        p->config = (int)(cfg > 1000 ? 1000 : cfg);
+    }
+    while (ac4_bit(b))                  /* presentation_version */
+        p->version++;
+    if (!single && cfg == 6) {
+        add_emdf = 1;
+    } else {
+        int frf, n, hsf = 0, i;
+        p->md_compat = (int)ac4_u(b, 3);
+        if (ac4_bit(b))                 /* b_presentation_id */
+            p->presentation_id = (long)ac4_vb(b, 2);
+        frf = frame_rate_multiply_info(b, fri);
+        *frf_out = frf;
+        if (frf != 1)
+            *multi = 1;
+        emdf_info(b);
+        n = single ? 1 : cfg <= 5 ? NSUB[cfg] : 0;
+        if (!single)
+            hsf = (int)ac4_bit(b);      /* b_hsf_ext */
+        if (!single && cfg > 5)
+            presentation_config_ext_info(b);
+        for (i = 0; i < n; i++) {
+            ac4_toc_group g;
+            substream_info_v0(b, frf, t, &g);
+            if (i == 0 && hsf) {
+                substream_index(b);     /* ac4_hsf_ext_substream_info */
+                g.hsf_ext = 1;
+            }
+            if (p->n_groups < AC4_MAX_PGROUPS)
+                p->groups[p->n_groups++] = t->n_groups_all;
+            if (t->n_groups < AC4_MAX_GROUPS)
+                t->groups[t->n_groups++] = g;
+            t->n_groups_all++;
+        }
+        p->n_sg = n;
+        ac4_bit(b);                     /* b_pre_virtualized */
+        add_emdf = (int)ac4_bit(b);
+    }
+    if (add_emdf) {
+        uint64_t n = ac4_u(b, 2), i;
+        if (n == 0)
+            n = ac4_vb(b, 2) + 4;
+        for (i = 0; i < n; i++)
+            emdf_info(b);
+    }
+}
+
 void ac4_toc_parse(ac4_bits *b, ac4_toc *t)
 {
     uint64_t bv, n_pres, i, n_sub;
@@ -459,26 +564,36 @@ void ac4_toc_parse(ac4_bits *b, ac4_toc *t)
             pb += ac4_vb(b, 3);
         t->payload_base = (long)pb;
     }
-    if (bv <= 1)
-        ac4_fail(b, b->eof_code);
-    if (ac4_bit(b)) {                   /* b_program_id */
-        ac4_u(b, 16);
-        if (ac4_bit(b))                 /* b_program_uuid_present */
-            ac4_skip(b, 128);
-    }
-    for (i = 0; i < n_pres; i++) {
-        ac4_toc_pres p;
-        presentation_v1_info(b, fri, &frf, &t->rate_multi, &p, &max_group);
-        if (t->n_pres < AC4_MAX_PRES)
-            t->pres[t->n_pres++] = p;
-    }
-    /* total_n_substream_groups = 1 + max_group_index (6.3.2.1.8) */
-    t->n_groups_all = max_group + 1;
-    for (i = 0; i < (uint64_t)(max_group + 1); i++) {
-        ac4_toc_group g;
-        substream_group_info(b, frf, t, &g);
-        if (t->n_groups < AC4_MAX_GROUPS)
-            t->groups[t->n_groups++] = g;
+    if (bv <= 1) {
+        /* TS 103 190-1 4.2.3: ac4_presentation_info, substream infos
+           inline (toc.presentation_info_v0) */
+        for (i = 0; i < n_pres; i++) {
+            ac4_toc_pres p;
+            presentation_info_v0(b, fri, &frf, &t->rate_multi, t, &p);
+            if (t->n_pres < AC4_MAX_PRES)
+                t->pres[t->n_pres++] = p;
+        }
+    } else {
+        if (ac4_bit(b)) {               /* b_program_id */
+            ac4_u(b, 16);
+            if (ac4_bit(b))             /* b_program_uuid_present */
+                ac4_skip(b, 128);
+        }
+        for (i = 0; i < n_pres; i++) {
+            ac4_toc_pres p;
+            presentation_v1_info(b, fri, &frf, &t->rate_multi, &p,
+                                 &max_group);
+            if (t->n_pres < AC4_MAX_PRES)
+                t->pres[t->n_pres++] = p;
+        }
+        /* total_n_substream_groups = 1 + max_group_index (6.3.2.1.8) */
+        t->n_groups_all = max_group + 1;
+        for (i = 0; i < (uint64_t)(max_group + 1); i++) {
+            ac4_toc_group g;
+            substream_group_info(b, frf, t, &g);
+            if (t->n_groups < AC4_MAX_GROUPS)
+                t->groups[t->n_groups++] = g;
+        }
     }
     n_sub = ac4_u(b, 2);                /* substream_index_table */
     if (n_sub == 0)
@@ -503,6 +618,15 @@ void ac4_toc_parse(ac4_bits *b, ac4_toc *t)
     }
     ac4_align(b);
     t->toc_bytes = b->p / 8;
+    if (!size_present) {
+        /* one substream without a size: the rest of the frame */
+        double r = (double)(b->nbits / 8) - (double)t->toc_bytes
+                   - (double)t->payload_base;
+        t->sizes[0] = r > 0 ? (long)r : 0;
+        t->sizes_sum = (double)t->sizes[0];
+        t->sizes_min = t->sizes[0];
+        t->n_sizes = 1;
+    }
 }
 
 /* ------------------------------------------------------------ choice */

@@ -114,6 +114,52 @@ static void mix_metadata(ac4_bits *b, long n_groups, ac4_meta *m)
     }
 }
 
+int ac4_v0_metadata(const uint8_t *sub, size_t len, size_t bit,
+                    ac4_meta *out)
+{
+    /* metadata.v0_loudness: dialnorm and truepk at the start of a sus_ver
+       0 basic_metadata */
+    jmp_buf jb;
+    ac4_bits b;
+    ac4_meta m;
+    memset(out, 0, sizeof(*out));
+    memset(&m, 0, sizeof(m));
+    b.d = sub;
+    b.nbits = len * 8;
+    b.p = bit;
+    b.jb = &jb;
+    b.eof_code = AC4E_ELEMENT_PARSE;
+    if (bit > b.nbits || setjmp(jb) != 0)
+        return -1;
+    m.dialnorm = -(double)ac4_u(&b, 7) / 4.0;
+    if (ac4_bit(&b) && ac4_bit(&b)) {
+        int i;
+        if (ac4_u(&b, 2) == 3)
+            ac4_u(&b, 4);
+        if (ac4_u(&b, 4) != 0) {
+            if (ac4_bit(&b))
+                ac4_u(&b, 3);
+            ac4_bit(&b);
+        }
+        if (ac4_bit(&b))
+            ac4_u(&b, 11);
+        if (ac4_bit(&b)) {
+            ac4_u(&b, 11);
+            ac4_u(&b, 3);
+        }
+        for (i = 0; i < 2; i++)
+            if (ac4_bit(&b))
+                ac4_u(&b, 11);
+        if (ac4_bit(&b)) {
+            m.has_truepk = 1;
+            m.truepk = ((double)ac4_u(&b, 11) - 1024.0) / 10.0;
+        }
+    }
+    m.valid = 1;
+    *out = m;
+    return 0;
+}
+
 static void compression_curve(ac4_bits *b, ac4_drc_mode *m)
 {
     m->nb_low = (int)ac4_u(b, 4);

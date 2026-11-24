@@ -178,6 +178,8 @@ typedef struct {
     long pres_substream;   /* -1 when none */
     int b_alternative, b_pres_ndot;
     long n_sg;             /* n_substream_groups (toc.py) */
+    int v0;                /* from ac4_presentation_info (bitstream_version
+                              0 / 1): no presentation substream */
 } ac4_toc_pres;
 
 typedef struct {
@@ -852,6 +854,11 @@ int ac4_pres_metadata(const uint8_t *sub, size_t len, int b_alternative,
                       int b_pres_ndot, long n_substreams,
                       ac4_drc_config *state, const ac4_huff *hcb,
                       int ch_mode, int fl, long n_groups, ac4_meta *out);
+/* bitstream_version 0 / 1: dialnorm and truepk of the audio substream's
+   sus_ver 0 basic_metadata at bit `bit` (metadata.v0_loudness) -> 0, or
+   -1 when it does not parse */
+int ac4_v0_metadata(const uint8_t *sub, size_t len, size_t bit,
+                    ac4_meta *out);
 double ac4_curve_gain(double x, const double *pv);
 
 typedef struct {

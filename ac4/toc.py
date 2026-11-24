@@ -378,6 +378,95 @@ def substream_info_obj(b, present, frf, st):
     return s
 
 
+def substream_info_v0(b, frf, st):
+    """ac4_substream_info (TS 103 190-1 Table 9, bitstream_version 0 / 1)
+    -> (substream dict as substream_info_chan's, content_classifier,
+    language). These substreams are channel-coded and always carry their
+    substream_index; b_iframe takes the place of b_audio_ndot."""
+    cm = channel_mode(b)
+    st["channel_modes"].append(cm)
+    s = dict(kind="chan", channel_mode=cm, sf_multiplier=None)
+    if st["fs_index"] == 1:
+        if b.u(1):                        # b_sf_multiplier
+            s["sf_multiplier"] = b.u(1)
+    if b.u(1):                            # b_bitrate_info
+        if b.u(3) == 0b111:
+            b.u(2)
+    if cm in CH_MODES_WITH_ADD_CH_BASE:
+        s["add_ch_base"] = b.u(1)
+    cc, lang = (content_type(b) if b.u(1) else (None, None))
+    s["ndot"] = []
+    for _ in range(frf):
+        st["ndot_bits"].append(b.p)
+        s["ndot"].append(b.u(1))          # b_iframe
+    s["index"] = substream_index(b)
+    st["n_lf_substreams"] += 1
+    st["channel_coded"] += 1
+    return s, cc, lang
+
+
+# substream infos per presentation_config (TS 103 190-1 Table 5)
+V0_N_SUBSTREAMS = {0: 2, 1: 2, 2: 2, 3: 3, 4: 3, 5: 1}
+
+
+def presentation_info_v0(b, fri, st, groups):
+    """ac4_presentation_info (TS 103 190-1 Table 5; TS 103 190-2 6.2.1.2),
+    bitstream_version 0 and 1 -> the dict presentation_v1_info gives. Each
+    ac4_substream_info becomes a substream group of its own (appended to
+    `groups`), with that substream's content type; there is no
+    presentation substream (the metadata is in the audio substreams).
+    presentation_config 7 (bitstream_version 1: an ac4_presentation_v1_info
+    inside presentation_config_ext_info) is skipped: no substreams."""
+    single = b.u(1)                       # b_single_substream
+    cfg = 0
+    if not single:
+        cfg = b.u(3)
+        if cfg == 7:
+            cfg += b.vb(2)
+    ver = 0
+    while b.u(1):                         # presentation_version, unary
+        ver += 1
+    p = dict(config=None if single else cfg, version=ver, md_compat=None,
+             presentation_id=None, frame_rate_factor=1,
+             frame_rate_fraction=1, enabled=True, groups=[],
+             n_substream_groups=0, multi_pid=0, pre_virtualized=0,
+             pres_substream=None, b_alternative=0, b_pres_ndot=0,
+             emdf=[], v0=True)
+    if (not single) and cfg == 6:
+        add_emdf = 1
+    else:
+        p["md_compat"] = b.u(3)
+        if b.u(1):                        # b_presentation_id
+            p["presentation_id"] = b.vb(2)
+        frf = frame_rate_multiply_info(b, fri, st)
+        p["frame_rate_factor"] = frf
+        p["emdf"].append(emdf_info(b, st))
+        n = 1 if single else V0_N_SUBSTREAMS.get(cfg, 0)
+        hsf = 0 if single else b.u(1)    # b_hsf_ext
+        if not single and cfg not in V0_N_SUBSTREAMS:
+            presentation_config_ext_info(b, st)
+        for i in range(n):
+            s, cc, lang = substream_info_v0(b, frf, st)
+            if i == 0 and hsf:
+                s["hsf_index"] = substream_index(b)
+            p["groups"].append(len(groups))
+            groups.append(dict(substreams_present=1, hsf_ext=int(
+                i == 0 and hsf), substreams=[s], channel_coded=1,
+                oamd=None, content_classifier=cc, language=lang))
+        p["n_substream_groups"] = n
+        p["pre_virtualized"] = b.u(1)
+        add_emdf = b.u(1)
+    if add_emdf:
+        n = b.u(2)
+        if n == 0:
+            n = b.vb(2) + 4
+        for _ in range(n):
+            p["emdf"].append(emdf_info(b, st))
+    st["presentation_config"] = cfg
+    st["single_group"] = single
+    return p
+
+
 def hsf_ext_substream_info(b, present):
     return substream_index(b) if present else None
 
@@ -462,7 +551,13 @@ def parse(frame):
             pb += b.vb(3)
         st["payload_base"] = pb
     if bv <= 1:
-        raise ValueError("this module is for bitstream_version >= 2")
+        # TS 103 190-1 4.2.3 (bitstream_version 0; 1: TS 103 190-2
+        # 6.2.1.2): ac4_presentation_info, substream infos inline
+        groups = []
+        pres = [presentation_info_v0(b, fri, st, groups)
+                for _ in range(n_pres)]
+        st["total_n_substream_groups"] = len(groups)
+        return _index_table(b, st, pres, groups)
     if b.u(1):                            # b_program_id
         st["short_program_id"] = b.u(16)
         if b.u(1):                        # b_program_uuid_present
@@ -472,6 +567,12 @@ def parse(frame):
     total_sg = 1 + max((g for p in pres for g in p["groups"]), default=-1)
     st["total_n_substream_groups"] = total_sg
     groups = [substream_group_info(b, st) for _ in range(total_sg)]
+    return _index_table(b, st, pres, groups)
+
+
+def _index_table(b, st, pres, groups):
+    """substream_index_table (TS 103 190-1 4.2.3.11) and the rest of
+    ac4_toc()."""
     n_sub = b.u(2)                        # substream_index_table
     if n_sub == 0:
         n_sub = b.vb(2) + 4
@@ -486,8 +587,13 @@ def parse(frame):
             sizes.append(s)
     b.align()
     st["n_substreams"] = n_sub
-    st["substream_sizes"] = sizes
     st["toc_bytes"] = b.p // 8
+    if not size_present:
+        # one substream without a size: the rest of the frame
+        sizes = [max(0, len(b.d) - st["toc_bytes"]
+                     - st.get("payload_base", 0))]
+        st["size_implicit"] = 1
+    st["substream_sizes"] = sizes
     st["presentations"] = pres
     st["groups"] = groups
     return st

@@ -267,6 +267,8 @@ struct ac4dec {
     /* ---- stats */
     long n_frames, n_out, n_ok, n_concealed, n_bad, n_seq_jumps;
     long n_guard, n_aspx_level, n_burst, n_late;
+    int v0;                     /* the frame's presentation is
+                                   bitstream_version 0 / 1 */
     /* ---- mixing (mix.py): the other substreams' decoders */
     int mix_decided, n_kid, mix_n, mix_version;
     ac4dec *kid[AC4_MIX_MAX - 1];
@@ -1213,7 +1215,8 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         code = AC4E_TOC_SEQ_RANGE;
         goto fail;
     }
-    if (t.n_sizes < 2 || (long)t.n_sizes != t.n_substreams
+    if (t.n_sizes < (t.bitstream_version >= 2 ? 2 : 1)
+        || (long)t.n_sizes != t.n_substreams
         || (double)t.toc_bytes + (double)t.payload_base + t.sizes_sum
            > (double)len || t.sizes_min < 1) {
         code = AC4E_TOC_SIZES;
@@ -1527,7 +1530,14 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         const ac4_toc_pres *pp = pi >= 0 && pi < t.n_pres ? &t.pres[pi]
                                                           : NULL;
         r->meta.valid = 0;
-        if (pp && s && pp->pres_substream >= 0
+        d->v0 = pp && pp->v0;
+        if (pp && s && pp->v0) {
+            /* bitstream_version 0 / 1 (stream._v0_metadata) */
+            if (ac4_v0_metadata(sub, sub_len,
+                                e->audio_start + 8 * e->audio_size,
+                                &r->meta) != 0)
+                r->meta.valid = 0;
+        } else if (pp && s && pp->pres_substream >= 0
             && pp->pres_substream < t.n_substreams
             && pp->pres_substream < t.n_sizes) {
             size_t po = t.toc_bytes + (size_t)t.payload_base, pl;
@@ -1551,7 +1561,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
        (stream.py _sub_metadata), read with the coded element's channel
        mode */
     r->de.kind = AC4_DE_NONE;
-    if (d->cfg.de_level != 0.0) {
+    if (d->cfg.de_level != 0.0 && !d->v0) {
         static const int CM[7] = { 4, 4, 1, 0, 2, 3, 6 };
         int cm = d->element == AC4DEC_ELEMENT_7X ? d->ch_mode
                                                  : CM[d->element];

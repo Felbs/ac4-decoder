@@ -19,7 +19,9 @@ TABLE OF CONTENTS (TS 103 190-1 4.2.3, -2 6.2.1)
                   frame_rate_fraction > 1, 96/192 kHz substreams)
   toc.shape       presentation/substream layout (channel modes, number of
                   substreams) differs from the stream's
-  toc.sizes       the substream size list does not match n_substreams, or
+  toc.sizes       the substream size list does not match n_substreams
+                  (bitstream_version 2: at least two substreams, the
+                  presentation substream and an audio one), or
                   the substreams do not fit in the frame:
                   toc + payload_base + sum(substream_size) > frame length,
                   or a substream of size 0. (Equality does not hold on air:
@@ -247,7 +249,10 @@ def check_toc(st, frame, ref_shape):
     if st["sequence_counter"] > 1020:
         raise Damaged("toc.seq_range", str(st["sequence_counter"]))
     sizes = st.get("substream_sizes") or []
-    if len(sizes) < 2 or len(sizes) != st.get("n_substreams"):
+    # bitstream_version 2: a presentation substream and an audio one at
+    # least; 0 / 1 (no presentation substream): one
+    least = 2 if st.get("bitstream_version", 2) >= 2 else 1
+    if len(sizes) < least or len(sizes) != st.get("n_substreams"):
         raise Damaged("toc.sizes", f"substream sizes {sizes}")
     total = st["toc_bytes"] + st.get("payload_base", 0) + sum(sizes)
     if total > len(frame) or min(sizes) < 1:
