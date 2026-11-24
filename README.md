@@ -32,9 +32,9 @@ this repository.
 
 | | |
 |---|---|
-| Bitstream | version 2, channel-coded; every frame rate of TS 103 190-1 Table 83 at 48 kHz (frame lengths 2048 .. 384, internal rate resampled by the table's ratio) and 44,1 kHz (Table 84, index 13). frame_rate_factor / frame_rate_fraction above 1 and 96/192 kHz substreams are concealed (`toc.unsupported_rate`), not misdecoded. Checked on air at 29.97 fps and on public test streams at 25 and 29.97 fps; the other rates on synthetic streams only (unverified on real streams) |
+| Bitstream | version 2, channel-coded (versions 0 and 1, whose table of contents is TS 103 190-1's `ac4_presentation_info()`: on synthetic streams only, unverified on real streams); every frame rate of TS 103 190-1 Table 83 at 48 kHz (frame lengths 2048 .. 384, internal rate resampled by the table's ratio) and 44,1 kHz (Table 84, index 13). frame_rate_factor / frame_rate_fraction above 1 and 96/192 kHz substreams are concealed (`toc.unsupported_rate`), not misdecoded. Checked on air at 29.97 fps and on public test streams at 25 and 29.97 fps; the other rates on synthetic streams only (unverified on real streams) |
 | Input | detected from the content: MP4 (fragmented: init segment + `moof`/`mdat` fragments, or bare fragments; or non-fragmented, from the sample table), AC-4 sync frames (TS 103 190-1 Annex G, CRC checked, ID3 tags skipped), MPEG-2 TS (ETSI TS 101 154). The `dac4` box is parsed (`--list`) |
-| Presentations | the table of contents is parsed in full (presentations, substream groups, substream indices, content type and language, object/A-JOC substream info); the decoded presentation is chosen per TS 103 190-2 4.8.2 (see Interpretations), or with `--presentation N`, `id:N`, `--language`; its audio substream is located by its `substream_index`, and is an I-frame when its own `b_audio_ndot` says so |
+| Presentations | the table of contents is parsed in full (presentations, substream groups, substream indices, content type and language, object/A-JOC substream info); the decoded presentation is chosen per TS 103 190-2 4.8.2 (see Interpretations), or with `--presentation N`, `id:N`, `--language`; its audio substream is located by its `substream_index`, and is an I-frame when its own `b_audio_ndot` says so. A presentation with several channel-coded substreams (music and effects + dialogue, main + associated audio) is decoded substream by substream and mixed (TS 103 190-2 4.8.4, `ac4/mix.py`; `--no-mix` decodes the main one only): on synthetic streams only, unverified on real streams. The captures' and kit's second substream is in every case the presentation substream (metadata), not audio |
 | 5.1 (`5_X` channel element) | codec mode 1 (A-SPX), coding_config 0: all six channels (both broadcasters). Codec mode 3 (ASPX_ACPL_2): all six channels, Ls/Rs from the one-channel A-CPL of L/R (the public 5.1 test streams). Codec mode 4 (ASPX_ACPL_3): all six channels, L/R/C/Ls/Rs from the A-CPL upmix of the two-channel core, the LFE from its own data (see A-CPL below). On synthetic streams only (unverified on real streams): codec mode 0 (SIMPLE); coding_config 0 with 2ch_mode 1 and coding_config 1 - 3 (three, four and five_channel_data, every chel_matsel; Tables 178 - 180); ASPX_ACPL_1 (codec mode 2: the two max_sfb_master side tracks, Tables B.8 - B.19, 5.3.4.3.2) and coding_config 1 of codec modes 2 and 3 |
 | Stereo (`channel_pair_element`) | stereo_codec_mode 0 (SIMPLE), 1 (A-SPX), 2 (ASPX_ACPL_1) and 3 (ASPX_ACPL_2); modes 2 and 3 on synthetic streams only (unverified on real streams) |
 | Mono, 3.0, 5.0, 7.x | single_channel_element (mono: C), 3_0_channel_element (L R C, both coding configs), 5_X without LFE (5.0: L R C Ls Rs), 7_X_channel_element in codec modes SIMPLE and ASPX for all six 7.0 / 7.1 channel modes of Table 88 (L R C [LFE] Ls Rs plus Lb Rb, Lw Rw or Tfl Tfr; Tables 182, 183 with b_use_sap_add_ch; A-SPX on the four blocks of Table 213): on synthetic streams only (unverified on real streams). 7_X ASPX_ACPL_1 / _2 are concealed (`element.parse`) |
@@ -351,6 +351,54 @@ Where TS 103 190-1 leaves room, these are the readings both decoders take
 (the A-SPX readings are under
 [Changes against the standard](#changes-against-the-standard)).
 
+**Phase B3**
+
+* **truepk as a level reference** (TS 103 190-1 4.3.12.3.17: "the true
+  peak sample value of the programme measured since the previous value
+  was sent"). The value sent in frame f is taken to cover the output
+  frames f - 3 .. f + 3 (the encoder's frame of a peak and the decoder's
+  differ by a frame or two: with a window of 0 the decoded peak was up to
+  40 dB above it, with 3 at most 11.7 dB), against full scale
+  `IMDCT_K` x 2^14.5 (the decoder scale of phase A). A stream whose decode
+  sits under its metadata (broadcaster A's stereo, 17 dB; see Known
+  issues) is measured against its own offset, tracked as a median.
+  Frames that do not send truepk are covered by the window of the frames
+  that do; with none in the window, the frame is judged without it.
+* **Mixing** (TS 103 190-2 4.8.4). The formula is printed Y = (sum of
+  the substreams' X) / n_sub; TS 103 190-1 6.2.16 (presentation_version 0)
+  sums without dividing. Both are followed as printed: the division for
+  presentation_version 1 and above, the plain sum for version 0
+  (`mix.MIX_NORMALISE`).
+* **The mixer's layout** is that of the main (or music and effects)
+  substream (TS 103 190-1 6.2.16.0); every other substream's channels go
+  to the channel of the same name. A mono substream goes to the centre,
+  or, with no centre, to L and R at 0.5 each (Table 216, 0 degrees on
+  2.0); with pan_associated (an associated substream) it is panned by
+  linear pairwise panning between the two loudspeakers either side of the
+  angle (L -30, C 0, R +30, Ls -110, Rs +110 degrees), which meets Table
+  216's mandatory points (330: L; 0: C on 5.1, L and R 0.5 on 2.0; 30:
+  R). The order of the main-substream gains is the text's: centre, then L
+  and R, then all (4.8.3.17); they act on the dialogue substreams too
+  when an associated substream is present.
+* **Substream group gains** (Table 70): sg indexes the presentation's
+  substream groups in the order its ac4_sgi_specifier elements reference
+  them, without a dialogue enhancement group (presentation_config 1 and
+  4: n_substream_groups counts it out). "Not present" keeps the gains in
+  force, like b_keep (TS 103 190-1 6.2.16.0: mixing metadata stays valid
+  until new values are sent); 0 dB until the first.
+* **Which substream is main.** The first substream group whose type
+  (Table 53, or Table 54 by content_classifier for presentation_config 5)
+  is main or music and effects. The C decoder decides the substreams to
+  mix at the first frame whose TOC parses; the Python probes the first 64
+  frames (the same unless the first frames are damaged).
+* **Bitstream versions 0 / 1.** Each ac4_substream_info of an
+  ac4_presentation_info becomes a substream group of its own (its content
+  type, b_iframe as b_audio_ndot), so presentation choice and mixing work
+  as for version 2. A substream_index_table with one substream and no
+  size gives the substream the rest of the frame. dialnorm and truepk
+  come from the start of the audio substream's sus_ver 0 basic_metadata
+  (TS 103 190-2 4.8.5.2, Table 16); its DRC is not read.
+
 **Phase B2**
 
 * **Dialogue enhancement** (5.7.8): frame f's matrix acts on the QMF
@@ -464,9 +512,9 @@ Where TS 103 190-1 leaves room, these are the readings both decoders take
   substream, preferring the `--language` given (primary subtag), then
   "complete main" content (Table 91) over audio description, commentary
   and the rest. `md_compat` is reported, not used. Of the chosen
-  presentation the first channel-coded substream is decoded; several
-  substream groups (M&E + dialogue, main + associated) are not mixed
-  (6.2.16). The choice is made per frame, so it follows a TOC that changes.
+  presentation every channel-coded substream is decoded and mixed (phase
+  B3; see Mixing under Phase B3 above; until then only the first). The
+  choice is made per frame, so it follows a TOC that changes.
 * **Sync frames.** A frame whose CRC fails is passed on empty (concealed,
   timeline kept). After lost sync a frame is accepted when its CRC checks
   or, for 0xAC40 frames, when the next sync word (or an ID3 tag, or the end)
@@ -613,6 +661,24 @@ lookahead 8: 5, 159, 10). Speed (`speed.py`, best of 2): 5.1 codec mode 1
 17.9x, its stereo 47.7x, broadcaster B's upmixed 5.1 23.9x (phase B's
 code 23.8x on the same run).
 
+**Phase B3 figures** (2026-11-23): against the Python on the 12 capture
+files, both broadcasters' 42 s captures and the 10 public kit streams it
+decodes (one decode pass): largest difference 1.3e-14 of full scale at
+decoder scale, 9.0e-15 loudness-normalised, 2.5e-14 with dialogue
+enhancement at 9 dB; 16-bit WAVs identical and the same per-frame
+statuses everywhere. Damaged input: see Damaged input (Phase B3; Python
+and C identical at the default lookahead). Every synthetic mixed and
+version 0 / 1 stream of the tests: within 1e-9. `check_inputs.py` (19
+containers, clean and with 30 byte changes each): the same frames.
+`make asan`, and the AddressSanitizer build on two capture cuts and on
+damaged mixed streams: clean. Speed (`speed.py`, best of 2, one
+thread): broadcaster A's 5.1 (codec mode 1) 18.5x, its stereo 50.0x,
+broadcaster B's upmixed 5.1 24.1x, its stereo 56.1x (phase B2: 17.9x,
+47.7x, 23.9x). Audio on the clean captures: bit-identical to phase B2's
+(C, decoder scale, every capture); on the public kit's stereo and
+immersive-stereo streams the burst guard no longer replaces 19 / 27 and
+167 / 184 clean frames by their core band (Known issues).
+
 ## What it does not do yet
 
 * **frame_rate_factor / frame_rate_fraction above 1** (high frame rates,
@@ -626,11 +692,18 @@ code 23.8x on the same run).
   metadata after it is not reached; on the immersive-stereo stream, which
   signals 7.1, `basic_metadata` reads but its tools block does not close
   (see Interpretations).
-* Mixing the substream groups of one presentation (M&E + dialogue, main +
-  associated): only its first channel-coded substream is decoded.
-* The SSF speech frontend; 7_X in ASPX_ACPL_1 / _2; immersive and
-  object audio (A-JOC, IFM, OAMD), and the IMS rendering to 7.1;
-  bitstream versions 0 and 1.
+* **Mixing** (phase B3): the associated audio's gains of a
+  presentation_version 0 presentation (in the associated substream's
+  extended_metadata) and pan_dialog / g_dialog limits (dialog_max_gain)
+  are not read; mixing gains change at frame boundaries, unsmoothed.
+  Object audio substreams are not mixed.
+* **Bitstream versions 0 / 1** (phase B3): the sus_ver 0 DRC frame is not
+  read (no DRC on such streams); presentation_config 7 of version 1 is
+  skipped; the `dac4` box of version 0 is not parsed (`--list` reads the
+  TOC).
+* The SSF speech frontend (TS 103 190-1 5.2): frames that use it are
+  concealed (`element.parse`); 7_X in ASPX_ACPL_1 / _2; immersive and
+  object audio (A-JOC, IFM, OAMD), and the IMS rendering to 7.1.
 
 ## Survey
 
@@ -703,7 +776,19 @@ guard as a last resort (`ac4/robust.py` lists every rule):
      judged: over a near-silent core the ratio means nothing, up to 7.5e6
      measured on clean frames whose A-SPX peak was below 0.012x). Clean
      maximum 7.43 (margin 2.15x), measured before full SAP was added.
-  2. `guard.level`, the output guard: a frame whose peak is above 3x a
+  2. `guard.truepk` (phase B3): most streams send, in the presentation
+     substream, the true peak of the programme since the last value
+     (`truepk`, TS 103 190-1 4.3.12.3.17; 67 to 98 % of the frames of the
+     captures and public test streams). A frame whose peak is more than
+     20 dB above the largest truepk sent for frames f - 3 .. f + 3 is
+     muted, and the near-damage rule below mutes a frame next to a
+     concealed one only when it is also more than 12 dB above it. Both
+     limits follow the stream's own level against its truepk (a median
+     tracker, never above 0 dB: broadcaster A's stereo, which decodes 17
+     dB under its metadata, gets limits 17 dB tighter). On every capture
+     and public kit stream (16,896 frames) the frame peak is at most 11.7
+     dB above its truepk window: no clean frame fires.
+  3. `guard.level`, the output guard: a frame whose peak is above 3x a
      reference is muted with 256-sample ramps. The reference is the larger
      of the stream level (the largest accepted frame peak, released by
      0.9999 per frame, seeded from the 5th-largest of the first 30 frames,
@@ -737,7 +822,45 @@ guard as a last resort (`ac4/robust.py` lists every rule):
 gives them by reason, and `Decoder.last_concealed` marks them per frame of
 the last pass. `ac4dec` prints the count and the reasons.
 
-Measured 2026-11-23 with `c/tests/robust_compare.py` (the measurement of
+**Phase B3** (2026-11-23, `c/tests/robust_compare.py`, the same 7 cuts,
+12 kinds x 20 seeds, 11,046 damaged frames; Python and C identical at
+the default lookahead):
+
+| | before phase B3 | after |
+|---|---|---|
+| worst peak (x the clean stream's own peak) | 8.10 (a bit flip in an A-SPX frame of broadcaster A's stereo) | 1.94 (a damaged first-frame TOC) |
+| damaged frames LOUD (over 2x the clean peak, not concealed) | 3 | 0 |
+| undamaged frames concealed (collateral) | 139 | 86 |
+| gate failures | 6 | 0 |
+| C at lookahead 8: LOUD / collateral / failures | 5 / 159 / 10 | 0 / 102 / 0 |
+
+Nothing is concealed, and the guard changes nothing, on the clean cuts,
+on every capture and on every public test stream the decoder takes.
+What made it worse after phase B's start (each C commit measured the
+same way): the robust figures of the A-CPL milestone (2 LOUD, 75
+collateral, 4 failures, worst 4.45x) held through the TOC and input
+work; the standard's IMDCT scale raised collateral to 83, the 1.5 dB
+envelope dequantisation to 130, the one-frame-later A-SPX time grid added
+the third LOUD frame (138, 6 failures), and companding turned a bit flip
+in broadcaster A's quiet stereo into the 8.1x frame (139). All of these
+are fixes towards the standard: the high band now sits at its true level,
+and damage there reaches further. The burst guard and the start-level
+limit, both fixed fractions of the element's reference level, let it
+through on quiet streams. The true-peak rules of `guard.truepk` (Level
+checks) catch it from the stream's own metadata: the cut2 bursts (4.42x,
+3.41x) and the 8.1x frame are muted, and the near-damage rule no longer
+mutes programme that the stream's truepk covers. Of the 86 collateral
+frames, 53 are A-SPX frames just after a concealed one whose high band
+the `aspx.level` check replaces by the core: their time-differential
+envelopes refer to the lost frame, and decoded against the last good one
+they come out 13 to 36 dB above the stream's true peak (measured on 12
+of them). They are counted as concealed. Playing the core band
+for every time-differential A-SPX frame after a loss instead (the
+reference is lost) would cost up to 29 frames of high band per loss on
+these streams (runs of time-coded first envelopes), so it was not done;
+the target of 75 is not met.
+
+Measured 2026-11-23 (before phase B3) with `c/tests/robust_compare.py` (the measurement of
 tests/test_robust.py) on 7 cuts of both broadcasters (4 fragments each),
 12 kinds of damage x 20 seeds (11,046 damaged frames: 6 per decode for 10
 kinds, a swap damaging two; runs of 3 to 20 consecutive frames; a damaged
@@ -824,12 +947,14 @@ reading.
   full scale, rising only when a louder sample appears, capped at twice the
   start. `decode()` returns the decoder's own scale.
 * **Burst guard.** Separate from the damaged-input guard above: an A-SPX
-  frame above twice the element's fixed reference plays its core band. It
-  is a heuristic carried over from the receiver. It used to fire on clean
-  material (31 frames of one broadcaster's 42 s stereo); those were the
-  1.5 dB envelopes dequantised as 3 dB (fixed), and it now fires on no
-  capture. It still fires on 7 frames of a public stereo test stream,
-  which is louder than the fixed reference.
+  frame above twice full scale (+6 dBFS, `decoder.BURST_LIMIT`) plays its
+  core band. Until phase B3 its limit was twice the element's fixed
+  reference (`REF_PEAK`), a heuristic carried over from the receiver,
+  and it fired on clean frames of streams louder than that reference: 19
+  / 27 frames of the public stereo test streams (25 / 29.97 fps), 167 /
+  184 of the immersive-stereo ones (decoded as stereo). The loudest
+  public test stream peaks at 0.92 of full scale; it now fires on no
+  clean stream at hand.
 * **Broadcaster A's stereo** plays about 17 dB below its loudness
   metadata (BS.1770 -41.6 LUFS against loudrelgat -24.5 on its 10 s lane;
   its SIMPLE stereo and its 5.1 match theirs within 0.3 dB). Phase B2
@@ -927,6 +1052,17 @@ guard changes nothing, on the clean cuts. Its negative control turns the checks 
 (`robust.CHECKS = False`, `guard=False`) and requires the same gate to
 fail.
 
+Phase B3 added `tests/test_phase_b3.py` (the true-peak rules on
+synthetic signals: a frame they mute that the level rule passes, an
+announced transient they spare, the near-damage rule, the offset tracker,
+truepk read bit by bit, the burst limit), `tests/test_mix.py` (mixing
+metadata and Tables 70 / 216, substream types, M&E + dialogue and main +
+associated mixes against the separately decoded substreams, b_keep, a
+muted group, C against Python) and `tests/test_bitstream_v0.py` (version
+0 / 1 TOCs bit by bit; the same audio under a version 0 and a version 2
+TOC decodes identically; basic_metadata dialnorm and truepk; C against
+Python).
+
 Phase B2 added `tests/test_phase_b2.py` (Tables 178, 179 and 5.3.3.4
 entry by entry, Tables B.8 - B.19, every 5_X coding_config and 2ch_mode,
 ASPX_ACPL_1's side tracks, C against Python), `tests/test_elements_b2.py`
@@ -957,7 +1093,8 @@ their streams bit by bit.
 | `resample.py` | 1001/960 output resampler |
 | `stream.py` | `Ac4Stream`: frames to spectra, with cross-frame state |
 | `decoder.py` | `Decoder`: spectra to PCM; `decode()` |
-| `robust.py` | damaged-frame rules, sequence rules, output guard |
+| `robust.py` | damaged-frame rules, sequence rules, output guard (with the true-peak rules) |
+| `mix.py` | mixing the substreams of a presentation (`MixDecoder`) |
 | `cli.py` | `ac4dec` |
 | `scalefac.py`, `pcm.py` | early LFE prototypes, kept for constants they define |
 | `tables/` | numeric tables (no standards text) |

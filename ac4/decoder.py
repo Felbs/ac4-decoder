@@ -20,10 +20,9 @@ A-CPL upmix (acpl.py) runs on the core pair's A-SPX output in the QMF
 domain and gives L, R, C, Ls, Rs; the LFE is decoded from its own
 mono_data. With channels=2 such a stream gives its stereo core.
 
-What it does NOT do:
-companding, DRC / dialogue / loudness metadata,
-presentation or substream choice (substream 1 is always decoded), frame
-rates other than 29.97 and sample rates other than 48 kHz.
+Presentation choice, mixing several substreams (mix.py), loudness and
+DRC (loudness.py) and the frame rates of Table 83 are handled; see the
+README for what is not.
 
 DAMAGED INPUT (robust.py): decode_pass never raises and always returns
 1536 samples per frame. Frames that break a rule of the bitstream are

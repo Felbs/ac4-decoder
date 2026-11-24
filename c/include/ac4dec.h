@@ -163,9 +163,8 @@ typedef struct {
 /* PRESENTATIONS (TS 103 190-2 4.8.2). The automatic choice is, per frame,
    the first enabled presentation that has a channel-coded audio substream,
    preferring the configured language, then "complete main" content (not
-   audio description, commentary, ...). Of that presentation the first
-   channel-coded substream is decoded (several substream groups are not
-   mixed). */
+   audio description, commentary, ...). Of that presentation every
+   channel-coded substream is decoded and mixed (see MIXING above). */
 typedef struct {
     int index;             /* position in the TOC (0-based) */
     long presentation_id;  /* -1 when not signalled */

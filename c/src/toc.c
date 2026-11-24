@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* The AC-4 table of contents, bitstream_version >= 2 (TS 103 190-2 6.2.1).
+/* The AC-4 table of contents (TS 103 190-2 6.2.1; bitstream_version 0 / 1:
+ * TS 103 190-1 4.2.3, presentation_info_v0).
  * Port of ac4/toc.py. Every read is bounds-checked by the bit reader; any
  * failure raises AC4E_TOC_PARSE. */
 #include <string.h>
