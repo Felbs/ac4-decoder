@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 from ac4 import aspx_parse as P                            # noqa: E402
 from ac4 import channels as C                              # noqa: E402
 from ac4 import container                                  # noqa: E402
+from ac4 import decoder as DEC                            # noqa: E402
 from ac4 import metadata as MD                             # noqa: E402
 from ac4 import toc as M                                   # noqa: E402
 from ac4.frameinfo import FrameWalker                      # noqa: E402
@@ -229,6 +230,12 @@ def survey_file(path, max_frames=None):
                     continue
                 cm = s["channel_mode"]
                 c[f"channel_mode {ch_name(cm)}"] += 1
+                if (cm in DEC.IMS_CH_MODES and p["version"] == 2):
+                    # immersive stereo: the substream is a channel pair
+                    # and its metadata() is read with the stereo channel
+                    # mode, as the decoder does (README, Interpretations)
+                    c["IMS: read as channel_pair_element"] += 1
+                    cm = DEC.IMS_STEREO
                 if s.get("sf_multiplier") is not None:
                     c[f"sf_multiplier {s['sf_multiplier']}"] += 1
                 ifr = bool(s["ndot"][0])
