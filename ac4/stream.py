@@ -69,7 +69,7 @@ class Ac4Stream:
         if element == "ajoc":
             self.CHANS = EL.ajoc_slots(ajoc_info)
             self.PAIRS = ({0: ("L", "R"), 1: ("Ls", "Rs"), 2: ("C", "C")}
-                          if ajoc_info["static"] else
+                          if ajoc_info.get("static", 1) else
                           {0: ("L", "R"), 1: ("Ls", "Rs"), 2: ("C", "C"),
                            3: ("Tfl", "Tfr")})
         else:
@@ -389,6 +389,23 @@ class Ac4Stream:
                         raise RB.Damaged("element.parse", str(e)[:60]) \
                             if not isinstance(e, RB.Damaged) else e
                     end = bt.p
+                if r.get("tail") == "objs":
+                    # the objects' metadata: the group's oamd_substream
+                    gi_, g_, s_ = M.audio_substreams(st, pi)[self.substream]
+                    o = g_.get("oamd")
+                    if o is None or o.get("index") is None or \
+                            o["index"] >= len(st["substream_sizes"]):
+                        raise RB.Damaged("element.parse",
+                                         "no oamd_substream")
+                    self.obj_state["alternative"] = bool(
+                        st["presentations"][pi].get("b_alternative"))
+                    try:
+                        got_obj = EL.objs_tail(
+                            M.substream_bytes(f, st, o["index"]), g_, s_,
+                            bool(o["ndot"]), self.obj_state)
+                    except Exception as e:                     # noqa: BLE001
+                        raise RB.Damaged("element.parse", str(e)[:60]) \
+                            if not isinstance(e, RB.Damaged) else e
                 r["end"] = end
                 # every block of audio_data() parsed?  Not before the first
                 # aspx_config (the A-SPX blocks cannot be sized) nor, for

@@ -83,13 +83,59 @@ struct ac4_ajoc_full {
 };
 
 /* ------------------------------------------------ objrender.matrix */
-void ac4_obj_matrix(const signed char *types, const ac4_obj *st, int n,
-                    int lay, double *M)
+/* objrender.BED_FULL (render ids) and bed_of: the bed of the bed types
+   among types[0 .. n), as a mask of render ids */
+static const int BED_FULL[12] = { RN_L, RN_R, RN_C, RN_LFE, RN_LS, RN_RS,
+                                  RN_LB, RN_RB, RN_TFL, RN_TFR, RN_TBL,
+                                  RN_TBR };
+
+unsigned ac4_bed_of(unsigned have)
 {
-    int no = ac4_layout_channels(lay), j, c;
+    unsigned m = 0;
+    int i, n = 0, one = -1;
+    for (i = 0; i < 12; i++)
+        if (have & (1u << BED_FULL[i])) {
+            m |= 1u << BED_FULL[i];
+            n++;
+            one = BED_FULL[i];
+        }
+    if (n == 1 && one != RN_C && one != RN_LFE) {
+        if (one == RN_L || one == RN_R)
+            return (1u << RN_L) | (1u << RN_R);
+        if (one == RN_LS || one == RN_RS)
+            return (1u << RN_L) | (1u << RN_R) | (1u << RN_C)
+                   | (1u << RN_LFE) | (1u << RN_LS) | (1u << RN_RS);
+        m = 0;
+        for (i = 0; i < 12; i++)
+            m |= 1u << BED_FULL[i];
+    }
+    return m;
+}
+
+unsigned ac4_bed_mask_types(const signed char *types, int n)
+{
+    unsigned have = 0;
+    int j;
+    for (j = 0; j < n; j++)
+        if (types[j] >= 0 && types[j] < RN_N)
+            have |= 1u << types[j];
+    return ac4_bed_of(have);
+}
+
+/* ------------------------------------------------ objrender.matrix */
+void ac4_obj_matrix_ex(const signed char *types, const ac4_obj *st, int n,
+                       int lay, unsigned bed, int isf_cfg, double *M)
+{
+    int no = ac4_layout_channels(lay), j, c, nb = 0, bid[12];
     const int *out = ac4_layout_ids(lay);
+    double R[AC4DEC_MAX_CHANNELS * 12];
     for (c = 0; c < no * n; c++)
         M[c] = 0.0;
+    for (c = 0; c < 12; c++)
+        if (bed & (1u << BED_FULL[c]))
+            bid[nb++] = BED_FULL[c];
+    if (nb)
+        ac4_render_matrix(bid, nb, lay, NULL, R);
     for (j = 0; j < n; j++) {
         int t = types[j];
         const ac4_obj *s = st ? &st[j] : NULL;
@@ -101,6 +147,17 @@ void ac4_obj_matrix(const signed char *types, const ac4_obj *st, int n,
             for (c = 0; c < no; c++)
                 if (out[c] == RN_LFE)
                     M[c * n + j] = g;
+        } else if (t <= AC4_OBJ_ISF_I(0)) {
+            /* TS 103 190-2 5.10.3: the ISF matrix of the layout, row
+               t's object, columns the speakers without the LFE */
+            const double *m = AC4T_ISF[isf_cfg][lay - 1];
+            int i = AC4_OBJ_ISF_I(0) - t, ns = 0, k = 0;
+            for (c = 0; c < no; c++)
+                if (out[c] != RN_LFE)
+                    ns++;
+            for (c = 0; c < no; c++)
+                if (out[c] != RN_LFE)
+                    M[c * n + j] = g * m[i * ns + k++];
         } else if (t == AC4_OBJ_DYN || t == AC4_OBJ_ISF) {
             double gg[AC4DEC_MAX_CHANNELS];
             if (s)
@@ -109,14 +166,28 @@ void ac4_obj_matrix(const signed char *types, const ac4_obj *st, int n,
                 ac4_obj_gains(0.5, 0.0, 0.0, out, no, gg);
             for (c = 0; c < no; c++)
                 M[c * n + j] = g * gg[c];
-        } else {
-            double col[AC4DEC_MAX_CHANNELS];
-            int id = t;
-            ac4_render_matrix(&id, 1, lay, NULL, col);
+        } else if (t >= 0 && t < RN_N && (bed & (1u << t))) {
+            int k;
+            for (k = 0; k < nb && bid[k] != t; k++)
+                ;
             for (c = 0; c < no; c++)
-                M[c * n + j] = g * col[c];
+                M[c * n + j] = g * R[c * nb + k];
+        } else {
+            /* objrender: Lw / Rw, Tsl / Tsr panned at their position */
+            double x, y, z, gg[AC4DEC_MAX_CHANNELS];
+            ac4_bed_position(t, &x, &y, &z);
+            ac4_obj_gains(x, y, z, out, no, gg);
+            for (c = 0; c < no; c++)
+                M[c * n + j] = g * gg[c];
         }
     }
+}
+
+void ac4_obj_matrix(const signed char *types, const ac4_obj *st, int n,
+                    int lay, double *M)
+{
+    ac4_obj_matrix_ex(types, st, n, lay, ac4_bed_mask_types(types, n), 0,
+                      M);
 }
 
 /* ------------------------------------------------ the engine */

@@ -198,6 +198,8 @@ class Decoder:
         self.renderer = None
         self.obj_renderer = None
         self.ajoc_full = None
+        if element == "ajoc" and ajoc_info.get("kind") == "obj":
+            ajoc_core = True        # direct-coded objects: no A-JOC
         if element == "ajoc" and not ajoc_core:
             # full decoding (TS 103 190-2 5.7): the upmix objects
             # reconstructed and rendered in the QMF domain (AjocFull)
@@ -687,6 +689,16 @@ class ObjectRenderer:
         self.layout = layout
         self.out = LAYOUTS[layout]
         self.ramp = None
+        if info.get("kind") == "obj":
+            # audio_data_objs: the LFE first, then the element's tracks
+            # in their order (toc.obj_split's OAMD order: an LFE at its
+            # place in the bed, the other objects in order)
+            self.types = list(info["types"])
+            lf = [i for i, t in enumerate(self.types)
+                  if t in ("lfe", "lfe2")]
+            rest = [i for i in range(len(self.types)) if i not in lf]
+            self.slot_obj = lf + rest
+            return
         lfe = bool(info["b_lfe"])
         self.types = (["lfe"] if lfe else []) + list(info["dmx_types"])
         self.slot_obj = list(range(len(self.slots)))
@@ -699,7 +711,7 @@ class ObjectRenderer:
     def _matrix(self, objs):
         from . import objrender as OR
         from . import render as RD
-        if self.info["static"]:
+        if self.info.get("static"):
             # 5.0 / 5.1 bed: channels
             return RD.matrix(self.slots, self.layout)
         types = [self.types[k] if k < len(self.types) else "DYN"
@@ -707,7 +719,9 @@ class ObjectRenderer:
         states = (None if objs is None else
                   [objs[k] if k < len(objs) else None
                    for k in self.slot_obj])
-        return OR.matrix(types, states, self.out, self.layout)
+        bed = (OR.bed_of(self.info["bed"]) if self.info.get("kind") == "obj"
+               else None)
+        return OR.matrix(types, states, self.out, self.layout, bed)
 
     def process(self, y, objs, frame):
         from . import objrender as OR
@@ -719,7 +733,7 @@ class ObjectRenderer:
         for f in range(n_f):
             o = objs[f] if f < len(objs) else None
             ev = []
-            if isinstance(o, dict) and not self.info["static"]:
+            if isinstance(o, dict) and not self.info.get("static"):
                 blks = o.get("dmx_blocks")
                 upd = o.get("dmx_upd") or []
                 if blks:
@@ -873,7 +887,7 @@ def probe_ajoc_info(frames, limit=64, presentation=None, language=None,
         sel = M.audio_substream(st, pi, substream)
         if sel is None:
             continue
-        return sel if sel.get("kind") == "ajoc" else None
+        return sel if sel.get("kind") in ("ajoc", "obj") else None
     return None
 
 
@@ -919,7 +933,7 @@ def probe_ch_mode(frames, limit=64, presentation=None, language=None,
         sel = M.audio_substream(st, pi, substream)
         if sel is None:
             continue
-        if sel.get("kind") == "ajoc":
+        if sel.get("kind") in ("ajoc", "obj"):
             return "ajoc"
         cm = sel["channel_mode"]
         if (pi is not None and cm in IMS_CH_MODES

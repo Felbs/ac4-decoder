@@ -42,6 +42,10 @@ extern const ac4t_book AC4T_MISC_BOOKS[AC4T_N_MISC_BOOKS];
    0..1 = COARSE, FINE; h 0..2 = F0, DF, DT (cb_off 0, 0, (n - 1) / 2) */
 #define AC4T_N_AJOC_BOOKS 12
 extern const ac4t_book AC4T_AJOC_BOOKS[AC4T_N_AJOC_BOOKS];
+/* ISF matrices (TS 103 190-2 Annex A.2.1; ac4_tables_p2.c): isf_config
+   x layout (ac4dec_layout 1 .. 7, i.e. 2.0, 5.1, 5.1.2, 5.1.4, 7.1,
+   7.1.2, 7.1.4), row-major (ISF objects x speakers without the LFE) */
+extern const double *const AC4T_ISF[6][7];
 
 /* Table D.3 QMF prototype (640 taps) and Table D.2 ASPX_NOISE (re, im). */
 extern const double AC4T_QWIN[640];

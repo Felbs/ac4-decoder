@@ -574,3 +574,48 @@ void ac4_ajoc_tail(ac4_bits *b, const ac4_huff *bk, const ac4_toc_sub *info,
         fr->n_uev = 1;
     }
 }
+
+void ac4_objs_tail(ac4_bits *b, const ac4_toc_group *g,
+                   const ac4_toc_sub *s, int ndot, int alternative,
+                   ac4_obj_state *st, ac4_ajoc_frame *fr)
+{
+    int n = g->n_obj, i, k, nb, k0 = s->oamd_offset, nk = s->n_types;
+    if (n > 64 || k0 + nk > n || nk > 17)
+        ac4_fail(b, AC4E_ELEMENT_PARSE);
+    if (!st->init) {
+        for (i = 0; i < 65; i++)
+            ac4_obj_init(&st->umx[i]);
+        st->blocks = 1;
+        st->n_grp = n;
+        st->init = 1;
+    }
+    if (st->n_grp != n)                 /* object count changed */
+        ac4_fail(b, AC4E_ELEMENT_PARSE);
+    if (ac4_bit(b))                     /* b_oamd_common_data_present */
+        ac4_oamd_common_data(b);
+    if (ac4_bit(b))                     /* b_oamd_timing_present */
+        st->blocks = oamd_timing_data(b, &st->dt);
+    nb = st->blocks;
+    if (!alternative) {
+        /* oamd_dyndata_multi (6.2.8.4) */
+        for (i = 0; i < n; i++) {
+            int dyn = g->obj_type[i] == AC4_OBJ_DYN && !g->obj_lfe[i];
+            for (k = 0; k < nb; k++) {
+                if (!g->obj_ajoc[i])
+                    object_info_block(b, &st->umx[i], ndot && k == 0, dyn);
+                if (k < AC4_OAMD_NB && i >= k0 && i < k0 + nk)
+                    fr->dblk[k][i - k0] = st->umx[i];
+            }
+        }
+    }
+    if (nb > AC4_OAMD_NB)
+        nb = AC4_OAMD_NB;
+    if (alternative || nb == 0) {
+        memcpy(fr->dblk[0], &st->umx[k0], sizeof(ac4_obj) * (size_t)nk);
+        fr->dev[0][0] = fr->dev[0][1] = 0;
+        fr->n_dev = 1;
+        return;
+    }
+    block_updates(&st->dt, nb, fr->dev);
+    fr->n_dev = nb;
+}

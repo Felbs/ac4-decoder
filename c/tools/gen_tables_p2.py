@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Generate src/ac4_tables_p2.c from ac4/tables/ac4_huffman_p2.json: the
-twelve A-JOC codebooks of TS 103 190-2 Annex A.1.1.
+twelve A-JOC codebooks of TS 103 190-2 Annex A.1.1, and the ISF
+matrices of Annex A.2.1 (ac4/tables/ac4_isf.json) for the decoder's
+layouts.
 
     python3 c/tools/gen_tables_p2.py > c/src/ac4_tables_p2.c"""
 import json
@@ -40,6 +42,22 @@ def main():
     for b in AJOC:
         out.append("    { AC4T_%s_LEN, AC4T_%s_CW, %d }," % (
             b, b, len(huff[b + "_LEN"])))
+    out.append("};")
+    out.append("")
+    isf = json.load(open(os.path.join(TAB, "ac4_isf.json")))
+    names = ("SR3100", "SR5300", "SR7300", "SR9500", "SR7530", "SR15951")
+    outs = ("2", "5", "502", "504", "7", "702", "704")
+    for n in names:
+        for o in outs:
+            m = isf["%s_to_%s" % (n, o)]
+            arr("AC4T_ISF_%s_%s" % (n, o), "double",
+                [repr(v) for row in m for v in row], out)
+    out.append("/* [isf_config][layout 1 .. 7 - 1]: rows the ISF objects, "
+               "columns the speakers without the LFE */")
+    out.append("const double *const AC4T_ISF[6][7] = {")
+    for n in names:
+        out.append("    { " + ", ".join("AC4T_ISF_%s_%s" % (n, o)
+                                         for o in outs) + " },")
     out.append("};")
     print("\n".join(out))
 

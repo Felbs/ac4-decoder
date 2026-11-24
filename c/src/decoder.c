@@ -314,6 +314,10 @@ struct ac4dec {
                                    bitstream_version 0 / 1 */
     /* ---- mixing (mix.py): the other substreams' decoders */
     int mix_decided, n_kid, mix_n, mix_version;
+    /* an object substream as the main one (phase E): its objects are
+       rendered to its layout before the mix, which then runs on the
+       layout's channels (lay_slot: their slots by name) */
+    int objmix, lay_slot[NOUT];
     double mix_gprev[AC4_MIX_MAX][NOUT][NOUT];  /* last frame's matrices */
     int mix_gn[AC4_MIX_MAX], mix_ghas[AC4_MIX_MAX];
     ac4dec *kid[AC4_MIX_MAX - 1];
@@ -447,7 +451,7 @@ static ac4dec_element element_of_toc(const ac4dec_config *c, const ac4_toc *t)
     long cm;
     if (!s)
         return AC4DEC_ELEMENT_AUTO;
-    if (s->kind == 1)
+    if (s->kind == 1 || s->kind == 2)
         return AC4DEC_ELEMENT_AJOC;
     cm = s->channel_mode;
     switch (cm) {
@@ -605,6 +609,28 @@ static void obj_matrix(const ac4dec *d, const ac4_obj *st, double *M)
     signed char ty[NOUT];
     ac4_obj ss[NOUT];
     render_ids(d, ids);
+    if (d->ajoc_known && ai->kind == 2) {
+        /* direct-coded objects: the LFE slot first, then the element's
+           tracks in order (toc.obj_split's OAMD order) */
+        int nl = 0, q;
+        for (q = 0; q < ai->n_types; q++)
+            if (ai->types[q] == RN_LFE)
+                slot_obj[nl++] = q;
+        for (q = 0; q < ai->n_types; q++)
+            if (ai->types[q] != RN_LFE)
+                slot_obj[nl++] = q;
+        for (j = 0; j < d->n_ch; j++) {
+            int k = j < nl ? slot_obj[j] : -1;
+            ty[j] = k >= 0 ? ai->types[k] : AC4_OBJ_DYN;
+            if (st && k >= 0)
+                ss[j] = st[k];
+            else
+                ac4_obj_init(&ss[j]);
+        }
+        ac4_obj_matrix_ex(ty, st ? ss : NULL, d->n_ch, lay,
+                          ac4_bed_of(ai->obj_bed), ai->isf_cfg, M);
+        return;
+    }
     if (!d->ajoc_known || ai->static_dmx) {
         ac4_render_matrix(ids, d->n_ch, lay, NULL, M);
         return;
@@ -909,6 +935,33 @@ static int element_slots(int element, int ch_mode, int *slot)
 
 /* the layout an AJOC decoder renders to (decoder.py: 5.1 unless one is
    asked for; channels 2: 2.0) */
+/* a layout's channels as decoder slots, by name (for the leveler's
+   weights and the mixer) */
+static int lay_slots(int lay, int *slot)
+{
+    const int *ids = ac4_layout_ids(lay);
+    int i, n = ac4_layout_channels(lay);
+    for (i = 0; i < n; i++) {
+        int sl = CH_X1;
+        switch (ids[i]) {
+        case RN_L: sl = CH_L; break;
+        case RN_R: sl = CH_R; break;
+        case RN_C: sl = CH_C; break;
+        case RN_LFE: sl = CH_LFE; break;
+        case RN_LS: sl = CH_LS; break;
+        case RN_RS: sl = CH_RS; break;
+        case RN_LB: sl = CH_LB; break;
+        case RN_RB: sl = CH_RB; break;
+        case RN_TBL: sl = CH_TBL; break;
+        case RN_TBR: sl = CH_TBR; break;
+        case RN_TFR: case RN_TSR: case RN_RW: sl = CH_X2; break;
+        default: break;
+        }
+        slot[i] = sl;
+    }
+    return n;
+}
+
 static int ajoc_layout(const ac4dec *d)
 {
     if (d->cfg.layout)
@@ -936,7 +989,19 @@ static void set_element(ac4dec *d, int element)
         const ac4_toc_sub *ai = &d->ajoc_info;
         int nd = d->ajoc_known ? ai->n_dmx : 5;
         n = 0;
-        if (!d->ajoc_known || ai->static_dmx) {
+        if (d->ajoc_known && ai->kind == 2) {
+            /* audio_data_objs: the LFE, then the element's tracks */
+            static const int OB[6][5] = {
+                { 0 }, { CH_C }, { CH_L, CH_R }, { CH_L, CH_R, CH_C },
+                { 0 }, { CH_L, CH_R, CH_C, CH_LS, CH_RS } };
+            static const int ON[6] = { 0, 1, 2, 3, 0, 5 };
+            int no = ai->n_objects >= 0 && ai->n_objects < 6
+                     ? ON[ai->n_objects] : 0;
+            if (ai->lfe)
+                slot[n++] = CH_LFE;
+            for (i = 0; i < no; i++)
+                slot[n++] = OB[ai->n_objects][i];
+        } else if (!d->ajoc_known || ai->static_dmx) {
             slot[n++] = CH_L;
             slot[n++] = CH_R;
             slot[n++] = CH_C;
@@ -988,7 +1053,8 @@ static void set_element(ac4dec *d, int element)
     if (element == AC4DEC_ELEMENT_AJOC)
         d->n_lay = ac4_layout_channels(ajoc_layout(d));
     d->ajoc_full = 0;
-    if (element == AC4DEC_ELEMENT_AJOC && d->ajoc_known && !d->cfg.ajoc_core) {
+    if (element == AC4DEC_ELEMENT_AJOC && d->ajoc_known && !d->cfg.ajoc_core
+        && d->ajoc_info.kind == 1) {
         /* full decoding (decoder.AjocFull): the decoded channels are the
            layout's, rendered from the upmix objects in the QMF domain;
            their slots (for the leveler's weights) by name */
@@ -997,24 +1063,8 @@ static void set_element(ac4dec *d, int element)
         if (!d->ajx)
             d->ajx = ac4_ajoc_full_new(&d->ajoc_info, ajoc_layout(d));
         d->n_ch = d->n_lay;
-        for (i = 0; i < d->n_lay; i++) {
-            int sl = CH_X1;
-            switch (ids[i]) {
-            case RN_L: sl = CH_L; break;
-            case RN_R: sl = CH_R; break;
-            case RN_C: sl = CH_C; break;
-            case RN_LFE: sl = CH_LFE; break;
-            case RN_LS: sl = CH_LS; break;
-            case RN_RS: sl = CH_RS; break;
-            case RN_LB: sl = CH_LB; break;
-            case RN_RB: sl = CH_RB; break;
-            case RN_TBL: sl = CH_TBL; break;
-            case RN_TBR: sl = CH_TBR; break;
-            case RN_TFR: case RN_TSR: case RN_RW: sl = CH_X2; break;
-            default: break;
-            }
-            d->out_ch[i] = sl;
-        }
+        (void)ids;
+        lay_slots(ajoc_layout(d), d->out_ch);
     }
     if (element == AC4DEC_ELEMENT_AJOC && !d->ajf) {
         d->ajf_cap = d->rec_cap + 2;
@@ -1685,7 +1735,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
         if (d->element == AC4DEC_ELEMENT_AJOC && !d->ajoc_known) {
             /* the substream's info, from the first frame that has it
                (decoder.probe_ajoc_info); the decoded slots follow it */
-            if (s->kind != 1) {
+            if (s->kind != 1 && s->kind != 2) {
                 code = AC4E_ELEMENT_PARSE;
                 goto fail;
             }
@@ -1706,6 +1756,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     code = setjmp(jb);
     if (code != 0)
         goto fail;
+    e->objs_lfe = NULL;
     switch (d->element) {
     case AC4DEC_ELEMENT_PAIR: ac4_parse_pair(&b, &d->books, ifr, e); break;
     case AC4DEC_ELEMENT_MONO: ac4_parse_mono(&b, &d->books, ifr, e); break;
@@ -1722,6 +1773,11 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
     case AC4DEC_ELEMENT_AJOC:
         if (!d->ajoc_known)
             ac4_fail(&b, AC4E_ELEMENT_PARSE);
+        if (d->ajoc_info.kind == 2) {
+            ac4_parse_objs(&b, &d->books, ifr, d->ajoc_info.n_objects,
+                           d->ajoc_info.lfe, e);
+            break;
+        }
         ac4_parse_ajoc(&b, &d->books, ifr, d->ajoc_info.lfe,
                        d->ajoc_info.static_dmx, d->ajoc_info.n_dmx,
                        d->ajoc_info.n_umx, e);
@@ -1791,7 +1847,40 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
                && (!(acpl3 || acpl1) || e->has_acpl_cfg
                    || (acpl3 ? d->has_pcfg : d->has_pcfg1));
     r->has_obj = 0;
-    if (e->tail && (cfg || !has_aspx)) {
+    if (e->tail == 2) {
+        /* the objects' metadata: the group's oamd_substream
+           (elements.objs_tail) */
+        const ac4_toc_sub *ss[AC4_MIX_MAX];
+        long gg[AC4_MIX_MAX], oi;
+        int ns = ac4_toc_audio_substreams(&t, choose_pres(&d->cfg, &t), ss,
+                                          gg, AC4_MIX_MAX);
+        int k = d->cfg.substream > 0 ? d->cfg.substream : 0;
+        const ac4_toc_group *g;
+        size_t oo;
+        ac4_bits ob;
+        long i;
+        if (k >= ns || !d->ajf_cap)
+            ac4_fail(&b, AC4E_ELEMENT_PARSE);
+        g = &t.groups[gg[k]];
+        oi = g->has_oamd ? g->oamd_index : -1;
+        if (oi < 0 || oi >= t.n_sizes || oi >= AC4_MAX_SIZES)
+            ac4_fail(&b, AC4E_ELEMENT_PARSE);
+        oo = t.toc_bytes + (size_t)t.payload_base;
+        for (i = 0; i < oi; i++)
+            oo += (size_t)t.sizes[i];
+        if (oo > len)
+            oo = len;
+        ob.d = data + oo;
+        ob.nbits = ((size_t)t.sizes[oi] > len - oo ? len - oo
+                    : (size_t)t.sizes[oi]) * 8;
+        ob.p = 0;
+        ob.jb = &jb;
+        ob.eof_code = AC4E_ELEMENT_PARSE;
+        ac4_objs_tail(&ob, g, ss[k], g->oamd_ndot,
+                      t.pres[choose_pres(&d->cfg, &t)].b_alternative,
+                      &d->obj, &d->ajf[(int)(r->index % d->ajf_cap)]);
+        r->has_obj = 1;
+    } else if (e->tail && (cfg || !has_aspx)) {
         /* the rest of audio_data_ajoc (elements.ajoc_tail) */
         b.p = end;
         b.eof_code = AC4E_ELEMENT_PARSE;
@@ -1801,7 +1890,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
                       &d->ajf[(int)(r->index % d->ajf_cap)]);
         end = b.p;
         r->has_obj = 1;
-    } else if (e->tail) {
+    } else if (e->tail == 1) {
         complete = 0;
     }
     /* audio_size closure */
@@ -2783,6 +2872,16 @@ static void emit(ac4dec *d, ac4dec_frame *out)
         out->status = AC4DEC_OK;
         d->n_ok++;
     }
+    if (d->n_kid && d->objmix && d->element == AC4DEC_ELEMENT_AJOC
+        && !d->ajoc_full) {
+        /* mix.MixDecoder: an object main substream is rendered by its
+           own decoder, then mixed on the layout's channels */
+        double (*tmp)[FRAME] = d->reorder;
+        int c;
+        obj_render_frame(d, o, tmp);
+        for (c = 0; c < d->n_lay; c++)
+            memcpy(o->pcm[c], tmp[c], sizeof(tmp[c]));
+    }
     if (d->n_kid)
         mix_frame(d, o, out);
     if (!d->rs_fixed) {
@@ -2805,20 +2904,25 @@ static void emit(ac4dec *d, ac4dec_frame *out)
             int drc = d->cfg.drc == 0 ? AC4_DRC_AUTO
                       : d->cfg.drc < 0 ? AC4_DRC_OFF : d->cfg.drc - 1;
             d->lev = (ac4_leveler *)malloc(sizeof(ac4_leveler));
-            if (d->lev)
+            if (d->lev && d->objmix && d->n_kid)
+                ac4_leveler_init(d->lev, d->n_lay, d->lay_slot, 0,
+                                 d->cfg.target_level, drc,
+                                 (double)d->out_rate * d->rs_down / d->rs_up);
+            else if (d->lev)
                 ac4_leveler_init(d->lev, d->n_ch, d->out_ch,
                                  d->element == AC4DEC_ELEMENT_7X
                                  && d->ch_mode <= 6,
                                  d->cfg.target_level, drc,
                                  (double)d->out_rate * d->rs_down / d->rs_up);
         }
-        for (k = 0; k < d->n_ch; k++)
+        for (k = 0; k < (d->objmix && d->n_kid ? d->n_lay : d->n_ch); k++)
             pp[k] = o->pcm[k];
         if (d->lev)
             ac4_leveler_frame(d->lev, o->meta.valid ? &o->meta : NULL, pp,
                               o->n);
     }
-    if (d->element == AC4DEC_ELEMENT_AJOC && !d->ajoc_full) {
+    if (d->element == AC4DEC_ELEMENT_AJOC && !d->ajoc_full
+        && !(d->objmix && d->n_kid)) {
         /* ObjectRenderer (core decoding): the frame's downmix objects'
            block updates */
         double (*tmp)[FRAME] = d->reorder;
@@ -2980,7 +3084,7 @@ static void mix_decide(ac4dec *d, const uint8_t *data, size_t len)
     ac4_toc t;
     const ac4_toc_sub *s[AC4_MIX_MAX];
     long grp[AC4_MIX_MAX], order[AC4_MIX_MAX];
-    int pi, n, k, i, n_order = 0, kmain = 0;
+    int pi, n, k, i, n_order = 0, kmain = 0, obj_lay;
     if (toc_try(data, len, &t) != 0)
         return;
     d->mix_decided = 1;
@@ -3001,6 +3105,31 @@ static void mix_decide(ac4dec *d, const uint8_t *data, size_t len)
     d->mix_version = t.pres[pi].version;
     d->cfg.substream = kmain;
     d->mix_n = 0;
+    /* mix.MixDecoder: object substreams in core decoding, rendered to
+       the main substream's layout (when it is a channel substream of one
+       of the layouts), else to the layout asked for, or 5.1 */
+    {
+        const ac4_toc_sub *m = s[kmain];
+        obj_lay = d->cfg.layout ? d->cfg.layout : AC4DEC_LAYOUT_5_1;
+        if (m->kind == 0) {
+            int el = element_of_cm(m->channel_mode, t.pres[pi].version);
+            if (el == AC4DEC_ELEMENT_PAIR)
+                obj_lay = AC4DEC_LAYOUT_2_0;
+            else if (el == AC4DEC_ELEMENT_5X)
+                obj_lay = AC4DEC_LAYOUT_5_1;
+            else if (el == AC4DEC_ELEMENT_7X && m->channel_mode == 6)
+                obj_lay = AC4DEC_LAYOUT_7_1;
+            else if (el == AC4DEC_ELEMENT_ICE
+                     && (m->channel_mode == 12 || m->channel_mode == 14)
+                     && m->centre && m->top == 3)
+                obj_lay = m->back4 ? AC4DEC_LAYOUT_7_1_4
+                                   : AC4DEC_LAYOUT_5_1_4;
+        } else {
+            d->cfg.ajoc_core = 1;
+            d->objmix = 1;
+            lay_slots(ajoc_layout(d), d->lay_slot);
+        }
+    }
     for (k = 0; k < n; k++) {
         int slot = k == kmain ? 0 : ++d->n_kid;
         d->mix_type[slot] = ac4_toc_substream_type(&t, pi, grp[k]);
@@ -3010,15 +3139,17 @@ static void mix_decide(ac4dec *d, const uint8_t *data, size_t len)
         if (slot > 0) {
             ac4dec_config c = d->cfg;
             long long j;
-            c.element = element_of_cm(s[k]->channel_mode,
-                                      t.pres[pi].version);
+            c.element = s[k]->kind != 0 ? AC4DEC_ELEMENT_AJOC
+                        : element_of_cm(s[k]->channel_mode,
+                                        t.pres[pi].version);
             c.ch_mode = c.element == AC4DEC_ELEMENT_7X
                         || c.element == AC4DEC_ELEMENT_ICE
                         ? (int)s[k]->channel_mode : 0;
             c.present = c.element == AC4DEC_ELEMENT_ICE
                         ? 16 | (s[k]->back4 ? 1 : 0) | (s[k]->centre ? 2 : 0)
                           | (s[k]->top << 2) : 0;
-            c.layout = 0;
+            c.layout = c.element == AC4DEC_ELEMENT_AJOC ? obj_lay : 0;
+            c.ajoc_core = 1;
             c.channels = 0;
             c.internal_rate = 1;
             c.loudness = 0;
@@ -3090,6 +3221,12 @@ static void mix_frame(ac4dec *d, outf_t *o, ac4dec_frame *out)
     double y[NOUT][FRAME];
     int s, c, j, i, has_assoc = 0, conc = 0;
     const ac4_meta *m = &o->meta;
+    /* the mix's channels: the main decoder's, or with an object main the
+       layout's (objmix) */
+    int nd = d->objmix ? d->n_lay : d->n_ch, dmask = 0;
+    const int *dslot = d->objmix ? d->lay_slot : d->out_ch;
+    for (c = 0; c < nd; c++)
+        dmask |= 1 << dslot[c];
     if (m->valid) {
         if (m->sg_state == 2)
             for (i = 0; i < d->mix_n_sg; i++)
@@ -3110,10 +3247,10 @@ static void mix_frame(ac4dec *d, outf_t *o, ac4dec_frame *out)
         const double *src[NOUT];
         int src_slot[NOUT];
         if (s == 0) {
-            n_src = d->n_ch;
+            n_src = nd;
             for (j = 0; j < n_src; j++) {
                 src[j] = o->pcm[j];
-                src_slot[j] = d->out_ch[j];
+                src_slot[j] = dslot[j];
             }
         } else {
             const ac4dec *k = d->kid[s - 1];
@@ -3126,32 +3263,34 @@ static void mix_frame(ac4dec *d, outf_t *o, ac4dec_frame *out)
                 src[j] = d->kid_out[s - 1].pcm[j];
                 src_slot[j] = k->out_ch[j];
             }
+            if (k->element == AC4DEC_ELEMENT_AJOC && !k->ajoc_full)
+                lay_slots(ajoc_layout(k), src_slot);   /* rendered */
         }
         memset(gm, 0, sizeof(gm));
         if (n_src == 1 && src_slot[0] == CH_C
             && ((d->mix_type[s] == 2 && d->mix_has_assoc && d->mix_has_sc[3])
-                || !(d->el_mask & (1 << CH_C)))) {
+                || !(dmask & (1 << CH_C)))) {
             double pg[NOUT];
             double ang = d->mix_type[s] == 2 && d->mix_has_assoc
                          && d->mix_has_sc[3] ? d->mix_sc[3] : 0.0;
-            pan_gains(ang, d->el_mask, pg);
-            for (c = 0; c < d->n_ch; c++)
-                gm[c][0] = pg[d->out_ch[c]];
+            pan_gains(ang, dmask, pg);
+            for (c = 0; c < nd; c++)
+                gm[c][0] = pg[dslot[c]];
         } else {
-            for (c = 0; c < d->n_ch; c++)
+            for (c = 0; c < nd; c++)
                 for (j = 0; j < n_src; j++)
-                    if (src_slot[j] == d->out_ch[c])
+                    if (src_slot[j] == dslot[c])
                         gm[c][j] = 1.0;
         }
         {
             double g = mix_db(d->mix_sgdb[d->mix_sg[s]]);
-            for (c = 0; c < d->n_ch; c++)
+            for (c = 0; c < nd; c++)
                 for (j = 0; j < n_src; j++)
                     gm[c][j] *= g;
             if (d->mix_type[s] == 2) {
                 double ga = mix_db(d->cfg.assoc_gain < 0.0
                                    ? d->cfg.assoc_gain : 0.0);
-                for (c = 0; c < d->n_ch; c++)
+                for (c = 0; c < nd; c++)
                     for (j = 0; j < n_src; j++)
                         gm[c][j] *= ga;
             }
@@ -3168,8 +3307,8 @@ static void mix_frame(ac4dec *d, outf_t *o, ac4dec_frame *out)
                 if (!d->mix_has_sc[i])
                     continue;
                 g = mix_db(d->mix_sc[i]);
-                for (c = 0; c < d->n_ch; c++) {
-                    int sl = d->out_ch[c];
+                for (c = 0; c < nd; c++) {
+                    int sl = dslot[c];
                     if (i == 0 || (i == 2 && (sl == CH_L || sl == CH_R))
                         || (i == 1 && sl == CH_C))
                         for (j = 0; j < n_src; j++)
@@ -3178,24 +3317,24 @@ static void mix_frame(ac4dec *d, outf_t *o, ac4dec_frame *out)
             }
         }
         if (d->mix_version >= 1)
-            for (c = 0; c < d->n_ch; c++)
+            for (c = 0; c < nd; c++)
                 for (j = 0; j < n_src; j++)
                     gm[c][j] /= (double)d->mix_n;
         {
             /* mix.py: a changed matrix crossfades over the frame */
             int same = d->mix_gn[s] == n_src;
-            for (c = 0; c < d->n_ch && same; c++)
+            for (c = 0; c < nd && same; c++)
                 for (j = 0; j < n_src; j++)
                     if (gm[c][j] != d->mix_gprev[s][c][j])
                         same = 0;
             if (!d->mix_ghas[s] || same || d->mix_gn[s] != n_src) {
-                for (c = 0; c < d->n_ch; c++)
+                for (c = 0; c < nd; c++)
                     for (j = 0; j < n_src; j++)
                         if (gm[c][j] != 0.0)
                             for (i = 0; i < o->n; i++)
                                 y[c][i] += src[j][i] * gm[c][j];
             } else {
-                for (c = 0; c < d->n_ch; c++)
+                for (c = 0; c < nd; c++)
                     for (j = 0; j < n_src; j++) {
                         double p = j < d->mix_gn[s]
                                    ? d->mix_gprev[s][c][j] : 0.0;
@@ -3213,7 +3352,7 @@ static void mix_frame(ac4dec *d, outf_t *o, ac4dec_frame *out)
             d->mix_ghas[s] = 1;
         }
     }
-    for (c = 0; c < d->n_ch; c++)
+    for (c = 0; c < nd; c++)
         memcpy(o->pcm[c], y[c], sizeof(double) * (size_t)o->n);
     if (conc && out->status == AC4DEC_OK) {
         out->status = AC4DEC_CONCEALED;

@@ -35,6 +35,24 @@ def main(out):
                                   iframe_every=8, **kw)
         with open(os.path.join(out, name + ".syn"), "wb") as fh:
             fh.write(b"".join(syncframe(f) for f in frames))
+    # phase E: direct-coded objects (a bed over two substreams and two
+    # dynamic objects; ISF over two substreams)
+    import test_phase_e as E
+    rng = np.random.default_rng(2027)
+    for name, subs, objs in (
+            ("objs_bed_dyn",
+             [dict(kind="bed", n=3, blfe=1, start=("code", 2)),
+              dict(kind="bed", n=2, start=None),
+              dict(kind="dyn", n=2, lfe=0)],
+             [(False, None, None)] * 6 + [(True, (5, 50, 3), -3),
+                                          (True, (60, 10, -2), None)]),
+            ("objs_isf",
+             [dict(kind="isf", n=5, start=1), dict(kind="isf", n=3,
+                                                   start=None)],
+             [(False, None, None)] * 8)):
+        frames, _ = E.objs_frames(rng, subs, objs, n=48, iframe_every=8)
+        with open(os.path.join(out, name + ".syn"), "wb") as fh:
+            fh.write(b"".join(syncframe(f) for f in frames))
 
 
 if __name__ == "__main__":

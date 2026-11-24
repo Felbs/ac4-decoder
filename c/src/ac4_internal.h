@@ -167,7 +167,21 @@ typedef struct {
     int lfe, static_dmx, n_dmx;
     long n_umx;
     signed char dmx_type[16], umx_type[64];
+    /* direct-coded objects (kind 2; ac4_substream_info_obj, 6.2.1.11;
+       toc.obj_split): n_objects (the coded signals), objects (0 dynamic,
+       1 bed, 2 ISF, 3 reserved), b_lfe (dynamic), the bed's / ISF's
+       assignment when this substream starts one (n_assign, -1: none;
+       render ids, AC4_OBJ_ISF_I(i) for ISF object i of isf_cfg); after
+       the split: this substream's objects in OAMD order (types, n_types;
+       lfe: one is an LFE) and its first object's index in the group's
+       oamd_dyndata_multi */
+    int n_objects, objects, dyn_lfe, n_assign, isf_cfg;
+    signed char assign[32];
+    int n_types, oamd_offset;
+    signed char types[8];
+    unsigned obj_bed;      /* the group's bed_mask */
 } ac4_toc_sub;
+#define AC4_OBJ_ISF_I(i) (-10 - (i))
 #define AC4_OBJ_DYN (-1)
 #define AC4_OBJ_ISF (-2)
 
@@ -176,6 +190,15 @@ typedef struct {
     int n_subs;            /* kept (at most AC4_MAX_GSUBS) */
     long n_subs_all;
     ac4_toc_sub subs[AC4_MAX_GSUBS];
+    /* an object-coded group's oamd_substream (has_oamd, its index, -1
+       when not present, and b_oamd_ndot) and its objects (toc.obj_split:
+       type a render id, AC4_OBJ_DYN or AC4_OBJ_ISF; LFE; A-JOC coded);
+       bed_mask: the render ids of the group's bed assignments */
+    int has_oamd, oamd_ndot, n_obj;
+    long oamd_index;
+    signed char obj_type[64];
+    unsigned char obj_lfe[64], obj_ajoc[64];
+    unsigned bed_mask;
     int content_classifier;   /* -1 when no content_type */
     char language[16];        /* "" when none */
 } ac4_toc_group;
@@ -366,7 +389,12 @@ typedef struct {
                                    2 p, 2 p + 1 (groups 0, 1, 3), of the
                                    odd signal n - 1 */
     int tail;                   /* audio_data_ajoc: OAMD and A-JOC data
-                                   follow the A-SPX blocks */
+                                   follow the A-SPX blocks (1); a
+                                   direct-coded object substream: its
+                                   OAMD is in the oamd_substream (2) */
+    const void *objs_lfe;       /* audio_data_objs: the books when the
+                                   LFE's mono_data follows audio_size
+                                   (kept by element_reset) */
     size_t audio_size, audio_start;
     size_t bits_end;            /* where the core parse ended */
     /* the tracks, by output channel (decoder.c CH_*: L R C LFE Ls Rs;
@@ -417,6 +445,11 @@ void ac4_parse_ice(ac4_bits *b, const ac4_books *bk, int b_iframe,
 void ac4_parse_ajoc(ac4_bits *b, const ac4_books *bk, int b_iframe,
                     int lfe, int static_dmx, int n, long n_umx,
                     ac4_element *e);
+/* audio_data_objs (TS 103 190-2 6.2.3.2; elements.objs_element): the
+   LFE's mono_data, then the element of objs_to_channel_mode(n) in codec
+   mode SIMPLE or ASPX */
+void ac4_parse_objs(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                    int n, int lfe, ac4_element *e);
 
 /* ------------------------------------------------------------ A-SPX
  * Port of ac4/aspx_bands.py, aspx_parse.py, aspx_env.py, aspx_envadj.py,
@@ -944,6 +977,7 @@ typedef struct {
    object and downmix signal / decorrelator (n: band count, 0 none) */
 typedef struct {
     int init, blocks, n_dlg;
+    int n_grp;             /* direct-coded objects: the group's count */
     ac4_obj dmx[17], umx[65];
     ac4_oamd_timing dt, ut;
     unsigned char qd[AC4_AJOC_NU][AC4_AJOC_ND][23];
@@ -971,6 +1005,14 @@ void ac4_oamd_common_data(ac4_bits *b);
    b->jb. */
 void ac4_ajoc_tail(ac4_bits *b, const ac4_huff *bk, const ac4_toc_sub *info,
                    int ifr, ac4_obj_state *st, ac4_ajoc_frame *fr);
+/* elements.objs_tail: the oamd_substream of group g for its
+   direct-coded substream s (the group's objects' states in st->umx,
+   the timing in st->dt); fr gets s's objects' block updates
+   (n_dev, dev, dblk). ndot: b_oamd_ndot; alternative: b_alternative
+   (no oamd_dyndata_multi) */
+void ac4_objs_tail(ac4_bits *b, const ac4_toc_group *g,
+                   const ac4_toc_sub *s, int ndot, int alternative,
+                   ac4_obj_state *st, ac4_ajoc_frame *fr);
 /* ajoc.input_order (Pseudocode 14a) -> pos[0 .. n_fb) */
 void ac4_ajoc_input_order(int n_fb, int *pos);
 
@@ -989,6 +1031,14 @@ void ac4_decorr_run(ac4_decorr *s, int cd, int n, double (*vr)[64],
 /* objrender.matrix: objects of types[0 .. n) (RN_* of a bed channel,
    RN_LFE, AC4_OBJ_DYN / _ISF) with states st (NULL: unknown) on layout
    lay -> M (layout channels x n, row-major) */
+/* objrender.bed_of: the bed (render id mask) of the bed channels in
+   have (a mask), and of the bed types among types[0 .. n) */
+unsigned ac4_bed_of(unsigned have);
+unsigned ac4_bed_mask_types(const signed char *types, int n);
+/* objrender.matrix with the bed given (render id mask) and the ISF
+   configuration of AC4_OBJ_ISF_I types */
+void ac4_obj_matrix_ex(const signed char *types, const ac4_obj *st, int n,
+                       int lay, unsigned bed, int isf_cfg, double *M);
 void ac4_obj_matrix(const signed char *types, const ac4_obj *st, int n,
                     int lay, double *M);
 

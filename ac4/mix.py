@@ -34,8 +34,10 @@ interpolation, TS 103 190-1 5.7.8.6); unchanged matrices apply as
 they are.
 
 Dialogue enhancement substreams (presentation_config 1 and 4) are not
-mixed (toc.audio_substreams leaves them out). Object audio substreams are
-not decoded. UNVERIFIED ON REAL STREAMS: no capture or public test signal
+mixed (toc.audio_substreams leaves them out). Object audio substreams
+(phase E) are decoded by their own Decoder, rendered by it to the main
+substream's layout (or the one asked for), and mixed like the rest; an
+A-JOC substream mixed with others is taken in core decoding mode. UNVERIFIED ON REAL STREAMS: no capture or public test signal
 at hand carries more than one audio substream in a presentation (the
 second substream of every one of them is the presentation substream);
 the tests build such streams bit by bit.
@@ -76,9 +78,12 @@ def probe(frames, presentation=None, language=None, limit=64):
         out = []
         for k, (gi, g, s) in enumerate(subs):
             cm = s.get("channel_mode")
+            obj = s["kind"] in ("obj", "ajoc")
             out.append(dict(k=k, type=M.substream_type(st, pi, gi),
                             group=gi, ch_mode=cm,
-                            element=ELEMENT_OF_CH_MODE.get(cm),
+                            element=("ajoc" if obj else
+                                     ELEMENT_OF_CH_MODE.get(cm)),
+                            info=s if obj else None,
                             version=p.get("version")))
         # the substream group index (sg of Table 70) of each substream:
         # the position of its group among the presentation's mixed groups
@@ -162,19 +167,34 @@ class MixDecoder:
                  assoc_gain=0.0, dialog_gain=0.0, layout=None,
                  stereo_dmx="loro"):
         from . import robust as RB
+        from .render import LAYOUTS
         self.subs = list(subs)
-        self.decs = []
-        for d in self.subs:
+        self.decs = [None] * len(self.subs)
+        mains = [i for i, d in enumerate(self.subs) if d["type"] == "main"]
+        self.main = mains[0] if mains else 0
+        # object substreams (phase E) are rendered to a layout by their
+        # decoder: the main substream's, when that is a channel
+        # substream of one of render.LAYOUTS; else `layout`, or 5.1
+        order = [self.main] + [i for i in range(len(self.subs))
+                               if i != self.main]
+        obj_layout = layout or "5.1"
+        for i in order:
+            d = self.subs[i]
             el = d["element"]
             if el is None:
                 raise ValueError(f"substream {d['k']}: channel mode "
                                  f"{d['ch_mode']} not decodable")
-            self.decs.append(Decoder(
+            self.decs[i] = Decoder(
                 el, guard=guard, presentation=presentation,
                 language=language, de_level=de_level, substream=d["k"],
-                ch_mode=d["ch_mode"] if el in ("7_X", "ice") else None))
-        mains = [i for i, d in enumerate(self.subs) if d["type"] == "main"]
-        self.main = mains[0] if mains else 0
+                ch_mode=d["ch_mode"] if el in ("7_X", "ice") else None,
+                ajoc_info=d.get("info"), ajoc_core=True,
+                layout=obj_layout if el == "ajoc" else None)
+            if i == self.main and el != "ajoc":
+                hit = [k for k, v in LAYOUTS.items()
+                       if v == tuple(self.decs[i].chans)]
+                if hit:
+                    obj_layout = hit[0]
         full = self.decs[self.main].chans
         if channels is not None and channels not in (2, len(full)):
             raise ValueError(f"channels must be {len(full)} or 2")

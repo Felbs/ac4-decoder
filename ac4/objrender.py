@@ -126,12 +126,27 @@ def render(signals, objects, chans):
     return signals @ M.T
 
 
-def matrix(types, states, out, layout):
+def bed_of(types):
+    """The bed (channel set for the channel renderer) of the bed objects
+    among types, in BED_FULL order; a bed of one channel other than C
+    takes the 2.0 / 5.X.0 / 7.X.4 bed that holds it."""
+    bed = tuple(c for c in BED_FULL if c in types or (c == "lfe"
+                                                       and "lfe2" in types))
+    if len(bed) == 1 and bed[0] not in ("C", "lfe"):
+        from . import render as RD
+        for full in (("L", "R"), RD.LAYOUTS["5.1"], BED_FULL):
+            if bed[0] in full:
+                return tuple(full)
+    return bed
+
+
+def matrix(types, states, out, layout, bed=None):
     """The rendering matrix (len(out), len(types)) of objects of the
     given types ("lfe", a bed channel name, "DYN" or "ISF") with their
     ObjState (None: unknown, rendered at gain 1 from the room's front
     centre (0.5, 0, 0)) on the layout's channels `out`."""
     from . import render as RD
+    bed = bed_of(types) if bed is None else tuple(bed)
     M = np.zeros((len(out), len(types)))
     for j, t in enumerate(types):
         st = states[j] if states is not None and j < len(states) else None
@@ -139,15 +154,55 @@ def matrix(types, states, out, layout):
         if st is not None and not st.active:
             gdb = -math.inf
         g = 0.0 if gdb == -math.inf else 10.0 ** (gdb / 20.0)
-        if t == "lfe":
+        if t in ("lfe", "lfe2"):
             if "lfe" in out:
                 M[out.index("lfe"), j] = g
+        elif t.startswith("ISF:"):
+            # TS 103 190-2 5.10.3: the ISF matrix of the layout (A.2.1),
+            # its rows the ISF objects, columns the speakers of Table A.27
+            # without the LFE
+            _, cfg, i = t.split(":")
+            row = isf_matrix(int(cfg), layout)[int(i)]
+            spk = [c for c in out if c != "lfe"]
+            for c, v in zip(spk, row):
+                M[out.index(c), j] = g * v
         elif t in ("DYN", "ISF"):
             pos = st.position() if st is not None else (0.5, 0.0, 0.0)
             M[:, j] = g * gains(pos, out)
+        elif t in bed:
+            # a bed channel as a channel of its bed (alone, the channel
+            # renderer would take "R" for a mono input; phase E)
+            M[:, j] = g * RD.matrix(bed, layout)[:, bed.index(t)]
         else:
-            M[:, j] = g * RD.matrix((t,), layout)[:, 0]
+            # Lw / Rw, Tsl / Tsr (no channel-renderer input): panned at
+            # their Table A.30 position
+            M[:, j] = g * gains(bed_position(t), out)
     return M
+
+
+BED_FULL = ("L", "R", "C", "lfe", "Ls", "Rs", "Lb", "Rb", "Tfl", "Tfr",
+            "Tbl", "Tbr")
+
+
+# ISF (TS 103 190-2 5.10.3, Annex A.2.1): isf_config -> the matrices'
+# names (Table 61's stacked-ring formats), layout -> their output suffix
+ISF_NAMES = ("SR3100", "SR5300", "SR7300", "SR9500", "SR7530", "SR15951")
+ISF_OUT = {"2.0": "2", "5.1": "5", "5.1.2": "502", "5.1.4": "504",
+           "7.1": "7", "7.1.2": "702", "7.1.4": "704"}
+_ISF = None
+
+
+def isf_matrix(isf_config, layout):
+    """-> the (n_isf, n_speakers) coefficient matrix of Annex A.2.1
+    (ac4/tables/ac4_isf.json, from ts_103190_tables_part2.c) for the
+    layout (its speakers without the LFE, in Table A.27 order)."""
+    global _ISF
+    if _ISF is None:
+        import json
+        import os
+        _ISF = json.load(open(os.path.join(os.path.dirname(
+            os.path.abspath(__file__)), "tables", "ac4_isf.json")))
+    return _ISF[f"{ISF_NAMES[isf_config]}_to_{ISF_OUT[layout]}"]
 
 
 class SampleRamp:

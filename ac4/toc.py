@@ -399,11 +399,24 @@ def substream_info_ajoc(b, present, frf, st):
     return s
 
 
+# direct-coded beds (6.2.1.11): bed_chan_assign_code with the LFE
+# (Table 63's channels, the LFE fourth)
+BED_OBJ_CH = tuple(c[:3] + ("lfe",) + c[3:] if len(c) > 3 else c
+                   for c in BED_AJOC_CH)
+
+
 def substream_info_obj(b, present, frf, st):
+    """ac4_substream_info_obj (6.2.1.11) -> dict: n_objects (the coded
+    signals of audio_data_objs, Table 60 without the LFE), objects
+    ("dynamic", "bed", "isf", "reserved"), b_lfe (dynamic objects), and
+    assign: the bed's or ISF's object types when this substream starts
+    them (b_bed_start / b_isf_start), None when it extends the group's
+    previous one. obj_split() turns them into each substream's objects."""
     code = b.u(3)
     if code > 5:
         raise ValueError(f"n_objects_code {code} reserved")
-    s = dict(kind="obj", n_objects=(0, 1, 2, 3, 5, 7)[code])
+    s = dict(kind="obj", n_objects=(0, 1, 2, 3, 5, 7)[code], b_lfe=0,
+             assign=None)
     if b.u(1):                            # b_dynamic_objects
         s["b_lfe"] = b.u(1)
         s["objects"] = "dynamic"
@@ -411,20 +424,87 @@ def substream_info_obj(b, present, frf, st):
         s["objects"] = "bed"
         if b.u(1):                        # b_bed_start
             if b.u(1):                    # b_ch_assign_code
-                b.u(3)
+                s["assign"] = list(BED_OBJ_CH[b.u(3)])
             elif b.u(1):                  # nonstd flags present
-                b.u(17)
+                fl = b.u(17)
+                s["assign"] = [NONSTD_CH[i] for i in range(17)
+                               if (fl >> (16 - i)) & 1]
             else:
-                b.u(10)
+                fl = b.u(10)
+                s["assign"] = [c for i in range(10) if (fl >> (9 - i)) & 1
+                               for c in STD_CH[i]]
     elif b.u(1):                          # b_isf
         s["objects"] = "isf"
         if b.u(1):                        # b_isf_start
-            _isf_n(b)
+            c = b.u(3)
+            if c >= len(ISF_N):
+                raise ValueError(f"isf_config {c} reserved")
+            s["assign"] = [f"ISF:{c}:{i}" for i in range(ISF_N[c])]
     else:
         s["objects"] = "reserved"
         b.u(8 * b.u(4))
     _sf_bitrate_ndot_index(b, present, frf, st, s)
     return s
+
+
+def obj_split(g):
+    """The objects of a substream group's object substreams (interpreted:
+    6.2.1.11 restarts n_objs per substream, while the group's one
+    oamd_substream covers them all): each direct-coded substream s gets
+    s["types"], its objects in OAMD order ("lfe" / "lfe2", a bed channel
+    name, "DYN", or "ISF:<isf_config>:<i>"), s["lfe"] (audio_data_objs'
+    b_lfe: one of its objects is an LFE, coded first as mono_data) and
+    s["oamd_offset"], its first object's index in the group's
+    oamd_dyndata_multi; g["obj_types"] lists (type, b_lfe, b_ajoc_coded)
+    of the whole group (A-JOC substreams' upmix objects are A-JOC coded).
+
+    Dynamic objects: the LFE (b_lfe) first, then n_objects of them
+    (Table 60's count). A bed or ISF is shared out in its assignment
+    order: a substream takes the next n_objects non-LFE objects and the
+    first LFE not taken yet (6.3.2.10.6: one LFE per substream); one
+    that does not start a bed (ISF) continues the group's last."""
+    pending = []
+    types = []
+    bed = []
+    for s in g["substreams"]:
+        if s["kind"] == "obj" and s["objects"] == "bed" and s["assign"]:
+            bed += [t for t in s["assign"] if t not in bed]
+    for s in g["substreams"]:
+        if s["kind"] == "ajoc":
+            n = s["n_upmix"] + (1 if s["b_lfe"] else 0)
+            types += [("DYN", 0, 1)] * n
+            continue
+        if s["kind"] != "obj":
+            continue
+        n = s["n_objects"]
+        if s["objects"] == "dynamic":
+            own = (["lfe"] if s["b_lfe"] else []) + ["DYN"] * n
+        elif s["objects"] in ("bed", "isf"):
+            if s["assign"] is not None:
+                pending = list(s["assign"])
+            own, lfe_taken, k = [], False, 0
+            rest = []
+            for t in pending:
+                is_lfe = t in ("lfe", "lfe2")
+                if is_lfe and not lfe_taken:
+                    own.append(t)
+                    lfe_taken = True
+                elif not is_lfe and k < n:
+                    own.append(t)
+                    k += 1
+                else:
+                    rest.append(t)
+            pending = rest
+            own += ["DYN"] * (n - k)       # more signals than assigned
+        else:
+            own = ["DYN"] * n
+        s["types"] = own
+        s["bed"] = bed
+        s["lfe"] = int(any(t in ("lfe", "lfe2") for t in own))
+        s["oamd_offset"] = len(types)
+        types += [(t if not t.startswith("ISF") else "ISF",
+                   int(t in ("lfe", "lfe2")), 0) for t in own]
+    g["obj_types"] = types
 
 
 def substream_info_v0(b, frf, st):
@@ -557,6 +637,7 @@ def substream_group_info(b, st):
             if hsf:
                 s["hsf_index"] = hsf_ext_substream_info(b, present)
             g["substreams"].append(s)
+        obj_split(g)
     if b.u(1):                            # b_content_type
         g["content_classifier"], g["language"] = content_type(b)
     return g
@@ -722,7 +803,7 @@ def audio_substreams(st, pi):
     for gi, g, s in presentation_substreams(st, pi):
         if gi == de_group:
             continue
-        if (s["kind"] == "chan" and s.get("index") is not None
+        if (s["kind"] in ("chan", "obj") and s.get("index") is not None
                 and s["index"] < len(st["substream_sizes"])):
             out.append((gi, g, s))
     if not out and AJOC_CORE:

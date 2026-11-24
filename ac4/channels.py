@@ -982,7 +982,11 @@ def audio_size(b):
     if b.u(1):
         asz += b.vb(7) << 15
         b.align()
-    return asz, b.p
+    a0 = b.p
+    pre = getattr(b.d, "pre", None)
+    if pre is not None:             # audio_data_objs' LFE (elements.py)
+        pre(b)
+    return asz, a0
 
 
 def load_tables():

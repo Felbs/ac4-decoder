@@ -383,10 +383,21 @@ VAR_SLOTS = {1: ("C",), 2: ("L", "R"), 3: ("L", "R", "C"),
 VAR_PAIR_GROUPS = (0, 1, 3)
 
 
+# audio_data_objs (TS 103 190-2 6.2.3.2): objs_to_channel_mode (6.2.3.3)
+# -> the element and its track slots
+OBJS_ELEMENT = {1: ("mono", ("C",)), 2: ("pair", ("L", "R")),
+                3: ("3_0", ("L", "R", "C")),
+                5: ("5_0", ("L", "R", "C", "Ls", "Rs"))}
+
+
 def ajoc_slots(info):
     """The decoder track slots of an A-JOC substream's downmix (core
     decoding): ("lfe" first when b_lfe) + VAR_SLOTS, or the 5_X
-    element's for b_static_dmx."""
+    element's for b_static_dmx. A direct-coded object substream
+    (info kind "obj", audio_data_objs): the LFE, then its element's."""
+    if info.get("kind") == "obj":
+        el = OBJS_ELEMENT.get(info["n_objects"])
+        return (("lfe",) if info["lfe"] else ()) + (el[1] if el else ())
     lfe = ("lfe",) if info["b_lfe"] else ()
     if info["static"]:
         return ("L", "R", "C") + lfe + ("Ls", "Rs")
@@ -463,6 +474,8 @@ def ajoc_element(sub, T, info, b_iframe=False):
     b_static_dmx: the downmix is a 5.0 / 5.1 audio_data_chan (5_X
     element); otherwise a var_channel_element of n_dmx signals (at most
     seven here; more are concealed, element.parse)."""
+    if info.get("kind") == "obj":
+        return objs_element(sub, T, info, b_iframe)
     if info["n_upmix"] > 64:
         raise Damaged("element.parse", "A-JOC with more than 64 upmix "
                       "objects not built")
@@ -556,3 +569,91 @@ def ajoc_tail(b, info, ifr, st):
     out["dmx"] = [s.copy() for s in dmx_s]
     out["umx"] = [s.copy() for s in umx_s]
     return out
+
+
+class _ObjSub(bytes):
+    """A substream whose audio_data starts with audio_data_objs' LFE
+    mono_data: channels.audio_size reads it (pre) right after the
+    audio_size field, so the channel elements parse the rest unchanged."""
+    pre = None
+
+
+def objs_element(sub, T, info, b_iframe=False):
+    """ac4_substream of a direct-coded object substream (TS 103 190-2
+    6.2.2.2, audio_data_objs 6.2.3.2): the LFE's mono_data when the
+    substream carries one, then audio_data_chan of objs_to_channel_mode
+    (n_objects 1, 2, 3, 5: mono, stereo, 3.0, 5.0; others concealed,
+    element.parse). The objects' metadata is in the group's
+    oamd_substream (stream.py, out["tail"] "objs"). Elements in codec
+    modes other than SIMPLE / ASPX (A-CPL, SSF) are concealed."""
+    n = info["n_objects"]
+    if n not in OBJS_ELEMENT:
+        raise Damaged("element.parse", f"audio_data_objs with {n} objects")
+    el = OBJS_ELEMENT[n][0]
+    got = {}
+    x = _ObjSub(sub)
+    if info["lfe"]:
+        x.pre = lambda b: got.__setitem__(
+            "lfe", C.mono_data(b, T, b_lfe=True))
+    if el == "mono":
+        out = single_channel_element(x, T, b_iframe)
+    elif el == "pair":
+        from . import pair as PAIR
+        out = PAIR.decode_pair(x, T, b_iframe=b_iframe)
+        if out["mode"][1] > 1:
+            raise Damaged("element.parse", "objects in ASPX_ACPL_1 / _2")
+        out["order"] = ("L", "R")
+    elif el == "3_0":
+        out = three_0_channel_element(x, T, b_iframe)
+    else:
+        out = C.decode_element(x, T, b_iframe=b_iframe, has_lfe=False)
+        if out["mode"][1] > 1:
+            raise Damaged("element.parse", "objects in 5.0 with A-CPL")
+    if info["lfe"]:
+        out["lfe"] = got["lfe"]
+        out["order"] = ("lfe",) + tuple(out.get("order") or ())
+    out["mode"] = ("objs",) + tuple(out["mode"])
+    out["ajoc_info"] = info
+    out["tail"] = "objs"
+    return out
+
+
+def objs_tail(oamd_sub, g, s, ifr, st):
+    """The objects' metadata of a direct-coded object substream s of
+    group g, from the group's oamd_substream (TS 103 190-2 6.2.2.4):
+    oamd_common_data, oamd_timing_data and oamd_dyndata_multi over every
+    object of the group (toc.obj_split) -> dict as ajoc_tail's for core
+    decoding: dmx (this substream's objects' states), dmx_blocks (after
+    each block update) and dmx_upd ((update sample, ramp) per block).
+    st holds the group's object states and timing between frames
+    (Ac4Stream.obj_state). ifr: the oamd_substream's b_oamd_ndot.
+
+    b_alternative (oamd_dyndata_single in each substream's metadata)
+    is not read: those objects keep their last states."""
+    from . import oamd as O
+    from .toc import Bits
+    typ = g["obj_types"]
+    n = len(typ)
+    sts = st.setdefault("grp", [O.ObjState() for _ in range(n)])
+    if len(sts) != n:
+        raise Damaged("element.parse", "object count changed")
+    b = Bits(oamd_sub)
+    if b.u(1):                                  # b_oamd_common_data_present
+        from .toc import oamd_common_data
+        oamd_common_data(b)
+    tm = st.get("timing")
+    nb = st.get("blocks", 1)
+    if b.u(1):                                  # b_oamd_timing_present
+        tm = O.oamd_timing_data(b)
+        nb = len(tm["blocks"])
+    blk = []
+    if not st.get("alternative"):
+        ot = [O.BED if t not in ("DYN", "ISF") else t for t, _l, _a in typ]
+        O.oamd_dyndata_multi(b, sts, nb, ifr, ot, [l for _t, l, _a in typ],
+                             [a for _t, _l, a in typ], blk)
+    st["timing"] = tm
+    st["blocks"] = nb
+    k0, k1 = s["oamd_offset"], s["oamd_offset"] + len(s["types"])
+    return dict(dmx=[x.copy() for x in sts[k0:k1]],
+                dmx_blocks=[bl[k0:k1] for bl in blk] if blk else None,
+                dmx_upd=O.block_updates(tm, nb))

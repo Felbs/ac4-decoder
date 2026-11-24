@@ -282,12 +282,6 @@ void ac4_toc_substream_info_chan(ac4_bits *b, int present, int frf,
 static const int ISF_N[6] = { 4, 8, 10, 14, 15, 30 };
 static const int BED_AJOC_N[8] = { 2, 3, 5, 7, 9, 7, 9, 11 };
 
-static void isf_config(ac4_bits *b)
-{
-    if (ac4_u(b, 3) > 5)
-        ac4_fail(b, b->eof_code);       /* reserved */
-}
-
 /* toc.obj_assignment: the type of each of n_signals signals (types[]:
    max entries kept) */
 static void obj_assignment(ac4_bits *b, long n_signals, signed char *types,
@@ -398,32 +392,159 @@ static void info_ajoc(ac4_bits *b, int present, int frf, ac4_toc *t,
     sub_tail(b, present, frf, t->fs_index, s);
 }
 
+/* the bed channels of a direct-coded bed (Tables 63 - 66 with the LFE,
+   render ids) */
+static const signed char OBJ_NONSTD[17] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                                            12, 13, 10, 11, 14, 15, 3 };
+static const signed char OBJ_STD[10][2] = { { 0, 1 }, { 2, -9 }, { 3, -9 },
+    { 4, 5 }, { 6, 7 }, { 8, 9 }, { 12, 13 }, { 10, 11 }, { 14, 15 },
+    { 3, -9 } };
+
 static void info_obj(ac4_bits *b, int present, int frf, ac4_toc *t,
                      ac4_toc_sub *s)
 {
+    static const int NOBJ[6] = { 0, 1, 2, 3, 5, 7 };
+    static const signed char BED[8][12] = {
+        { 0, 1 }, { 0, 1, 2 }, { 0, 1, 2, 3, 4, 5 },
+        { 0, 1, 2, 3, 4, 5, 12, 13 }, { 0, 1, 2, 3, 4, 5, 8, 9, 10, 11 },
+        { 0, 1, 2, 3, 4, 5, 6, 7 }, { 0, 1, 2, 3, 4, 5, 6, 7, 12, 13 },
+        { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 } };
+    static const int BED_N[8] = { 2, 3, 6, 8, 10, 8, 10, 12 };
+    int code, i;
     memset(s, 0, sizeof(*s));
     s->kind = 2;
     s->channel_mode = -1;
-    if (ac4_u(b, 3) > 5)                /* n_objects_code */
+    s->n_assign = -1;
+    code = (int)ac4_u(b, 3);            /* n_objects_code */
+    if (code > 5)
         ac4_fail(b, b->eof_code);
+    s->n_objects = NOBJ[code];
     if (ac4_bit(b)) {                   /* b_dynamic_objects */
-        ac4_bit(b);                     /* b_lfe */
+        s->objects = 0;
+        s->dyn_lfe = (int)ac4_bit(b);   /* b_lfe */
     } else if (ac4_bit(b)) {            /* b_bed_objects */
+        s->objects = 1;
         if (ac4_bit(b)) {               /* b_bed_start */
-            if (ac4_bit(b))
-                ac4_u(b, 3);
-            else if (ac4_bit(b))
-                ac4_u(b, 17);
-            else
-                ac4_u(b, 10);
+            s->n_assign = 0;
+            if (ac4_bit(b)) {           /* b_ch_assign_code */
+                int c = (int)ac4_u(b, 3);
+                for (i = 0; i < BED_N[c]; i++)
+                    s->assign[s->n_assign++] = BED[c][i];
+            } else if (ac4_bit(b)) {
+                uint32_t fl = ac4_u(b, 17);
+                for (i = 0; i < 17; i++)
+                    if ((fl >> (16 - i)) & 1)
+                        s->assign[s->n_assign++] = OBJ_NONSTD[i];
+            } else {
+                uint32_t fl = ac4_u(b, 10);
+                for (i = 0; i < 10; i++)
+                    if ((fl >> (9 - i)) & 1) {
+                        s->assign[s->n_assign++] = OBJ_STD[i][0];
+                        if (OBJ_STD[i][1] >= 0)
+                            s->assign[s->n_assign++] = OBJ_STD[i][1];
+                    }
+            }
         }
     } else if (ac4_bit(b)) {            /* b_isf */
-        if (ac4_bit(b))
-            isf_config(b);
+        s->objects = 2;
+        if (ac4_bit(b)) {               /* b_isf_start */
+            int c = (int)ac4_u(b, 3);
+            if (c > 5)
+                ac4_fail(b, b->eof_code);
+            s->isf_cfg = c;
+            s->n_assign = ISF_N[c];
+            for (i = 0; i < ISF_N[c]; i++)
+                s->assign[i] = (signed char)AC4_OBJ_ISF_I(i);
+        }
     } else {
+        s->objects = 3;
         ac4_skip(b, 8 * (int)ac4_u(b, 4));   /* res_bytes */
     }
     sub_tail(b, present, frf, t->fs_index, s);
+}
+
+/* toc.obj_split: each direct-coded substream's objects, the group's */
+static void obj_split(ac4_toc_group *g)
+{
+    signed char pend[32];
+    int np = 0, j, i, isf_cfg = 0;
+    g->n_obj = 0;
+    g->bed_mask = 0;
+    for (j = 0; j < g->n_subs; j++) {
+        const ac4_toc_sub *s = &g->subs[j];
+        if (s->kind == 2 && s->objects == 1)
+            for (i = 0; i < s->n_assign; i++)
+                g->bed_mask |= 1u << s->assign[i];
+    }
+#define PUTO(t, l, a) do { if (g->n_obj < 64) { \
+        g->obj_type[g->n_obj] = (signed char)(t); \
+        g->obj_lfe[g->n_obj] = (unsigned char)(l); \
+        g->obj_ajoc[g->n_obj] = (unsigned char)(a); } g->n_obj++; } while (0)
+    for (j = 0; j < g->n_subs; j++) {
+        ac4_toc_sub *s = &g->subs[j];
+        int n = s->n_objects, k = 0;
+        if (s->kind == 1) {
+            long m = s->n_umx + (s->lfe ? 1 : 0), q;
+            for (q = 0; q < m; q++)
+                PUTO(AC4_OBJ_DYN, 0, 1);
+            continue;
+        }
+        if (s->kind != 2)
+            continue;
+        s->n_types = 0;
+#define OWN(t) do { if (s->n_types < 8) s->types[s->n_types] = \
+        (signed char)(t); s->n_types++; } while (0)
+        if (s->objects == 0) {
+            if (s->dyn_lfe)
+                OWN(RN_LFE);
+            for (i = 0; i < n; i++)
+                OWN(AC4_OBJ_DYN);
+        } else if (s->objects == 1 || s->objects == 2) {
+            signed char rest[32];
+            int nr = 0, lfe_taken = 0;
+            if (s->n_assign >= 0) {
+                np = s->n_assign;
+                memcpy(pend, s->assign, (size_t)np);
+                if (s->objects == 2)
+                    isf_cfg = s->isf_cfg;
+            }
+            for (i = 0; i < np; i++) {
+                int t = pend[i], is_lfe = t == RN_LFE;
+                if (is_lfe && !lfe_taken) {
+                    OWN(t);
+                    lfe_taken = 1;
+                } else if (!is_lfe && k < n) {
+                    OWN(t);
+                    k++;
+                } else {
+                    rest[nr++] = (signed char)t;
+                }
+            }
+            memcpy(pend, rest, (size_t)nr);
+            np = nr;
+            for (; k < n; k++)
+                OWN(AC4_OBJ_DYN);
+            if (s->objects == 2)
+                s->isf_cfg = isf_cfg;
+        } else {
+            for (i = 0; i < n; i++)
+                OWN(AC4_OBJ_DYN);
+        }
+#undef OWN
+        if (s->n_types > 8)
+            s->n_types = 8;      /* more than a substream codes: unused */
+        s->lfe = 0;
+        for (i = 0; i < s->n_types; i++)
+            if (s->types[i] == RN_LFE)
+                s->lfe = 1;
+        s->oamd_offset = g->n_obj;
+        s->obj_bed = g->bed_mask;
+        for (i = 0; i < s->n_types; i++) {
+            int t = s->types[i];
+            PUTO(t <= AC4_OBJ_ISF_I(0) ? AC4_OBJ_ISF : t, t == RN_LFE, 0);
+        }
+    }
+#undef PUTO
 }
 
 static void substream_group_info(ac4_bits *b, int frf, ac4_toc *t,
@@ -447,10 +568,12 @@ static void substream_group_info(ac4_bits *b, int frf, ac4_toc *t,
     g->n_subs_all = (long)(n_lf > 1000000 ? 1000000 : n_lf);
     g->channel_coded = (int)ac4_bit(b);
     if (!g->channel_coded) {
+        g->oamd_index = -1;
         if (ac4_bit(b)) {               /* b_oamd_substream */
-            ac4_bit(b);                 /* b_oamd_ndot */
+            g->has_oamd = 1;
+            g->oamd_ndot = (int)ac4_bit(b);   /* b_oamd_ndot */
             if (present)
-                substream_index(b);
+                g->oamd_index = substream_index(b);
         }
     }
     for (i = 0; i < n_lf; i++) {
@@ -466,6 +589,8 @@ static void substream_group_info(ac4_bits *b, int frf, ac4_toc *t,
         if (g->n_subs < AC4_MAX_GSUBS)
             g->subs[g->n_subs++] = s;
     }
+    if (!g->channel_coded)
+        obj_split(g);
     if (ac4_bit(b))                     /* b_content_type */
         content_type(b, g);
 }
@@ -692,7 +817,8 @@ int ac4_toc_audio_substreams(const ac4_toc *t, int pi,
         g = &t->groups[gi];
         for (j = 0; j < g->n_subs; j++) {
             const ac4_toc_sub *s = &g->subs[j];
-            if (s->kind == 0 && s->index >= 0 && s->index < t->n_sizes
+            if ((s->kind == 0 || s->kind == 2) && s->index >= 0
+                && s->index < t->n_sizes
                 && s->index < AC4_MAX_SIZES) {
                 if (n < max) {
                     out[n] = s;

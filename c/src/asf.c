@@ -770,6 +770,8 @@ static void audio_size(ac4_bits *b, ac4_element *e)
     e->audio_size = (size_t)(asz > ((uint64_t)1 << 40)
                              ? ((uint64_t)1 << 40) : asz);
     e->audio_start = b->p;
+    if (e->objs_lfe)                    /* audio_data_objs' LFE */
+        mono_data(b, (const ac4_books *)e->objs_lfe, 1, e, K_LFE);
 }
 
 static void aspx_config(ac4_bits *b, ac4_aspx_cfg *c)
@@ -1295,4 +1297,23 @@ void ac4_parse_ajoc(ac4_bits *b, const ac4_books *bk, int b_iframe,
     e->comp_c = n - 1;
     e->tail = 1;
     e->bits_end = b->p;
+}
+
+void ac4_parse_objs(ac4_bits *b, const ac4_books *bk, int b_iframe,
+                    int n, int lfe, ac4_element *e)
+{
+    e->objs_lfe = lfe ? (const void *)bk : NULL;
+    switch (n) {
+    case 1: ac4_parse_mono(b, bk, b_iframe, e); break;
+    case 2: ac4_parse_pair(b, bk, b_iframe, e); break;
+    case 3: ac4_parse_3_0(b, bk, b_iframe, e); break;
+    case 5: ac4_parse_5x_lfe(b, bk, b_iframe, 0, e); break;
+    default:
+        e->objs_lfe = NULL;
+        ac4_fail(b, AC4E_ELEMENT_PARSE);
+    }
+    e->objs_lfe = NULL;
+    if ((n == 2 || n == 5) && e->mode > 1)
+        ac4_fail(b, AC4E_ELEMENT_PARSE);   /* A-CPL: not for objects */
+    e->tail = 2;
 }
