@@ -80,6 +80,7 @@ class Ac4Stream:
         self.acpl_cfg = None        # acpl_config_2ch, from the last I-frame
         from . import metadata as MDm
         self.sub_meta = MDm.SubMetaState()  # the audio substream's DE state
+        self.want_de = False        # read the DE data (Decoder.de_level)
         # acpl_<SET>_q_prev of the eleven sets (Pseudocode 121), rolled back
         # with a concealed frame like the A-SPX framing state
         self.acpl_q = [None] * 11
@@ -624,6 +625,8 @@ class Ac4Stream:
         metadata() (TS 103 190-2 6.2.7; metadata.py) -> dict(config, par,
         ms), or None (none, or the metadata does not parse)."""
         from . import metadata as MDm
+        if not self.want_de:
+            return None
         cm = self.META_CH_MODE.get(self.element, sel.get("channel_mode"))
         try:
             md = MDm.substream_metadata(sub, r["audio_start"],

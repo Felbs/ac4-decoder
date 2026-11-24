@@ -189,6 +189,7 @@ class Decoder:
         # dialogue enhancement (de.py): the user gain in dB (0 = off) and
         # the lead-in frames' DE entries
         self.de_level = float(de_level)
+        self.stream.want_de = self.de_level != 0
         self.lead_de = []
         self.log = []               # human-readable notes, in order
         # damaged input (robust.py): frames concealed, by reason
