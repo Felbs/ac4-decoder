@@ -131,7 +131,7 @@ def list_presentations(src, out=print):
 def decode_file(src, dst, element="auto", channels=None, seconds=None,
                 max_pass=1800, ref_peak=0.0, quiet=False, guard=True,
                 presentation=None, language=None, target_level=-24.0,
-                drc="auto", de_level=0.0):
+                drc="auto", de_level=0.0, mix=True, assoc_gain=0.0):
     from . import container
     from . import rates as RT
     from .decoder import Decoder, probe_element, probe_rate
@@ -172,10 +172,24 @@ def decode_file(src, dst, element="auto", channels=None, seconds=None,
     ch_mode = (probe_ch_mode(frames, presentation=presentation,
                              language=language) if element == "7_X" else None)
     try:
-        dec = Decoder(element, channels, guard=guard,
-                      presentation=presentation, language=language,
-                      target_level=None if legacy else target_level, drc=drc,
-                      ch_mode=ch_mode, de_level=de_level)
+        dec = None
+        if mix:
+            from . import mix as MX
+            subs = MX.probe(frames, presentation, language)
+            if len(subs) > 1:
+                dec = MX.MixDecoder(
+                    subs, channels, guard=guard, presentation=presentation,
+                    language=language,
+                    target_level=None if legacy else target_level, drc=drc,
+                    de_level=de_level, assoc_gain=assoc_gain)
+                say(f"  mixing {len(subs)} substreams: "
+                    + ", ".join(f"{d['type']} ({d['element']})"
+                                for d in subs))
+        if dec is None:
+            dec = Decoder(element, channels, guard=guard,
+                          presentation=presentation, language=language,
+                          target_level=None if legacy else target_level,
+                          drc=drc, ch_mode=ch_mode, de_level=de_level)
     except ValueError as e:
         say(str(e))
         return 1
@@ -262,6 +276,12 @@ def main(argv=None):
     ap.add_argument("--de-level", type=float, default=0.0,
                     help="dialogue enhancement gain in dB (0 = off, the "
                          "default; capped by the stream's maximum)")
+    ap.add_argument("--no-mix", action="store_true",
+                    help="decode only the presentation's main substream "
+                         "(default: mix its dialogue / associated audio "
+                         "substreams in, TS 103 190-2 4.8.4)")
+    ap.add_argument("--assoc-gain", type=float, default=0.0,
+                    help="associated audio gain in dB, <= 0 (g_assoc)")
     ap.add_argument("--ref-peak", type=float, default=0.0,
                     help="use the old fixed-reference level rule instead: "
                          "decoder-scale level written at 0.9 of full scale")
@@ -282,7 +302,8 @@ def main(argv=None):
                        guard=not a.no_guard, presentation=pres,
                        language=a.language, target_level=a.target_level,
                        drc=a.drc if a.drc in ("auto", "off") else
-                       int(a.drc), de_level=a.de_level)
+                       int(a.drc), de_level=a.de_level,
+                       mix=not a.no_mix, assoc_gain=a.assoc_gain)
 
 
 if __name__ == "__main__":

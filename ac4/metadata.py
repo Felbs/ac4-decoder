@@ -23,6 +23,8 @@ result ("error"), not raised.
 """
 from __future__ import annotations
 
+import math
+
 from . import hcb as H
 from . import spectral as S
 from .toc_v1 import Bits
@@ -259,10 +261,15 @@ def drc_frame(b, iframe, state, ch_mode, frame_len):
 
 # ---------------------------------------------------------------- presentation substream
 def presentation_substream(sub, b_alternative, b_pres_ndot, n_substreams,
-                           drc, ch_mode, frame_len):
-    """ac4_presentation_substream (6.2.2.3) up to the end of drc_frame ->
-    dict: dialnorm (dBFS), loudness (further_loudness_info), drc
-    (drc_frame or None), name (alternative presentations)."""
+                           drc, ch_mode, frame_len, n_groups=1):
+    """ac4_presentation_substream (6.2.2.3) up to the associated audio
+    mixing metadata -> dict: dialnorm (dBFS), loudness
+    (further_loudness_info), drc (drc_frame or None), name (alternative
+    presentations); with n_groups > 1 substream groups, "sg_gain" (a list
+    of dB, -inf for 63, Table 70; "keep" when b_keep; absent when not
+    sent) and "assoc" (b_associated: scale_main, scale_main_centre,
+    scale_main_front in dB, pan_associated in degrees, each None when not
+    sent; TS 103 190-1 4.3.12.4)."""
     b = Bits(sub)
     out = {}
     if b_alternative:
@@ -308,7 +315,39 @@ def presentation_substream(sub, b_alternative, b_pres_ndot, n_substreams,
         out["drc_error"] = str(e)[:60]
     b.p = start + size
     out["drc_metadata_size"] = size
+    try:
+        if n_groups > 1 and b.u(1):          # b_substream_group_gains_present
+            if b.u(1):                       # b_keep
+                out["sg_gain"] = "keep"
+            else:
+                out["sg_gain"] = [sg_gain_db(b.u(6)) for _ in range(n_groups)]
+        if b.u(1):                           # b_associated
+            a = {}
+            a["scale_main"] = scale_db(b.u(8)) if b.u(1) else None
+            a["scale_main_centre"] = scale_db(b.u(8)) if b.u(1) else None
+            a["scale_main_front"] = scale_db(b.u(8)) if b.u(1) else None
+            a["pan_associated"] = pan_deg(b.u(8)) if b.u(1) else None
+            out["assoc"] = a
+    except (ValueError, EOFError, KeyError) as e:
+        out["mix_error"] = str(e)[:60]
     return out
+
+
+def sg_gain_db(v):
+    """Table 70: -0.25 dB steps, 63 = -inf."""
+    return -math.inf if v == 63 else -0.25 * v
+
+
+def scale_db(v):
+    """scale_main / _centre / _front (TS 103 190-1 4.3.12.4.4 - .8): 0 to
+    -76.2 dB in 0.3 dB steps, 0xff = mute."""
+    return -math.inf if v == 0xFF else -0.3 * v
+
+
+def pan_deg(v):
+    """pan_associated / pan_dialog (4.3.12.4.9): 1.5 degree steps,
+    clockwise from the front; 0xf0 .. 0xff are not used (read as 0)."""
+    return 1.5 * v if v < 0xF0 else 0.0
 
 
 # ---------------------------------------------------------------- substream metadata

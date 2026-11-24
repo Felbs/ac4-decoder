@@ -71,6 +71,49 @@ static void further_loudness_info(ac4_bits *b, ac4_meta *m)
     }
 }
 
+/* the substream group gains and the associated audio mixing metadata
+   after drc_frame (TS 103 190-2 6.2.2.3; metadata.presentation_substream):
+   each part is kept only when it is read whole */
+static void mix_metadata(ac4_bits *b, long n_groups, ac4_meta *m)
+{
+    int k;
+    if (n_groups > 1 && ac4_bit(b)) {   /* b_substream_group_gains_present */
+        if (ac4_bit(b)) {               /* b_keep */
+            m->sg_state = 1;
+        } else {
+            double g[AC4_MAX_SG];
+            long i;
+            for (i = 0; i < n_groups; i++) {
+                uint32_t v = ac4_u(b, 6);
+                if (i < AC4_MAX_SG)
+                    g[i] = v == 63 ? -INFINITY : -0.25 * (double)v;
+            }
+            m->n_sg = n_groups < AC4_MAX_SG ? (int)n_groups : AC4_MAX_SG;
+            memcpy(m->sg, g, sizeof(double) * (size_t)m->n_sg);
+            m->sg_state = 2;
+        }
+    }
+    if (ac4_bit(b)) {                   /* b_associated */
+        double v[4];
+        int has[4];
+        for (k = 0; k < 4; k++) {
+            has[k] = (int)ac4_bit(b);
+            if (has[k]) {
+                uint32_t x = ac4_u(b, 8);
+                if (k < 3)              /* 0.3 dB steps, 0xff mute */
+                    v[k] = x == 0xFF ? -INFINITY : -0.3 * (double)x;
+                else                    /* 1.5 degree steps */
+                    v[k] = x < 0xF0 ? 1.5 * (double)x : 0.0;
+            } else {
+                v[k] = 0.0;
+            }
+        }
+        memcpy(m->sc, v, sizeof(v));
+        memcpy(m->has_sc, has, sizeof(has));
+        m->has_assoc = 1;
+    }
+}
+
 static void compression_curve(ac4_bits *b, ac4_drc_mode *m)
 {
     m->nb_low = (int)ac4_u(b, 4);
@@ -253,11 +296,11 @@ static int drc_frame(ac4_bits *b, const ac4_huff *hcb, int iframe,
 int ac4_pres_metadata(const uint8_t *sub, size_t len, int b_alternative,
                       int b_pres_ndot, long n_substreams,
                       ac4_drc_config *state, const ac4_huff *hcb,
-                      int ch_mode, int fl, ac4_meta *out)
+                      int ch_mode, int fl, long n_groups, ac4_meta *out)
 {
     jmp_buf jb;
     ac4_bits b;
-    size_t size;
+    volatile size_t size = 0, start = 0;
     volatile int stage = 0;
     ac4_meta m;
     memset(out, 0, sizeof(*out));
@@ -270,8 +313,14 @@ int ac4_pres_metadata(const uint8_t *sub, size_t len, int b_alternative,
     if (setjmp(jb) != 0) {
         if (stage == 0)
             return -1;
-        /* the drc_frame did not parse: dialnorm kept, no DRC */
-        m.has_drc = 0;
+        if (stage == 1) {
+            /* the drc_frame did not parse: dialnorm kept, no DRC; the
+               mixing metadata after it is still read */
+            m.has_drc = 0;
+            stage = 2;
+            b.p = start + size;
+            mix_metadata(&b, n_groups, &m);
+        }
         *out = m;
         return 0;
     }
@@ -313,9 +362,12 @@ int ac4_pres_metadata(const uint8_t *sub, size_t len, int b_alternative,
     size = ac4_u(&b, 5);               /* drc_metadata_size */
     if (ac4_bit(&b))
         size += (size_t)ac4_vb(&b, 3) << 5;
-    (void)size;
+    start = b.p;
     stage = 1;
     m.has_drc = drc_frame(&b, hcb, b_pres_ndot, state, ch_mode, fl, &m);
+    stage = 2;
+    b.p = start + size;
+    mix_metadata(&b, n_groups, &m);
     *out = m;
     return 0;
 }

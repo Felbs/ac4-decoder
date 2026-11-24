@@ -196,6 +196,12 @@ static void presentation_v1_info(ac4_bits *b, int fri, int *frf_out,
                 break;
             }
         }
+        {
+            /* n_substream_groups (toc.py presentation_v1_info) */
+            static const int NSG[5] = { 2, 1, 2, 3, 2 };
+            p->n_sg = single ? 1 : cfg <= 4 ? NSG[cfg]
+                      : cfg == 5 ? (long)n_spec : 0;
+        }
         for (i = 0; i < n_spec; i++) {
             long g = sgi_specifier(b);
             if (p->n_groups < AC4_MAX_PGROUPS)
@@ -501,25 +507,66 @@ void ac4_toc_parse(ac4_bits *b, ac4_toc *t)
 
 /* ------------------------------------------------------------ choice */
 
-const ac4_toc_sub *ac4_toc_audio_substream(const ac4_toc *t, int pi)
+int ac4_toc_audio_substreams(const ac4_toc *t, int pi,
+                             const ac4_toc_sub **out, long *grp, int max)
 {
-    int k, j;
+    int k, j, n = 0;
+    long de = -1;
+    const ac4_toc_pres *p;
     if (pi < 0 || pi >= t->n_pres)
-        return NULL;
-    for (k = 0; k < t->pres[pi].n_groups; k++) {
-        long gi = t->pres[pi].groups[k];
+        return 0;
+    p = &t->pres[pi];
+    if ((p->config == 1 || p->config == 4) && p->n_groups > 1)
+        de = p->groups[1];
+    for (k = 0; k < p->n_groups; k++) {
+        long gi = p->groups[k];
         const ac4_toc_group *g;
-        if (gi < 0 || gi >= t->n_groups)
+        if (gi < 0 || gi >= t->n_groups || gi == de)
             continue;
         g = &t->groups[gi];
         for (j = 0; j < g->n_subs; j++) {
             const ac4_toc_sub *s = &g->subs[j];
             if (s->kind == 0 && s->index >= 0 && s->index < t->n_sizes
-                && s->index < AC4_MAX_SIZES)
-                return s;
+                && s->index < AC4_MAX_SIZES) {
+                if (n < max) {
+                    out[n] = s;
+                    if (grp)
+                        grp[n] = gi;
+                }
+                n++;
+            }
         }
     }
-    return NULL;
+    return n < max ? n : max;
+}
+
+const ac4_toc_sub *ac4_toc_audio_substream(const ac4_toc *t, int pi)
+{
+    const ac4_toc_sub *s[1];
+    return ac4_toc_audio_substreams(t, pi, s, NULL, 1) ? s[0] : NULL;
+}
+
+int ac4_toc_substream_type(const ac4_toc *t, int pi, long gi)
+{
+    /* Table 53 (0 M&E / main, 1 dialogue, 2 associated, 3 DE) and Table
+       54 (by content_classifier) */
+    static const int CFG[5][3] = { { 0, 1, 1 }, { 0, 3, 3 }, { 0, 2, 2 },
+                                   { 0, 1, 2 }, { 0, 3, 2 } };
+    static const int CLS[8] = { 0, 0, 2, 2, 1, 2, 0, 0 };
+    const ac4_toc_pres *p = &t->pres[pi];
+    int pos = 0, k;
+    if (p->config < 0)
+        return 0;
+    for (k = 0; k < p->n_groups; k++)
+        if (p->groups[k] == gi) {
+            pos = k;
+            break;
+        }
+    if (p->config <= 4)
+        return CFG[p->config][pos < 2 ? pos : 2];
+    if (gi >= 0 && gi < t->n_groups && t->groups[gi].content_classifier >= 0)
+        return CLS[t->groups[gi].content_classifier & 7];
+    return 0;
 }
 
 static const char *pres_language(const ac4_toc *t, int pi)

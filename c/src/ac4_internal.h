@@ -177,6 +177,7 @@ typedef struct {
     long groups[AC4_MAX_PGROUPS];
     long pres_substream;   /* -1 when none */
     int b_alternative, b_pres_ndot;
+    long n_sg;             /* n_substream_groups (toc.py) */
 } ac4_toc_pres;
 
 typedef struct {
@@ -214,6 +215,13 @@ int ac4_toc_choose(const ac4_toc *t, int index, long id, const char *language);
    channel-coded one with a substream_index inside the size table), or
    NULL. */
 const ac4_toc_sub *ac4_toc_audio_substream(const ac4_toc *t, int pi);
+/* toc.audio_substreams: the channel-coded substreams of presentation pi
+   (without a dialogue enhancement group, presentation_config 1 / 4), at
+   most max; grp[] their substream group indices. -> how many */
+int ac4_toc_audio_substreams(const ac4_toc *t, int pi,
+                             const ac4_toc_sub **out, long *grp, int max);
+/* toc.substream_type: 0 main / M&E, 1 dialogue, 2 associated, 3 DE */
+int ac4_toc_substream_type(const ac4_toc *t, int pi, long gi);
 
 /* Parse the TOC (TS 103 190-2 6.2.1, bitstream_version >= 2). Raises
    AC4E_TOC_PARSE through b->jb. */
@@ -817,11 +825,21 @@ typedef struct {
     int g[3][8][4];             /* dB2 */
 } ac4_drc_gains;
 
+#define AC4_MAX_SG 8            /* substream group gains kept */
+
 typedef struct {
     int valid;                  /* dialnorm parsed */
     double dialnorm;            /* dBFS */
     int has_truepk;             /* further_loudness_info sent truepk */
     double truepk;              /* dBTP (TS 103 190-1 4.3.12.3.17) */
+    /* mixing metadata (TS 103 190-2 6.2.2.3; metadata.py): sg_state 0 not
+       sent, 1 b_keep, 2 sg[] (dB, -inf for 63); has_assoc: b_associated,
+       with scale_main / _centre / _front (dB) and pan_associated
+       (degrees), each has_*[] when sent */
+    int sg_state, n_sg;
+    double sg[AC4_MAX_SG];
+    int has_assoc, has_sc[4];
+    double sc[4];               /* scale_main, _centre, _front, pan */
     int has_drc;
     ac4_drc_config cfg;         /* in force for this frame */
     int reset;                  /* drc_reset_flag, -1 when not sent */
@@ -833,7 +851,7 @@ typedef struct {
 int ac4_pres_metadata(const uint8_t *sub, size_t len, int b_alternative,
                       int b_pres_ndot, long n_substreams,
                       ac4_drc_config *state, const ac4_huff *hcb,
-                      int ch_mode, int fl, ac4_meta *out);
+                      int ch_mode, int fl, long n_groups, ac4_meta *out);
 double ac4_curve_gain(double x, const double *pv);
 
 typedef struct {

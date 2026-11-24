@@ -141,7 +141,24 @@ typedef struct {
     double de_level;       /* dialogue enhancement gain in dB (TS 103
                               190-1 5.7.8, de_method 0; capped by the
                               stream's maximum); 0 = off */
+    int substream;         /* which channel-coded substream of the
+                              presentation (0 = the main one); n > 0
+                              decodes only that one, unmixed */
+    int no_mix;            /* 1 = the main substream only (see MIXING) */
+    double assoc_gain;     /* associated audio gain g_assoc, dB <= 0 */
 } ac4dec_config;
+
+/* MIXING (TS 103 190-2 4.8.3.17, 4.8.3.18, 4.8.4; ac4/mix.py). When the
+   chosen presentation (decided at the first frame whose TOC parses) has
+   several channel-coded substreams -- music and effects + dialogue, main
+   + associated audio -- and substream is 0 and no_mix 0, the decoder
+   decodes each with an internal decoder of its own and gives their mix
+   in the main substream's channel layout: substream group gains, the
+   associated audio's scale_main / _centre / _front and pan_associated,
+   assoc_gain, and the sum divided by the number of substreams. A frame
+   is concealed when any substream's frame is. Unverified on real
+   streams. */
+#define AC4_MIX_MAX 4
 
 /* PRESENTATIONS (TS 103 190-2 4.8.2). The automatic choice is, per frame,
    the first enabled presentation that has a channel-coded audio substream,

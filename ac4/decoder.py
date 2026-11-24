@@ -140,7 +140,8 @@ class Decoder:
 
     def __init__(self, element="5_X", channels=None, burst_limit=None,
                  guard=True, presentation=None, language=None,
-                 target_level=None, drc="auto", ch_mode=None, de_level=0.0):
+                 target_level=None, drc="auto", ch_mode=None, de_level=0.0,
+                 substream=0):
         """The frame length follows the stream (TS 103 190-1 Table 83):
         `frame` is FRAME (1536) until the first frame whose rate the
         decoder takes (see Ac4Stream), then that frame_len_base; out_rate
@@ -153,7 +154,8 @@ class Decoder:
         if element not in ELEMENTS:
             raise ValueError(f"element {element!r}: one of {ELEMENTS}")
         self.stream = Ac4Stream(element=element, presentation=presentation,
-                                language=language, ch_mode=ch_mode)
+                                language=language, ch_mode=ch_mode,
+                                substream=substream)
         full = self.stream.CHANS
         if channels is None:
             channels = len(full)
@@ -569,9 +571,11 @@ IMS_CH_MODES = (5, 6, 7, 8, 9, 10)
 IMS_STEREO = 1
 
 
-def probe_ch_mode(frames, limit=64, presentation=None, language=None):
-    """The channel_mode (Table 88 ch_mode) of the audio substream of the
-    presentation that would be decoded (toc.choose), or None."""
+def probe_ch_mode(frames, limit=64, presentation=None, language=None,
+                  substream=0):
+    """The channel_mode (Table 88 ch_mode) of the audio substream (the
+    substream-th of toc.audio_substreams) of the presentation that would be
+    decoded (toc.choose), or None."""
     from . import toc as M
     for f in frames[:limit]:
         try:
@@ -579,7 +583,7 @@ def probe_ch_mode(frames, limit=64, presentation=None, language=None):
         except Exception:                                      # noqa: BLE001
             continue
         pi = M.choose(st, presentation, language)
-        sel = M.audio_substream(st, pi)
+        sel = M.audio_substream(st, pi, substream)
         if sel is None:
             continue
         cm = sel["channel_mode"]
@@ -590,23 +594,27 @@ def probe_ch_mode(frames, limit=64, presentation=None, language=None):
     return None
 
 
-def probe_element(frames, limit=64, presentation=None, language=None):
+def probe_element(frames, limit=64, presentation=None, language=None,
+                  substream=0):
     """Guess the element from the channel_mode of the audio substream of
     the presentation that would be decoded (toc.choose).
     -> "mono", "pair", "3_0", "5_0", "5_X" (5.1), "7_X", or None if not
     recognised."""
     return ELEMENT_OF_CH_MODE.get(probe_ch_mode(frames, limit, presentation,
-                                                language))
+                                                language, substream))
 
 
 def decode(frames, element=None, channels=None, max_pass=1800,
            presentation=None, language=None, target_level=None, drc="auto",
-           de_level=0.0):
+           de_level=0.0, mix=True):
     """Batch convenience: -> (pcm float64 (n, ch) at the external rate,
     Decoder.out_rate (48 kHz, or 44,1 kHz for fs_index 0), decoder scale,
     Decoder). The resampler ratio is the stream's (Table 83: 1001/960,
     25/24, 15/16 or 1; with ratio 1 it passes the samples through). Decodes in passes of `max_pass` frames, exactly as a
-    streaming caller would. presentation / language: see toc.choose."""
+    streaming caller would. presentation / language: see toc.choose.
+    A presentation with several channel-coded substreams (M&E + dialogue,
+    main + associated) is decoded and mixed by mix.MixDecoder (mix=False:
+    its main substream only)."""
     from .resample import StreamResampler
     element = element or probe_element(frames, presentation=presentation,
                                        language=language)
@@ -618,9 +626,18 @@ def decode(frames, element=None, channels=None, max_pass=1800,
                          "element='5_X' or 'pair'")
     ch_mode = (probe_ch_mode(frames, presentation=presentation,
                              language=language) if element == "7_X" else None)
-    dec = Decoder(element, channels, presentation=presentation,
-                  language=language, target_level=target_level, drc=drc,
-                  ch_mode=ch_mode, de_level=de_level)
+    dec = None
+    if mix:
+        from . import mix as MX
+        subs = MX.probe(frames, presentation, language)
+        if len(subs) > 1:
+            dec = MX.MixDecoder(subs, channels, presentation=presentation,
+                                language=language, target_level=target_level,
+                                drc=drc, de_level=de_level)
+    if dec is None:
+        dec = Decoder(element, channels, presentation=presentation,
+                      language=language, target_level=target_level, drc=drc,
+                      ch_mode=ch_mode, de_level=de_level)
     rs = StreamResampler(up, down)
     out = []
     for i in range(0, len(frames), max(1, max_pass)):

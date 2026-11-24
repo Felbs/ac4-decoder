@@ -62,7 +62,9 @@ class Cfg(ctypes.Structure):
                 ("loudness", ctypes.c_int),
                 ("target_level", ctypes.c_double),
                 ("drc", ctypes.c_int), ("ch_mode", ctypes.c_int),
-                ("de_level", ctypes.c_double)]
+                ("de_level", ctypes.c_double),
+                ("substream", ctypes.c_int), ("no_mix", ctypes.c_int),
+                ("assoc_gain", ctypes.c_double)]
 
 
 class Frame(ctypes.Structure):

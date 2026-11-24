@@ -267,6 +267,16 @@ struct ac4dec {
     /* ---- stats */
     long n_frames, n_out, n_ok, n_concealed, n_bad, n_seq_jumps;
     long n_guard, n_aspx_level, n_burst, n_late;
+    /* ---- mixing (mix.py): the other substreams' decoders */
+    int mix_decided, n_kid, mix_n, mix_version;
+    ac4dec *kid[AC4_MIX_MAX - 1];
+    ac4dec_frame kid_out[AC4_MIX_MAX - 1];
+    int kid_have[AC4_MIX_MAX - 1];
+    int mix_type[AC4_MIX_MAX], mix_sg[AC4_MIX_MAX];  /* [0]: this one */
+    int mix_n_sg;
+    double mix_sgdb[AC4_MAX_SG];
+    int mix_has_assoc, mix_has_sc[4];
+    double mix_sc[4];
     long reasons[AC4E_COUNT];
 };
 
@@ -371,10 +381,22 @@ static int choose_pres(const ac4dec_config *c, const ac4_toc *t)
                           c->language);
 }
 
+/* the audio substream this decoder takes: the cfg->substream-th
+   channel-coded substream of the chosen presentation */
+static const ac4_toc_sub *chosen_sub(const ac4dec_config *c,
+                                     const ac4_toc *t)
+{
+    const ac4_toc_sub *s[AC4_MIX_MAX];
+    int k = c->substream > 0 ? c->substream : 0;
+    int n = ac4_toc_audio_substreams(t, choose_pres(c, t), s, NULL,
+                                     AC4_MIX_MAX);
+    return k < n ? s[k] : NULL;
+}
+
 /* the element of the audio substream of the chosen presentation */
 static ac4dec_element element_of_toc(const ac4dec_config *c, const ac4_toc *t)
 {
-    const ac4_toc_sub *s = ac4_toc_audio_substream(t, choose_pres(c, t));
+    const ac4_toc_sub *s = chosen_sub(c, t);
     long cm;
     if (!s)
         return AC4DEC_ELEMENT_AUTO;
@@ -401,7 +423,7 @@ static ac4dec_element element_of_toc(const ac4dec_config *c, const ac4_toc *t)
 /* the 7_X ch_mode of the chosen presentation's audio substream, or 0 */
 static int ch_mode_of_toc(const ac4dec_config *c, const ac4_toc *t)
 {
-    const ac4_toc_sub *s = ac4_toc_audio_substream(t, choose_pres(c, t));
+    const ac4_toc_sub *s = chosen_sub(c, t);
     return s && s->channel_mode >= 5 && s->channel_mode <= 10
            ? (int)s->channel_mode : 0;
 }
@@ -873,6 +895,8 @@ void ac4dec_close(ac4dec *d)
     int i;
     if (!d)
         return;
+    for (i = 0; i < d->n_kid; i++)
+        ac4dec_close(d->kid[i]);
     for (i = 0; i < AC4T_N_BOOKS; i++)
         ac4_huff_free(&d->huff[i]);
     ac4_huff_free(&d->drc_hcb);
@@ -1221,8 +1245,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
        4.8.2), located by its substream_index; ITS b_audio_ndot says
        whether it is an I-frame */
     {
-        const ac4_toc_sub *s = ac4_toc_audio_substream(&t,
-                                                      choose_pres(&d->cfg, &t));
+        const ac4_toc_sub *s = chosen_sub(&d->cfg, &t);
         long i;
         if (!s) {
             code = AC4E_TOC_PRESENTATION;
@@ -1500,7 +1523,7 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
        _pres_metadata) */
     {
         int pi = choose_pres(&d->cfg, &t);
-        const ac4_toc_sub *s = ac4_toc_audio_substream(&t, pi);
+        const ac4_toc_sub *s = chosen_sub(&d->cfg, &t);
         const ac4_toc_pres *pp = pi >= 0 && pi < t.n_pres ? &t.pres[pi]
                                                           : NULL;
         r->meta.valid = 0;
@@ -1519,7 +1542,8 @@ static void parse_frame(ac4dec *d, const uint8_t *data, size_t len,
             if (ac4_pres_metadata(data + po, pl, pp->b_alternative,
                                   pp->b_pres_ndot, t.n_substreams,
                                   &d->drc_state, &d->drc_hcb,
-                                  (int)s->channel_mode, d->fl, &r->meta) != 0)
+                                  (int)s->channel_mode, d->fl, pp->n_sg,
+                                  &r->meta) != 0)
                 r->meta.valid = 0;
         }
     }
@@ -1894,6 +1918,9 @@ static void finish(ac4dec *d)
     assemble(d, hf, dcore, have);
 }
 
+static void mix_decide(ac4dec *d, const uint8_t *data, size_t len);
+static void mix_frame(ac4dec *d, outf_t *o, ac4dec_frame *out);
+
 /* ------------------------------------------------------------ guard */
 static int sustained(const ac4dec *d, int f, double ref)
 {
@@ -2108,6 +2135,8 @@ static void emit(ac4dec *d, ac4dec_frame *out)
         d->n_ok++;
     }
     out->n_channels = d->n_ch;
+    if (d->n_kid)
+        mix_frame(d, o, out);
     if (!d->rs_fixed) {
         /* the output resampler: the stream's ratio (Table 83 / 84), fixed
            at the first frame given out (1001 / 960 if no rate is known
@@ -2202,6 +2231,14 @@ int ac4dec_decode_frame(ac4dec *d, const uint8_t *data, size_t len,
         len = MAX_FRAME_BYTES + 1;      /* too large anyway: mp4.size */
     d->n_frames++;
     d->n_in++;
+    if (!d->mix_decided && !d->cfg.no_mix && d->cfg.substream == 0)
+        mix_decide(d, data, len);
+    {
+        int k;
+        for (k = 0; k < d->n_kid; k++)
+            d->kid_have[k] = ac4dec_decode_frame(d->kid[k], data, len,
+                                                 &d->kid_out[k]);
+    }
     if (d->has_raw) {
         /* parse the held frame now that its successor is here */
         parse_held(d, data, len, 1);
@@ -2215,6 +2252,242 @@ int ac4dec_decode_frame(ac4dec *d, const uint8_t *data, size_t len,
         return 1;
     }
     return 0;
+}
+
+/* ------------------------------------------------------------ mixing */
+static ac4dec_element element_of_cm(long cm, int version)
+{
+    switch (cm) {
+    case 0: return AC4DEC_ELEMENT_MONO;
+    case 1: return AC4DEC_ELEMENT_PAIR;
+    case 2: return AC4DEC_ELEMENT_3_0;
+    case 3: return AC4DEC_ELEMENT_5_0;
+    case 4: return AC4DEC_ELEMENT_5X;
+    default: break;
+    }
+    if (cm >= 5 && cm <= 10)
+        return version == 2 ? AC4DEC_ELEMENT_PAIR : AC4DEC_ELEMENT_7X;
+    return AC4DEC_ELEMENT_AUTO;
+}
+
+/* mix.probe / MixDecoder: at the first frame whose TOC parses, open a
+   decoder for every other channel-coded substream of the presentation
+   and bring it up to the frames fed so far (as lost frames) */
+static void mix_decide(ac4dec *d, const uint8_t *data, size_t len)
+{
+    ac4_toc t;
+    const ac4_toc_sub *s[AC4_MIX_MAX];
+    long grp[AC4_MIX_MAX], order[AC4_MIX_MAX];
+    int pi, n, k, i, n_order = 0, kmain = 0;
+    if (toc_try(data, len, &t) != 0)
+        return;
+    d->mix_decided = 1;
+    pi = choose_pres(&d->cfg, &t);
+    n = ac4_toc_audio_substreams(&t, pi, s, grp, AC4_MIX_MAX);
+    if (n < 2)
+        return;
+    for (k = 0; k < n; k++) {
+        for (i = 0; i < n_order; i++)
+            if (order[i] == grp[k])
+                break;
+        if (i == n_order)
+            order[n_order++] = grp[k];
+    }
+    for (k = n - 1; k >= 0; k--)
+        if (ac4_toc_substream_type(&t, pi, grp[k]) == 0)
+            kmain = k;
+    d->mix_version = t.pres[pi].version;
+    d->cfg.substream = kmain;
+    d->mix_n = 0;
+    for (k = 0; k < n; k++) {
+        int slot = k == kmain ? 0 : ++d->n_kid;
+        d->mix_type[slot] = ac4_toc_substream_type(&t, pi, grp[k]);
+        for (i = 0; i < n_order; i++)
+            if (order[i] == grp[k])
+                d->mix_sg[slot] = i;
+        if (slot > 0) {
+            ac4dec_config c = d->cfg;
+            long long j;
+            c.element = element_of_cm(s[k]->channel_mode,
+                                      t.pres[pi].version);
+            c.ch_mode = c.element == AC4DEC_ELEMENT_7X
+                        ? (int)s[k]->channel_mode : 0;
+            c.channels = 0;
+            c.internal_rate = 1;
+            c.loudness = 0;
+            c.substream = k;
+            c.no_mix = 1;
+            d->kid[slot - 1] = c.element == AC4DEC_ELEMENT_AUTO ? NULL
+                               : ac4dec_open(&c);
+            if (!d->kid[slot - 1]) {
+                /* not decodable: the main substream only */
+                for (i = 0; i < slot - 1; i++)
+                    ac4dec_close(d->kid[i]);
+                d->n_kid = 0;
+                d->cfg.substream = 0;
+                return;
+            }
+            for (j = 0; j < d->n_in - 1; j++)
+                ac4dec_decode_frame(d->kid[slot - 1], NULL, 0,
+                                    &d->kid_out[slot - 1]);
+        }
+    }
+    d->mix_n = n;
+    d->mix_n_sg = n_order < AC4_MAX_SG ? n_order : AC4_MAX_SG;
+}
+
+static double mix_db(double x)
+{
+    return isinf(x) && x < 0 ? 0.0 : pow(10.0, x / 20.0);
+}
+
+/* mix.pan_gains over the element's loudspeakers (slot mask) */
+static void pan_gains(double angle, int mask, double *g)
+{
+    static const int SL[5] = { CH_LS, CH_L, CH_C, CH_R, CH_RS };
+    static const double AZ[5] = { -110.0, -30.0, 0.0, 30.0, 110.0 };
+    int sp[6], n = 0, i;
+    double az[6], a;
+    for (i = 0; i < NCH; i++)
+        g[i] = 0.0;
+    for (i = 0; i < 5; i++)
+        if (mask & (1 << SL[i])) {
+            sp[n] = SL[i];
+            az[n++] = AZ[i];
+        }
+    if (n == 0)
+        return;
+    if (n == 1) {
+        g[sp[0]] = 1.0;
+        return;
+    }
+    a = fmod(angle + 180.0, 360.0) - 180.0;
+    sp[n] = sp[0];
+    az[n] = az[0] + 360.0;
+    for (i = 0; i < n; i++) {
+        double x = a >= az[i] ? a : a + 360.0, t;
+        if (az[i] <= x && x <= az[i + 1]) {
+            t = az[i + 1] > az[i] ? (x - az[i]) / (az[i + 1] - az[i]) : 0.0;
+            g[sp[i]] = 1.0 - t;
+            g[sp[i + 1]] += t;
+            return;
+        }
+    }
+    g[sp[0]] = 1.0;
+}
+
+/* MixDecoder.gains + decode_pass for one output frame: o->pcm (this
+   decoder's substream, after its guard) becomes the mix */
+static void mix_frame(ac4dec *d, outf_t *o, ac4dec_frame *out)
+{
+    double y[NCH][FRAME];
+    int s, c, j, i, has_assoc = 0, conc = 0;
+    const ac4_meta *m = &o->meta;
+    if (m->valid) {
+        if (m->sg_state == 2)
+            for (i = 0; i < d->mix_n_sg; i++)
+                d->mix_sgdb[i] = i < m->n_sg ? m->sg[i] : 0.0;
+        if (m->has_assoc) {
+            d->mix_has_assoc = 1;
+            memcpy(d->mix_sc, m->sc, sizeof(d->mix_sc));
+            memcpy(d->mix_has_sc, m->has_sc, sizeof(d->mix_has_sc));
+        }
+    }
+    for (s = 0; s < d->mix_n; s++)
+        if (d->mix_type[s] == 2)
+            has_assoc = 1;
+    memset(y, 0, sizeof(y));
+    for (s = 0; s < d->mix_n; s++) {
+        double gm[NCH][NCH];          /* [output c][source j] */
+        int n_src;
+        const double *src[NCH];
+        int src_slot[NCH];
+        if (s == 0) {
+            n_src = d->n_ch;
+            for (j = 0; j < n_src; j++) {
+                src[j] = o->pcm[j];
+                src_slot[j] = d->out_ch[j];
+            }
+        } else {
+            const ac4dec *k = d->kid[s - 1];
+            if (!d->kid_have[s - 1] || d->kid_out[s - 1].index != o->index)
+                continue;
+            if (d->kid_out[s - 1].status != AC4DEC_OK)
+                conc = s;
+            n_src = d->kid_out[s - 1].n_channels;
+            for (j = 0; j < n_src; j++) {
+                src[j] = d->kid_out[s - 1].pcm[j];
+                src_slot[j] = k->out_ch[j];
+            }
+        }
+        memset(gm, 0, sizeof(gm));
+        if (n_src == 1 && src_slot[0] == CH_C
+            && ((d->mix_type[s] == 2 && d->mix_has_assoc && d->mix_has_sc[3])
+                || !(d->el_mask & (1 << CH_C)))) {
+            double pg[NCH];
+            double ang = d->mix_type[s] == 2 && d->mix_has_assoc
+                         && d->mix_has_sc[3] ? d->mix_sc[3] : 0.0;
+            pan_gains(ang, d->el_mask, pg);
+            for (c = 0; c < d->n_ch; c++)
+                gm[c][0] = pg[d->out_ch[c]];
+        } else {
+            for (c = 0; c < d->n_ch; c++)
+                for (j = 0; j < n_src; j++)
+                    if (src_slot[j] == d->out_ch[c])
+                        gm[c][j] = 1.0;
+        }
+        {
+            double g = mix_db(d->mix_sgdb[d->mix_sg[s]]);
+            for (c = 0; c < d->n_ch; c++)
+                for (j = 0; j < n_src; j++)
+                    gm[c][j] *= g;
+            if (d->mix_type[s] == 2) {
+                double ga = mix_db(d->cfg.assoc_gain < 0.0
+                                   ? d->cfg.assoc_gain : 0.0);
+                for (c = 0; c < d->n_ch; c++)
+                    for (j = 0; j < n_src; j++)
+                        gm[c][j] *= ga;
+            }
+        }
+        if (d->mix_has_assoc && has_assoc
+            && (d->mix_type[s] == 0 || d->mix_type[s] == 1)) {
+            /* 4.8.3.17: centre (sc[1]), then L / R (sc[2]), then every
+               channel (sc[0], scale_main) */
+            static const int ORD[3] = { 1, 2, 0 };
+            int q;
+            for (q = 0; q < 3; q++) {
+                double g;
+                i = ORD[q];
+                if (!d->mix_has_sc[i])
+                    continue;
+                g = mix_db(d->mix_sc[i]);
+                for (c = 0; c < d->n_ch; c++) {
+                    int sl = d->out_ch[c];
+                    if (i == 0 || (i == 2 && (sl == CH_L || sl == CH_R))
+                        || (i == 1 && sl == CH_C))
+                        for (j = 0; j < n_src; j++)
+                            gm[c][j] *= g;
+                }
+            }
+        }
+        if (d->mix_version >= 1)
+            for (c = 0; c < d->n_ch; c++)
+                for (j = 0; j < n_src; j++)
+                    gm[c][j] /= (double)d->mix_n;
+        for (c = 0; c < d->n_ch; c++)
+            for (j = 0; j < n_src; j++)
+                if (gm[c][j] != 0.0)
+                    for (i = 0; i < o->n; i++)
+                        y[c][i] += src[j][i] * gm[c][j];
+    }
+    for (c = 0; c < d->n_ch; c++)
+        memcpy(o->pcm[c], y[c], sizeof(double) * (size_t)o->n);
+    if (conc && out->status == AC4DEC_OK) {
+        out->status = AC4DEC_CONCEALED;
+        out->reason = d->kid_out[conc - 1].reason;
+        d->n_ok--;
+        d->n_concealed++;
+    }
 }
 
 int ac4dec_flush(ac4dec *d, ac4dec_frame *out)
@@ -2231,6 +2504,9 @@ int ac4dec_flush(ac4dec *d, ac4dec_frame *out)
     for (;;) {
         int upstream = d->has_raw || d->rec_n > 0 || !d->finished;
         if (d->ring_n > 0 && (d->ring_n > d->G || !upstream)) {
+            int k;
+            for (k = 0; k < d->n_kid; k++)
+                d->kid_have[k] = ac4dec_flush(d->kid[k], &d->kid_out[k]);
             emit(d, out);
             return 1;
         }

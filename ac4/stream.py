@@ -51,7 +51,7 @@ CENTRE_ASPX = True
 
 class Ac4Stream:
     def __init__(self, element="5_X", presentation=None, language=None,
-                 ch_mode=None):
+                 ch_mode=None, substream=0):
         # "5_X" = the 5.1 programme element. "pair" = the stereo
         # channel_pair_element (Table 22). "mono", "3_0", "5_0" (5_X
         # without LFE) and "7_X" (ch_mode 5 - 10 of Table 88): elements.py
@@ -66,6 +66,10 @@ class Ac4Stream:
         # = by position in the TOC; "id:N" = by presentation_id
         self.presentation = presentation
         self.language = language
+        # which channel-coded substream of the presentation
+        # (toc.audio_substreams; 0: the main one; mix.py decodes the
+        # others with their own streams)
+        self.substream = substream
         self.selected = None        # index of the presentation decoded last
         self.last_toc = None
         self.acpl3 = False      # 13.25: set once the stream shows a 2-ch core + A-CPL
@@ -259,7 +263,7 @@ class Ac4Stream:
                 # can be an I-frame when b_iframe_global is not: the kit
                 # streams send one halfway between global I-frames.
                 pi = M.choose(st, self.presentation, self.language)
-                sel = M.audio_substream(st, pi)
+                sel = M.audio_substream(st, pi, self.substream)
                 if sel is None:
                     raise RB.Damaged("toc.presentation",
                                      "no decodable audio substream")
@@ -655,9 +659,11 @@ class Ac4Stream:
             md = MDm.presentation_substream(
                 psub, p.get("b_alternative", 0), p.get("b_pres_ndot", 0),
                 st.get("n_substreams", 0), self.drc_state,
-                sel.get("channel_mode", 1), self.frame_len or 1536)
+                sel.get("channel_mode", 1), self.frame_len or 1536,
+                n_groups=p.get("n_substream_groups", 1))
             return dict(dialnorm=md.get("dialnorm"), drc=md.get("drc"),
-                        truepk=(md.get("loudness") or {}).get("truepk"))
+                        truepk=(md.get("loudness") or {}).get("truepk"),
+                        sg_gain=md.get("sg_gain"), assoc=md.get("assoc"))
         except Exception:                                      # noqa: BLE001
             return None
 

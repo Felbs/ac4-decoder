@@ -553,17 +553,60 @@ def describe(st):
     return out
 
 
-def audio_substream(st, pi):
-    """-> the substream dict of the first channel-coded substream of
-    presentation pi that has a substream_index (the one this decoder
-    decodes), or None."""
+def audio_substreams(st, pi):
+    """-> [(group_index, group, substream)] of the channel-coded
+    substreams of presentation pi that have a substream_index, in TOC
+    order, without dialogue enhancement substreams (presentation_config 1
+    and 4: the second group, TS 103 190-2 Table 53; they are not mixed)."""
     if pi is None or not (0 <= pi < len(st.get("presentations") or [])):
-        return None
-    for _, g, s in presentation_substreams(st, pi):
+        return []
+    p = st["presentations"][pi]
+    de_group = (p["groups"][1] if p.get("config") in (1, 4)
+                and len(p["groups"]) > 1 else None)
+    out = []
+    for gi, g, s in presentation_substreams(st, pi):
+        if gi == de_group:
+            continue
         if (s["kind"] == "chan" and s.get("index") is not None
                 and s["index"] < len(st["substream_sizes"])):
-            return s
-    return None
+            out.append((gi, g, s))
+    return out
+
+
+def audio_substream(st, pi, k=0):
+    """-> the substream dict of the k-th channel-coded substream of
+    presentation pi (audio_substreams; k = 0: the one a single-substream
+    decode takes), or None."""
+    subs = audio_substreams(st, pi)
+    return subs[k][2] if 0 <= k < len(subs) else None
+
+
+# substream types (TS 103 190-2 4.8.3.2): per presentation_config the
+# type of the 1st, 2nd and 3rd substream group (Table 53); for
+# presentation_config 5 by content_classifier (Table 54)
+TYPES_OF_CONFIG = {0: ("me", "dialogue"), 1: ("main", "de"),
+                   2: ("main", "associated"),
+                   3: ("me", "dialogue", "associated"),
+                   4: ("main", "de", "associated")}
+TYPE_OF_CLASS = ("main", "main", "associated", "associated", "dialogue",
+                 "associated", "main", "main")
+
+
+def substream_type(st, pi, gi):
+    """-> "main" (main or music and effects), "dialogue", "associated" or
+    "de" for substream group gi of presentation pi."""
+    p = st["presentations"][pi]
+    cfg = p.get("config")
+    if cfg is None:
+        return "main"                     # b_single_substream_group
+    pos = p["groups"].index(gi) if gi in p["groups"] else 0
+    if cfg in TYPES_OF_CONFIG:
+        t = TYPES_OF_CONFIG[cfg]
+        return ("main" if t[min(pos, len(t) - 1)] == "me"
+                else t[min(pos, len(t) - 1)])
+    cc = st["groups"][gi].get("content_classifier") if gi < len(
+        st["groups"]) else None
+    return TYPE_OF_CLASS[cc] if cc is not None else "main"
 
 
 def choose(st, presentation=None, language=None):
