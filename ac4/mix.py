@@ -26,6 +26,12 @@ sees every frame, and the outputs are mixed frame by frame:
     printed: Y = sum(X_s) / n_sub; MIX_NORMALISE = False drops it, TS 103
     190-1 6.2.16's sum).
 Mixing metadata stays valid until new values are sent (6.2.16.0).
+Phase D: where a substream's mixing matrix changes from one frame to the
+next it is crossfaded over that frame, sample n of N taking (1 - w) the
+previous matrix and w the new one, w = (n + 1/2) / N (a reading: the
+standard does not say how; the form is that of dialogue enhancement's
+interpolation, TS 103 190-1 5.7.8.6); unchanged matrices apply as
+they are.
 
 Dialogue enhancement substreams (presentation_config 1 and 4) are not
 mixed (toc.audio_substreams leaves them out). Object audio substreams are
@@ -264,11 +270,23 @@ class MixDecoder:
             conc[:len(c)] |= c[:n]
             self.log.extend(d.log)
             d.log.clear()
+        w = (np.arange(F) + 0.5) / F
         for f in range(n):
             ms = self.gains(meta[f])
+            prev = getattr(self, "_m_prev", None) or [None] * len(ms)
             seg = slice(f * F, (f + 1) * F)
-            for yk, m in zip(ys, ms):
-                y[seg] += yk[seg] @ m.T
+            for yk, m, mp in zip(ys, ms, prev):
+                if mp is None or mp.shape != m.shape or np.array_equal(mp,
+                                                                       m):
+                    y[seg] += yk[seg] @ m.T
+                    continue
+                for c in range(m.shape[0]):
+                    for j in range(m.shape[1]):
+                        if m[c, j] == 0.0 and mp[c, j] == 0.0:
+                            continue
+                        g = mp[c, j] + (m[c, j] - mp[c, j]) * w
+                        y[seg, c] += yk[seg, j] * g[:len(yk[seg])]
+            self._m_prev = [m.copy() for m in ms]
         # reasons: every substream decoder's, the others' prefixed with
         # their substream ("s1:asf.sect_len"); n_concealed counts frames
         # any of them concealed

@@ -721,3 +721,46 @@ def _with_md(sub, tools):
     w.bits.extend(tools.bits)
     w.u(1, 0)                                    # no EMDF payloads
     return body + w.align().bytes()
+
+
+# ------------------------------------------------- mixing-gain changes
+def _sg_frames(sgs):
+    from test_mix import pair_sub, mono_sub, pres_sub
+    from test_phase_a import build_toc
+    rng = np.random.default_rng(17)
+    frames = []
+    for i, sg in enumerate(sgs):
+        a, b = pair_sub(rng), mono_sub(rng)
+        ps = pres_sub(sg=sg)
+        toc = build_toc(pres=[dict(groups=[0, 1], pres_sub=0)],
+                        groups=[dict(ch_mode_code="10", index=1, cc=1),
+                                dict(ch_mode_code="0", index=2, cc=4)],
+                        sizes=[len(ps), len(a), len(b)], seq=5 + i)
+        frames.append(toc + ps + a + b)
+    return frames
+
+
+def test_mix_gain_change_crossfades(tmp_path):
+    """A substream group gain that changes crossfades over the frame:
+    (1 - w) old + w new, w = (n + 1/2) / N; C against the Python."""
+    from ac4 import mix as MX
+    from ac4.decoder import Decoder
+    from test_mix import _c_mix
+    sgs = [(0, 0), (0, 0), (0, 24), (0, 24), (12, 24), (12, 24)]
+    frames = _sg_frames(sgs)
+    mx = MX.MixDecoder(MX.probe(frames), guard=False)
+    y = mx.decode_pass(frames)
+    ya = Decoder("pair", guard=False, substream=0).decode_pass(frames)
+    yb = Decoder("mono", guard=False, substream=1).decode_pass(frames)
+    F = 1536
+    w = (np.arange(F) + 0.5) / F
+    g1 = [10 ** (-v[1] * 0.25 / 20) for v in sgs]
+    g0 = [10 ** (-v[0] * 0.25 / 20) for v in sgs]
+    for f in (2, 3, 4):
+        s = slice(f * F, (f + 1) * F)
+        e1 = g1[f - 1] + (g1[f] - g1[f - 1]) * w
+        e0 = g0[f - 1] + (g0[f] - g0[f - 1]) * w
+        exp = (ya[s] * e0[:, None] + yb[s][:, [0, 0]] * 0.5 * e1[:, None]) / 2
+        assert np.abs(y[s] - exp).max() <= 1e-12 * np.abs(exp).max(), f
+    got = _c_mix(tmp_path, frames).reshape(-1, 2)
+    assert np.abs(got - y).max() <= 1e-9 * np.abs(y).max()

@@ -314,6 +314,8 @@ struct ac4dec {
                                    bitstream_version 0 / 1 */
     /* ---- mixing (mix.py): the other substreams' decoders */
     int mix_decided, n_kid, mix_n, mix_version;
+    double mix_gprev[AC4_MIX_MAX][NOUT][NOUT];  /* last frame's matrices */
+    int mix_gn[AC4_MIX_MAX], mix_ghas[AC4_MIX_MAX];
     ac4dec *kid[AC4_MIX_MAX - 1];
     ac4dec_frame kid_out[AC4_MIX_MAX - 1];
     int kid_have[AC4_MIX_MAX - 1];
@@ -3179,11 +3181,37 @@ static void mix_frame(ac4dec *d, outf_t *o, ac4dec_frame *out)
             for (c = 0; c < d->n_ch; c++)
                 for (j = 0; j < n_src; j++)
                     gm[c][j] /= (double)d->mix_n;
-        for (c = 0; c < d->n_ch; c++)
-            for (j = 0; j < n_src; j++)
-                if (gm[c][j] != 0.0)
-                    for (i = 0; i < o->n; i++)
-                        y[c][i] += src[j][i] * gm[c][j];
+        {
+            /* mix.py: a changed matrix crossfades over the frame */
+            int same = d->mix_gn[s] == n_src;
+            for (c = 0; c < d->n_ch && same; c++)
+                for (j = 0; j < n_src; j++)
+                    if (gm[c][j] != d->mix_gprev[s][c][j])
+                        same = 0;
+            if (!d->mix_ghas[s] || same || d->mix_gn[s] != n_src) {
+                for (c = 0; c < d->n_ch; c++)
+                    for (j = 0; j < n_src; j++)
+                        if (gm[c][j] != 0.0)
+                            for (i = 0; i < o->n; i++)
+                                y[c][i] += src[j][i] * gm[c][j];
+            } else {
+                for (c = 0; c < d->n_ch; c++)
+                    for (j = 0; j < n_src; j++) {
+                        double p = j < d->mix_gn[s]
+                                   ? d->mix_gprev[s][c][j] : 0.0;
+                        if (gm[c][j] == 0.0 && p == 0.0)
+                            continue;
+                        for (i = 0; i < o->n; i++) {
+                            double w = ((double)i + 0.5) / o->n;
+                            y[c][i] += src[j][i]
+                                       * (p + (gm[c][j] - p) * w);
+                        }
+                    }
+            }
+            memcpy(d->mix_gprev[s], gm, sizeof(gm));
+            d->mix_gn[s] = n_src;
+            d->mix_ghas[s] = 1;
+        }
     }
     for (c = 0; c < d->n_ch; c++)
         memcpy(o->pcm[c], y[c], sizeof(double) * (size_t)o->n);
