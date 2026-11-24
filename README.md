@@ -1458,24 +1458,56 @@ reading.
   184 of the immersive-stereo ones (decoded as stereo). The loudest
   public test stream peaks at 0.92 of full scale; it now fires on no
   clean stream at hand.
-* **Broadcaster A's stereo** plays about 17 dB below its loudness
-  metadata (BS.1770 -41.6 LUFS against loudrelgat -24.5 on its 10 s lane;
-  its SIMPLE stereo and its 5.1 match theirs within 0.3 dB). Phase B2
-  narrowed it to the companding tool: the same programme is on its 5.1
-  (correlation 0.96 with the 5.1's downmix). Without companding the
-  stereo core's per-frame level against that downmix spreads with a
-  standard deviation of 6.5 dB (loud frames 13 dB under, quiet ones 6 dB
-  over: the encoder's compression); the expansion of 5.7.5.2 brings the
-  spread to 2.7 dB, so its shape is right, but leaves the stereo 17 dB
-  under the downmix at the companding scale fitted on the kit
-  (Interpretations), where broadcaster B's stereo sits 0.7 dB under its
-  own 5.1 core and the kit's matches its AAC version. A change of that
-  scale moves every companded stream by the same gain, so it cannot
-  reconcile both; the formulas match the standard as printed (mean level
-  over the crossover's subbands, alpha 0.65, sync and average branches).
-  No decoder error found; open. The 34 dB step down at its A-SPX
-  crossover reported before is not explained by it (the high band is set
-  by the transmitted envelopes, not by the core's level) and stays open.
+* **Broadcaster A's stereo** plays 14 to 17 dB below its loudness
+  metadata (BS.1770 -41.4 LUFS against loudrelgat -24.5 on its 10 s
+  lane, -37.7 against -23.9 on a 178 s recording; its SIMPLE stereo and
+  its 5.1 match theirs within 0.5 dB). Investigated 2026-11-24: the
+  stream, not the decoder, as far as can be measured without a second
+  decoder (none on this box: FFmpeg has no AC-4 decoder).
+  * The raw core (decoded without the companding expansion, so free of
+    the companding-scale question) is already 6.3 dB under the stream's
+    own per-frame short-term loudness (loudstrm3s, matched at its best
+    lag of about 60 frames, 700 frames, sd 0.9 dB), where the companded
+    public stereo test stream's raw core sits 1.3 dB over its metadata
+    and broadcaster B's 1.3 dB under. Against the same programme on its
+    5.1 (downmix, 178 s, correlation 0.9 to 0.98 per 10 s), the raw core
+    follows the downmix with a slope of 0.64 to 0.66 in dB: the
+    compression law of 5.7.5 (alpha 0.65) exactly, with the encoder's
+    unity point about 30 dB below the one that puts the public test
+    stream and broadcaster B on their metadata. A misread core would not
+    give that law; the walk closes on every frame, and the element,
+    tools and flags (channel_pair ASPX, sap_mode 2, companding on, no
+    sync) are those of broadcaster B's stereo.
+  * The expansion restores the programme's shape (the companded decode
+    tracks loudstrm3s with correlation 0.90 against 0.87 for the raw
+    core) and leaves a constant offset: -13.9 dB against loudstrm3s
+    (sd 0.8 dB), -19 dB against the 5.1's downmix (-18.5 to -20.4 dB in
+    each 10 s where the two carry the same programme). The metadata
+    describes this track (its loudstrm3s follows the stereo's own
+    short-term loudness with correlation 0.90, the 5.1's with 0.55), so
+    the encoder measured its
+    input about 14 to 17 dB louder than the companded core it sent
+    implies: an input attenuated after the measurement, or a compressor
+    working to another reference level; the two are indistinguishable
+    from the output. No companding scale reconciles it: one 15 dB louder
+    for this stream would put every other companded stream 15 dB over.
+    Decoders without companding (the original receiver) play it 7 dB
+    louder, still 6 to 10 dB under its metadata.
+  * The "34 dB step" at its A-SPX crossover is the source's bandwidth:
+    the crossover is subband 36 (13.5 kHz, aspx start_freq 6,
+    master_freq_scale 1), the core's own content falls off from 12.5 to
+    13 kHz (the same programme's 5.1 reaches 17 kHz), and the
+    transmitted signal envelopes of the high band sit at their floor
+    (-12, against a median of -8 on the 5.1's L/R) in 98 % of the
+    values: the encoder sends an empty high band, and the decoder
+    renders it so (its output there is uncorrelated with the 5.1's).
+  * Side note: at the companding scale fitted on the public stereo test
+    stream's AAC version, that stream decodes 1.9 dB under its own
+    loudness metadata (loudrelgat -23.0, BS.1770 -24.9; loudstrm3s
+    tracked with sd 0.16 dB), and broadcaster B's stereo 2 to 3 dB under.
+    A scale 3.5 dB lower (about IMDCT_K x 2^15.9) would put both on
+    their metadata; not changed (the AAC fit stands until a reference
+    decoder settles it).
 * **Pass boundaries.** The output is not fully independent of how the
   frames are split into decode passes (`decode_pass`; the CLI's default
   pass is 1800 frames, 60 s): the last frame of a pass can differ from a
