@@ -8,6 +8,9 @@ It decodes the AC-4 that real ATSC 3.0 broadcasts carry. It is **not** a
 complete AC-4 decoder, it is not certified, and it is not affiliated with or
 endorsed by Dolby Laboratories (see [NOTICE](NOTICE)).
 
+How it compares with the other public AC-4 decoder (the 2019 FFmpeg patch),
+measured on 39 streams: [docs/COMPARISON.md](docs/COMPARISON.md).
+
 ```
 pip install -e .                 # numpy + scipy
 python -m ac4.build_kernels      # optional: build the C kernels (faster)
