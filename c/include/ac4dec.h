@@ -69,7 +69,7 @@
 extern "C" {
 #endif
 
-#define AC4DEC_VERSION "0.3.0-b"
+#define AC4DEC_VERSION "0.3.1"
 
 /* Samples per frame at the internal rate at 29.97 fps, 48 kHz (the frame
    length of frames before a stream's rate is known). */
@@ -354,6 +354,33 @@ void ac4dec_resampler_close(ac4dec_resampler *r);
    -> samples written per channel. */
 int ac4dec_resampler_push(ac4dec_resampler *r, const double *const *in,
                           int n, double *const *out);
+
+/* RUN-TIME LOADING. For programs that load libac4dec at run time (dlopen / LoadLibrary) and
+   should not depend on the layout of ac4dec_config, which may grow between
+   versions: the version string (AC4DEC_VERSION of the library), and
+   ac4dec_open with the settings as text, "key=value" pairs separated by
+   spaces or commas. Keys: lookahead (frames), layout (native, 2.0, 5.1,
+   5.1.2, 5.1.4, 7.1, 7.1.2, 7.1.4), channels, loudness (0/1),
+   target_level (dB, default -24), drc (auto, off, or a mode ID),
+   de_level (dB), presentation (n-th, 0 = automatic), language,
+   stereo_dmx (0 - 3), guard (0/1). Everything not given is as for
+   ac4dec_open(NULL). -> NULL on an unknown key, a bad value or a decoder
+   that would not open; err (errlen bytes, may be NULL) then says which. */
+const char *ac4dec_version(void);
+ac4dec *ac4dec_open_options(const char *options, char *err, size_t errlen);
+/* ac4dec_decode_frame / ac4dec_flush with the frame given out copied
+   into out[], interleaved (channel order as above), at most max_samples
+   samples per channel: room for max_samples * AC4DEC_MAX_CHANNELS floats
+   (AC4DEC_MAX_OUT samples is always enough). In the decoder's units:
+   with loudness=1, 1.0 is full scale (not clipped). -> samples per
+   channel, 0 while the delay line fills (decode) or when nothing is left
+   (flush), -1 on a bad argument; channels, sample_rate and status
+   (ac4dec_status) describe the frame (each may be NULL). */
+int ac4dec_decode_interleaved(ac4dec *d, const uint8_t *data, size_t len,
+                              float *out, int max_samples, int *channels,
+                              int *sample_rate, int *status);
+int ac4dec_flush_interleaved(ac4dec *d, float *out, int max_samples,
+                             int *channels, int *sample_rate, int *status);
 
 #ifdef __cplusplus
 }

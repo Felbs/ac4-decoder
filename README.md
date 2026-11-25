@@ -1116,6 +1116,20 @@ make -C c asan                   # the same gate under AddressSanitizer + UBSan
 c/ac4dec-c audio.m4s out.wav     # --f64 RAW, --status FILE, --lookahead N, ...
 ```
 
+**Loading it at run time.** A program that opens `libac4dec` with
+`dlopen` / `LoadLibrary` and should not depend on the layout of
+`ac4dec_config` or `ac4dec_frame` (which may grow) uses the six flat entry
+points of `ac4dec.h` ("RUN-TIME LOADING", from 0.3.1): `ac4dec_version`,
+`ac4dec_open_options` (the settings as text, e.g. `"lookahead=8
+layout=5.1 loudness=1 target_level=-24 drc=auto"`; an unknown key or a
+bad value is refused with the reason), `ac4dec_decode_interleaved` and
+`ac4dec_flush_interleaved` (the frame given out, as interleaved floats),
+`ac4dec_delay` and `ac4dec_close`. The unit tests check that they give
+the same samples as `ac4dec_decode_frame`, frame for frame. A change
+proposed to the OnAir SDR receiver (not merged yet) loads `libac4dec.so`
+/ `.dylib` / `ac4dec.dll` from its codecs folder this way for ATSC 3.0
+sound.
+
 **Inputs and presentations.** `include/ac4dec_input.h` (`ac4in_read`)
 reads what `ac4/container.py` reads (MP4 with or without fragments, AC-4
 sync frames with their CRC, MPEG-TS), frame for frame

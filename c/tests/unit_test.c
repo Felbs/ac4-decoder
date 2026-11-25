@@ -1026,6 +1026,113 @@ static void test_loudness(void)
           < 1e-12, "normalisation -18 -> -24 dB: %g", buf[0][100]);
 }
 
+/* ac4dec_open_options: the text settings reach the decoder, bad ones are
+   refused with a reason */
+static void test_options(void)
+{
+    char err[128];
+    ac4dec *d;
+    CHECK(!strcmp(ac4dec_version(), AC4DEC_VERSION), "version");
+    d = ac4dec_open_options("lookahead=12, layout=5.1 loudness=1 "
+                            "target_level=-24 drc=auto", err, sizeof(err));
+    CHECK(d != NULL, "open with options: %s", err);
+    if (d) {
+        CHECK(ac4dec_delay(d) == 12, "lookahead reached the decoder: %d",
+              ac4dec_delay(d));
+        ac4dec_close(d);
+    }
+    d = ac4dec_open_options(NULL, err, sizeof(err));
+    CHECK(d != NULL && ac4dec_delay(d) == AC4DEC_DEFAULT_LOOKAHEAD,
+          "no options = defaults");
+    if (d)
+        ac4dec_close(d);
+    d = ac4dec_open_options("layout=9.1", err, sizeof(err));
+    CHECK(d == NULL && strstr(err, "layout=9.1"), "bad layout: %s", err);
+    d = ac4dec_open_options("speed=2", err, sizeof(err));
+    CHECK(d == NULL && strstr(err, "speed=2"), "unknown key: %s", err);
+    d = ac4dec_open_options("lookahead", err, sizeof(err));
+    CHECK(d == NULL && strstr(err, "key=value"), "no value: %s", err);
+    d = ac4dec_open_options("lookahead=3", err, 0);
+    CHECK(d == NULL, "lookahead below the minimum");
+}
+
+/* ac4dec_decode_interleaved / _flush_interleaved give the same samples as
+   ac4dec_decode_frame / ac4dec_flush, frame for frame (a synthetic stream
+   of tests/data; skipped when the file is not there) */
+static void test_interleaved(void)
+{
+    static const char *path = "tests/data/v1_cfg7.syn";
+    FILE *fp = fopen(path, "rb");
+    static uint8_t data[1 << 16];
+    static float il[AC4DEC_MAX_OUT * AC4DEC_MAX_CHANNELS];
+    ac4dec_config cfg;
+    ac4dec *a, *b;
+    ac4in_frame *fr = NULL;
+    ac4in_info info;
+    ac4dec_frame f;
+    char err[128];
+    long m, k, outs = 0, diffs = 0, got_a = 0, got_b = 0;
+    size_t n;
+    int ch = 0, rate = 0, st = 0, r, c, i;
+    if (!fp) {
+        printf("skip interleaved: no %s\n", path);
+        return;
+    }
+    n = fread(data, 1, sizeof(data), fp);
+    fclose(fp);
+    m = ac4in_read(data, n, &fr, &info);
+    CHECK(m > 8, "frames in %s: %ld", path, m);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.lookahead = 8;
+    cfg.target_level = -24.0;
+    a = ac4dec_open(&cfg);
+    b = ac4dec_open_options("lookahead=8", err, sizeof(err));
+    CHECK(a && b, "open both: %s", err);
+    if (!a || !b || m <= 0)
+        goto done;
+    for (k = 0; k <= m; k++) {
+        int ga, gb;
+        memset(&f, 0, sizeof(f));
+        if (k < m) {
+            ga = ac4dec_decode_frame(a, fr[k].p, fr[k].len, &f);
+            gb = ac4dec_decode_interleaved(b, fr[k].p, fr[k].len, il,
+                                           AC4DEC_MAX_OUT, &ch, &rate, &st);
+        } else {
+            ga = ac4dec_flush(a, &f);
+            gb = ac4dec_flush_interleaved(b, il, AC4DEC_MAX_OUT, &ch, &rate,
+                                          &st);
+            if (ga)
+                k--;   /* keep flushing */
+        }
+        r = ga && f.n_channels > 0 ? f.n_samples : 0;
+        if (gb != r) {
+            diffs++;
+            continue;
+        }
+        if (!r)
+            continue;
+        outs++;
+        got_a += r;
+        got_b += gb;
+        if (ch != f.n_channels || rate != f.sample_rate || st != (int)f.status)
+            diffs++;
+        for (i = 0; i < r; i++)
+            for (c = 0; c < ch; c++)
+                if (il[(size_t)i * ch + c] != (float)f.pcm[c][i])
+                    diffs++;
+    }
+    CHECK(outs >= m - 8 && got_a == got_b && diffs == 0,
+          "interleaved = frame API: %ld frames out of %ld, %ld differences",
+          outs, m, diffs);
+done:
+    if (a)
+        ac4dec_close(a);
+    if (b)
+        ac4dec_close(b);
+    free(fr);
+    ac4in_free(&info);
+}
+
 /* dialogue enhancement, de_method 0 (TS 103 190-1 5.7.8.7, Tables 171,
    173, 209): the gains of a frame and one interpolated slot */
 static void test_de(void)
@@ -1092,6 +1199,8 @@ int main(int argc, char **argv)
     test_inputs();
     test_loudness();
     test_de();
+    test_options();
+    test_interleaved();
     if (fails) {
         printf("UNIT TESTS FAILED (%d)\n", fails);
         return 1;
